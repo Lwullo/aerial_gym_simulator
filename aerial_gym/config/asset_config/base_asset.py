@@ -12,6 +12,7 @@ class BaseAssetParams:
 
     collision_mask = 1
 
+
     disable_gravity = False
     replace_cylinder_with_capsule = (
         True  # replace collision cylinders with capsules, leads to faster/more stable simulation
