@@ -22,11 +22,11 @@ class control:
     K_pos_tensor_min = [2.0, 2.0, 1.0]  # used for lee_position_control only
 
     K_vel_tensor_max = [
-        3.3,
-        3.3,
-        1.3,
+        0.33,
+        0.33,
+        0.13,
     ]  # used for lee_position_control, lee_velocity_control only
-    K_vel_tensor_min = [2.7, 2.7, 1.7]
+    K_vel_tensor_min = [0.27, 0.27, 0.17]
 
     K_rot_tensor_max = [
         1.85,

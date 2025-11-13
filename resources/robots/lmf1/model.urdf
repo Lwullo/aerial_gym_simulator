@@ -17,8 +17,8 @@
       </geometry>
     </collision>
     <inertial>
-      <mass value="8.0"/>
-      <inertia ixx="0.34" ixy="0.0" ixz="0.0" iyy="0.34" iyz="0.0" izz="0.75"/>
+      <mass value="1.195"/>
+      <inertia ixx="0.013" ixy="0.0" ixz="0.0" iyy="0.014" iyz="0.0" izz="0.013"/>
     </inertial>
   </link>
 
@@ -26,6 +26,7 @@
     <visual>
       <origin xyz="0 0 0"/>
       <geometry>
+      <!-- <box size="0.1 0.1 0.07"/> -->
         <cylinder radius="0.05" length="0.07"/>
       </geometry>
       <material name="Orange">
@@ -44,10 +45,13 @@
     <origin xyz="0.100 -0.100 0"/>
   </joint>
 
+
+
   <link name="back_right_prop">
     <visual>
       <origin xyz="0 0 0"/>
       <geometry>
+      <!-- <box size="0.1 0.1 0.07"/> -->
         <cylinder radius="0.05" length="0.07"/>
       </geometry>
       <material name="Blue">
@@ -70,6 +74,7 @@
     <visual>
       <origin xyz="0 0 0"/>
       <geometry>
+      <!-- <box size="0.1 0.1 0.07"/> -->
         <cylinder radius="0.05" length="0.07"/>
       </geometry>
       <material name="Blue">
@@ -82,17 +87,21 @@
     </inertial>
   </link>
 
+
+
   <joint name="base_link_to_back_left_prop" type="fixed" dont_collapse="true">
     <parent link="base_link"/>
     <child link="back_left_prop"/>
     <origin xyz="-0.100 0.100 0"/>
   </joint>
 
+
   <link name="front_left_prop">
     <visual>
       <origin xyz="0 0 0"/>
       <geometry>
         <cylinder radius="0.05" length="0.07"/>
+        <!-- <box size="0.1 0.1 0.07"/> -->
       </geometry>
       <material name="Orange">
         <color rgba="1 0.423 0.03921568627 1.0"/>
@@ -108,374 +117,6 @@
     <parent link="base_link"/>
     <child link="front_left_prop"/>
     <origin xyz="0.100 0.100 0"/>
-  </joint>
-
-  <link name="front_right_support_drone">
-    <visual>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <box size="0.4 0.4 0.025"/>
-      </geometry>
-      <material name="White">
-        <color rgba="1 1 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="0.1 -0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Orange">
-        <color rgba="1.0 0.423 0.03921568627 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="-0.1 -0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Blue">
-        <color rgba="0 0 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="-0.1 0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Blue">
-        <color rgba="0 0 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="0.1 0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Orange">
-        <color rgba="1.0 0.423 0.03921568627 1.0"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <box size="0.5 0.5 0.5"/>
-      </geometry>
-    </collision>
-    <inertial>
-      <mass value="1.0"/>
-      <inertia ixx="0.34" ixy="0.0" ixz="0.0" iyy="0.34" iyz="0.0" izz="0.75"/>
-    </inertial>
-  </link>
-
-  <joint name="base_link_to_front_right_support_drone" type="fixed" dont_collapse="true">
-    <parent link="base_link"/>
-    <child link="front_right_support_drone"/>
-    <origin xyz="0.282842 -0.282842 -0.4"/>
-  </joint>
-
-  <link name="front_right_payload">
-    <visual>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <cylinder radius="0.07" length="0.05"/>
-      </geometry>
-      <material name="Grey">
-        <color rgba="0.5 0.5 0.5 1.0"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <cylinder radius="0.07" length="0.05"/>
-      </geometry>
-    </collision>
-    <inertial>
-      <mass value="1.0"/>
-      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.01" iyz="0.0" izz="0.02"/>
-    </inertial>
-  </link>
-
-  <joint name="front_right_support_drone_to_payload" type="fixed" dont_collapse="true">
-    <parent link="front_right_support_drone"/>
-    <child link="front_right_payload"/>
-    <origin xyz="0 0 -0.15"/>
-  </joint>
-
-  <link name="back_right_support_drone">
-    <visual>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <box size="0.4 0.4 0.025"/>
-      </geometry>
-      <material name="White">
-        <color rgba="1 1 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="0.1 -0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Orange">
-        <color rgba="1.0 0.423 0.03921568627 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="-0.1 -0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Blue">
-        <color rgba="0 0 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="-0.1 0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Blue">
-        <color rgba="0 0 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="0.1 0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Orange">
-        <color rgba="1.0 0.423 0.03921568627 1.0"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <box size="0.5 0.5 0.5"/>
-      </geometry>
-    </collision>
-    <inertial>
-      <mass value="1.0"/>
-      <inertia ixx="0.34" ixy="0.0" ixz="0.0" iyy="0.34" iyz="0.0" izz="0.75"/>
-    </inertial>
-  </link>
-
-  <joint name="base_link_to_back_right_support_drone" type="fixed" dont_collapse="true">
-    <parent link="base_link"/>
-    <child link="back_right_support_drone"/>
-    <origin xyz="-0.282842 -0.282842 -0.4"/>
-  </joint>
-
-  <link name="back_right_payload">
-    <visual>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <cylinder radius="0.07" length="0.05"/>
-      </geometry>
-      <material name="Grey">
-        <color rgba="0.5 0.5 0.5 1.0"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <cylinder radius="0.07" length="0.05"/>
-      </geometry>
-    </collision>
-    <inertial>
-      <mass value="1.0"/>
-      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.01" iyz="0.0" izz="0.02"/>
-    </inertial>
-  </link>
-
-  <joint name="back_right_support_drone_to_payload" type="fixed" dont_collapse="true">
-    <parent link="back_right_support_drone"/>
-    <child link="back_right_payload"/>
-    <origin xyz="0 0 -0.15"/>
-  </joint>
-
-  <link name="back_left_support_drone">
-    <visual>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <box size="0.4 0.4 0.025"/>
-      </geometry>
-      <material name="White">
-        <color rgba="1 1 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="0.1 -0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Orange">
-        <color rgba="1.0 0.423 0.03921568627 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="-0.1 -0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Blue">
-        <color rgba="0 0 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="-0.1 0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Blue">
-        <color rgba="0 0 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="0.1 0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Orange">
-        <color rgba="1.0 0.423 0.03921568627 1.0"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <box size="0.5 0.5 0.5"/>
-      </geometry>
-    </collision>
-    <inertial>
-      <mass value="1.0"/>
-      <inertia ixx="0.34" ixy="0.0" ixz="0.0" iyy="0.34" iyz="0.0" izz="0.75"/>
-    </inertial>
-  </link>
-
-  <joint name="base_link_to_back_left_support_drone" type="fixed" dont_collapse="true">
-    <parent link="base_link"/>
-    <child link="back_left_support_drone"/>
-    <origin xyz="-0.282842 0.282842 -0.4"/>
-  </joint>
-
-  <link name="back_left_payload">
-    <visual>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <cylinder radius="0.07" length="0.05"/>
-      </geometry>
-      <material name="Grey">
-        <color rgba="0.5 0.5 0.5 1.0"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <cylinder radius="0.07" length="0.05"/>
-      </geometry>
-    </collision>
-    <inertial>
-      <mass value="1.0"/>
-      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.01" iyz="0.0" izz="0.02"/>
-    </inertial>
-  </link>
-
-  <joint name="back_left_support_drone_to_payload" type="fixed" dont_collapse="true">
-    <parent link="back_left_support_drone"/>
-    <child link="back_left_payload"/>
-    <origin xyz="0 0 -0.15"/>
-  </joint>
-
-  <link name="front_left_support_drone">
-    <visual>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <box size="0.4 0.4 0.025"/>
-      </geometry>
-      <material name="White">
-        <color rgba="1 1 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="0.1 -0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Orange">
-        <color rgba="1.0 0.423 0.03921568627 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="-0.1 -0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Blue">
-        <color rgba="0 0 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="-0.1 0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Blue">
-        <color rgba="0 0 1 1.0"/>
-      </material>
-    </visual>
-    <visual>
-      <origin xyz="0.1 0.1 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-      </geometry>
-      <material name="Orange">
-        <color rgba="1.0 0.423 0.03921568627 1.0"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <box size="0.5 0.5 0.5"/>
-      </geometry>
-    </collision>
-    <inertial>
-      <mass value="1.0"/>
-      <inertia ixx="0.34" ixy="0.0" ixz="0.0" iyy="0.34" iyz="0.0" izz="0.75"/>
-    </inertial>
-  </link>
-
-  <joint name="base_link_to_front_left_support_drone" type="fixed" dont_collapse="true">
-    <parent link="base_link"/>
-    <child link="front_left_support_drone"/>
-    <origin xyz="0.282842 0.282842 -0.4"/>
-  </joint>
-
-  <link name="front_left_payload">
-    <visual>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <cylinder radius="0.07" length="0.05"/>
-      </geometry>
-      <material name="Grey">
-        <color rgba="0.5 0.5 0.5 1.0"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0"/>
-      <geometry>
-        <cylinder radius="0.07" length="0.05"/>
-      </geometry>
-    </collision>
-    <inertial>
-      <mass value="1.0"/>
-      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.01" iyz="0.0" izz="0.02"/>
-    </inertial>
-  </link>
-
-  <joint name="front_left_support_drone_to_payload" type="fixed" dont_collapse="true">
-    <parent link="front_left_support_drone"/>
-    <child link="front_left_payload"/>
-    <origin xyz="0 0 -0.15"/>
   </joint>
 
 </robot>

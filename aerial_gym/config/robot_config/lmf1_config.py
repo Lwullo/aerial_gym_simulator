@@ -51,7 +51,7 @@ class LMF1Cfg:
         enable_camera = False
         camera_config = BaseDepthCameraConfig
 
-        enable_lidar = False
+        enable_lidar = True
         lidar_config = BaseLidarConfig  # OSDome_64_Config
 
         enable_imu = False
