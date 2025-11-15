@@ -55,11 +55,22 @@ class BaseLeeController(BaseController):
             self.cfg.K_angvel_tensor_min, device=self.device, requires_grad=False
         ).expand(self.num_envs, -1)
 
+        #添加位置误差积分项
+        # self.Ki_tensor_max = torch.tensor(
+        #     self.cfg.Ki_tensor_max, device=self.device, requires_grad=False
+        # ).expand(self.num_envs, -1)
+        # self.Ki_tensor_min = torch.tensor(
+        #     self.cfg.Ki_tensor_min, device=self.device, requires_grad=False
+        # ).expand(self.num_envs, -1)
+        # self.int_err = torch.zeros((self.num_envs, 3), device=self.device)
+
         # Set the current values of the controller parameters
         self.K_pos_tensor_current = (self.K_pos_tensor_max + self.K_pos_tensor_min) / 2.0
         self.K_linvel_tensor_current = (self.K_linvel_tensor_max + self.K_linvel_tensor_min) / 2.0
         self.K_rot_tensor_current = (self.K_rot_tensor_max + self.K_rot_tensor_min) / 2.0
         self.K_angvel_tensor_current = (self.K_angvel_tensor_max + self.K_angvel_tensor_min) / 2.0
+        
+        # self.Ki_tensor_current = (self.Ki_tensor_max + self.Ki_tensor_min) / 2.0
 
         # tensors that are needed later in the controller are predefined here
         self.accel = torch.zeros((self.num_envs, 3), device=self.device)
@@ -87,6 +98,7 @@ class BaseLeeController(BaseController):
     def reset_idx(self, env_ids):
         if env_ids is None:
             env_ids = torch.arange(self.K_rot_tensor.shape[0])
+        # self.int_err = 0
         self.randomize_params(env_ids)
 
     def randomize_params(self, env_ids):
@@ -110,6 +122,10 @@ class BaseLeeController(BaseController):
 
     def compute_acceleration(self, setpoint_position, setpoint_velocity):
         position_error_world_frame = setpoint_position - self.robot_position
+
+        # self.int_err+= position_error_world_frame * 0.01
+        # self.int_err = torch.clamp(self.int_err, -2, 2)
+
         # logger.debug(
         #     f"position_error_world_frame: {position_error_world_frame}, setpoint_position: {setpoint_position}, robot_position: {self.robot_position}"
         # )
@@ -120,8 +136,11 @@ class BaseLeeController(BaseController):
 
         accel_command = (
             self.K_pos_tensor_current * position_error_world_frame
-            + self.K_linvel_tensor_current * velocity_error
+            + self.K_linvel_tensor_current * velocity_error 
+            #把积分项加入加速度命令
+            # + self.Ki_tensor_current * self.int_err 
         )
+        # print("int_z:", self.int_err[0, 2].item(), "acc_z:", accel_command[0, 2].item())
         return accel_command
 
     def compute_body_torque(self, setpoint_orientation, setpoint_angvel):

@@ -14,7 +14,7 @@ if __name__ == "__main__":
         # robot_name="lmf1",
         # controller_name="lee_position_control",
         robot_name="lmf2",
-        controller_name="lmf2_velocity_control",
+        controller_name="lmf2_position_control",
         args=None,
         device="cuda:0",
         num_envs=args.num_envs,

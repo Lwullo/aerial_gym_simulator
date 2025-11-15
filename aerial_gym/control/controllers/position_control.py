@@ -47,5 +47,4 @@ class LeePositionController(BaseLeeController):
         self.wrench_command[:, 3:6] = self.compute_body_torque(
             self.desired_quat, self.desired_body_angvel
         )
-
         return self.wrench_command

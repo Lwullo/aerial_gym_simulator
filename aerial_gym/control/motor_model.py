@@ -49,6 +49,7 @@ class MotorModel:
                 self.num_envs, self.num_motors_per_robot
             ),
         )
+        
         self.motor_time_constants_increasing = torch_rand_float_tensor(
             self.motor_time_constant_increasing_min, self.motor_time_constant_increasing_max
         )
@@ -89,6 +90,7 @@ class MotorModel:
         # clamp ref thrust so that it is within the min and max thrust
         ref_thrust = torch.clamp(ref_thrust, self.min_thrust, self.max_thrust)
         thrust_error = ref_thrust - self.current_motor_thrust
+        # print("motor thrust:", self.current_motor_thrust[0])  # 只看第一个 env
         motor_time_constants = torch.where(
             torch.sign(self.current_motor_thrust) * torch.sign(thrust_error) < 0,
             self.motor_time_constants_decreasing,

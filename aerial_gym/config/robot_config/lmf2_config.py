@@ -49,15 +49,16 @@ class LMF2Cfg:
             0.2,
             0.2,
         ]
-
+        # min_init_state = [0.5, 0.5, 0.5, 0, 0, 0, 1.0, 0, 0, 0, 0, 0, 0]
+        # max_init_state = min_init_state
     class sensor_config:
-        enable_camera = True
+        enable_camera = False
         camera_config = BaseDepthCameraConfig
 
         enable_lidar = False
         lidar_config = pmd_flexx2_config  # OSDome_64_Config
 
-        enable_imu = False
+        enable_imu = True
         imu_config = BaseImuConfig
 
     class disturbance:
@@ -176,4 +177,4 @@ class LMF2Cfg:
             min_thrust = 0.5
             max_thrust_rate = 100000.0
             thrust_to_torque_ratio = 0.07
-            use_discrete_approximation = True  # use discrete approximation for motor dynamics
+            use_discrete_approximation = False  # use discrete approximation for motor dynamics
