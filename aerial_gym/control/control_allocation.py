@@ -72,7 +72,7 @@ class ControlAllocator:
 
         ref_motor_thrusts = torch.clamp(ref_motor_thrusts, min=0.5, max=40.0)
 
-        print("ref thrust:", ref_motor_thrusts[0])
+        # print("ref thrust:", ref_motor_thrusts[0])
         current_motor_thrust = self.motor_model.update_motor_thrusts(ref_motor_thrusts)
 
         self.output_wrench[:] = torch.bmm(

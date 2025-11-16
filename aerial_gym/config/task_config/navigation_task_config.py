@@ -9,8 +9,8 @@ class task_config:
     robot_name = "lmf2"
     controller_name = "lmf2_velocity_control"
     args = {}
-    num_envs = 1024
-    use_warp = True
+    num_envs = 256
+    use_warp = False
     headless = True
     device = "cuda:0"
     observation_space_dim = 13 + 4 + 64  # root_state + action_dim _+ latent_dims
