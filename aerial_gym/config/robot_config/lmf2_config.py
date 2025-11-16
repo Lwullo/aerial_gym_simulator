@@ -52,11 +52,11 @@ class LMF2Cfg:
         # min_init_state = [0.5, 0.5, 0.5, 0, 0, 0, 1.0, 0, 0, 0, 0, 0, 0]
         # max_init_state = min_init_state
     class sensor_config:
-        enable_camera = True
+        enable_camera = False
         camera_config = BaseDepthCameraConfig
 
-        enable_lidar = False
-        lidar_config = pmd_flexx2_config  # OSDome_64_Config
+        enable_lidar = True
+        lidar_config = OSDome_64_Config  # OSDome_64_Config或者pmd_flexx2_config
 
         enable_imu = False
         imu_config = BaseImuConfig

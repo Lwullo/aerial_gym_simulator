@@ -93,7 +93,7 @@ class NavigationTask(BaseTask):
 
         # Get the dictionary once from the environment and use it to get the observations later.
         # This is to avoid constant retuning of data back anf forth across functions as the tensors update and can be read in-place.
-        self.obs_dict = self.sim_env.get_obs()
+        self.obs_dict = self.sim_env.get_obs() #  从仿真环境中获取观测字典，把所有传感器/状态数据的张量引用保存在这个字典中
         if "curriculum_level" not in self.obs_dict.keys():
             self.curriculum_level = self.task_config.curriculum.min_level
             self.obs_dict["curriculum_level"] = self.curriculum_level
@@ -155,6 +155,7 @@ class NavigationTask(BaseTask):
         }
 
         self.num_task_steps = 0
+        self.lidar_data = torch.zeros((self.num_envs, 6), device=self.device, dtype=torch.float32)
 
     def close(self):
         self.sim_env.delete_env()
@@ -271,11 +272,50 @@ class NavigationTask(BaseTask):
             self.success_aggregate = 0
             self.crashes_aggregate = 0
             self.timeouts_aggregate = 0
+    def process_lidar_observation(self):
+        """
+        (新函数) 
+        读取 (64, 512) 2D 深度图并将其压缩为 6 维向量 (前/后/左/右/上/下)。
+        """
+        # 1. 从 obs_dict 获取真实的 2D Lidar 深度图
+        #    (形状为 [num_envs, 1, 64, 512])
+        lidar_map_2d = self.obs_dict["depth_range_pixels"]
+        lidar_map_2d = lidar_map_2d.squeeze(1) # 移除通道维度 -> [num_envs, 64, 512]
 
-    def process_image_observation(self):
-        image_obs = self.obs_dict["depth_range_pixels"].squeeze(1)
-        if self.task_config.vae_config.use_vae:
-            self.image_latents[:] = self.vae_model.encode(image_obs)
+        # 2. 模仿新项目的 6 向 LiDAR
+        #    OSDome 512 像素是 360 度，64 像素是 0-90 度（上半球）
+
+        # --- 水平方向 (取“赤道”附近的扫描线, e.g., 30-34行) ---
+        # (我们取中间几行并取最小值，以获得更鲁棒的水平读数)
+        horizontal_scan = torch.amin(lidar_map_2d[:, 30:34, :], dim=1) # 形状 [num_envs, 512]
+
+        # 将 512 像素（360度）切分为 4 个 90 度的扇区
+        # (注意: 索引是估算的。 256=正前方, 0/512=正后方)
+        sector_size = 128 // 2 # 90度 / 2 = 45度
+
+        min_front = torch.amin(horizontal_scan[:, 256-sector_size : 256+sector_size], dim=1)
+        min_left  = torch.amin(horizontal_scan[:, 384-sector_size : 384+sector_size], dim=1) # 90度
+        min_right = torch.amin(horizontal_scan[:, 128-sector_size : 128+sector_size], dim=1) # -90度
+
+        # 后方 (跨越 0/512 边界)
+        min_back_1 = horizontal_scan[:, 0:sector_size]
+        min_back_2 = horizontal_scan[:, 512-sector_size:512]
+        min_back = torch.amin(torch.cat((min_back_1, min_back_2), dim=1), dim=1)
+
+        # --- 垂直方向 ---
+        # OSDome 只能看 0-90 度的上半球
+        min_up   = torch.amin(lidar_map_2d, dim=(1, 2)) # 取整个上半球的最小值
+
+        # OSDome 看不到下方, 必须设为一个安全的“最大值”
+        min_down = torch.full_like(min_up, 10.0) # 假设最大距离为 10.0
+
+        # 3. 将 6 个值存入 self.lidar_data
+        self.lidar_data[:] = torch.stack([min_front, min_back, min_left, min_right, min_up, min_down], dim=1)
+
+    # def process_image_observation(self):
+    #     image_obs = self.obs_dict["depth_range_pixels"].squeeze(1)
+    #     if self.task_config.vae_config.use_vae:
+    #         self.image_latents[:] = self.vae_model.encode(image_obs)
         # # comments to make sure the VAE does as expected
         # decoded_image = self.vae_model.decode(self.image_latents[0].unsqueeze(0))
         # image0 = image_obs[0].cpu().numpy()
@@ -302,8 +342,12 @@ class NavigationTask(BaseTask):
         # This step must be done since the reset is done after the reward is calculated.
         # This enables the robot to send back an updated state, and an updated observation to the RL agent after the reset.
         # This is important for the RL agent to get the correct state after the reset.
-        self.rewards[:], self.terminations[:] = self.compute_rewards_and_crashes(self.obs_dict)
+        #self.rewards[:], self.terminations[:] = self.compute_rewards_and_crashes(self.obs_dict)
 
+        min_lidar, _ = torch.min(self.lidar_data, dim=1)
+        velocities = self.obs_dict["robot_body_linvel"]
+
+        self.rewards[:], self.terminations[:] = self.compute_rewards_and_crashes(self.obs_dict, min_lidar, velocities)
         # logger.info(f"Curricluum Level: {self.curriculum_level}")
 
         if self.task_config.return_state_before_reset == True:
@@ -342,7 +386,8 @@ class NavigationTask(BaseTask):
             self.reset_idx(reset_envs)
         self.num_task_steps += 1
         # do stuff with the image observations here
-        self.process_image_observation()
+        # self.process_image_observation()
+        self.process_lidar_observation()
         self.post_image_reward_addition()
         if self.task_config.return_state_before_reset == False:
             return_tuple = self.get_return_tuple()
@@ -386,15 +431,16 @@ class NavigationTask(BaseTask):
         self.task_obs["observations"][:, 7:10] = self.obs_dict["robot_body_linvel"]
         self.task_obs["observations"][:, 10:13] = self.obs_dict["robot_body_angvel"]
         self.task_obs["observations"][:, 13:17] = self.obs_dict["robot_actions"]
-        if self.task_config.vae_config.use_vae:
-            self.task_obs["observations"][:, 17:] = self.image_latents
+        # if self.task_config.vae_config.use_vae:
+        #     self.task_obs["observations"][:, 17:] = self.image_latents
+        self.task_obs["observations"][:, 17:23] = self.lidar_data
         # self.task_obs["rewards"] = self.rewards
         # self.task_obs["terminations"] = self.terminations
         # self.task_obs["truncations"] = self.truncations
 
         # self.task_obs["image_obs"] = self.obs_dict["depth_range_pixels"]
 
-    def compute_rewards_and_crashes(self, obs_dict):
+    def compute_rewards_and_crashes(self, obs_dict, min_lidar, velocities):
         robot_position = obs_dict["robot_position"]
         target_position = self.target_position
         robot_vehicle_orientation = obs_dict["robot_vehicle_orientation"]
@@ -413,9 +459,10 @@ class NavigationTask(BaseTask):
             obs_dict["robot_prev_actions"],
             self.curriculum_progress_fraction,
             self.task_config.reward_parameters,
+            min_lidar,
+            velocities,
         )
-
-
+    
 @torch.jit.script
 def exponential_reward_function(
     magnitude: float, exponent: float, value: torch.Tensor
@@ -441,6 +488,8 @@ def compute_reward(
     prev_action,
     curriculum_progress_fraction,
     parameter_dict,
+    min_lidar,
+    velocities,
 ):
     # type: (Tensor, Tensor, Tensor, Tensor, Tensor, float, Dict[str, Tensor]) -> Tuple[Tensor, Tensor]
     MULTIPLICATION_FACTOR_REWARD = 1.0 + (2.0) * curriculum_progress_fraction
@@ -500,6 +549,15 @@ def compute_reward(
     )
     absolute_action_penalty = x_absolute_penalty + z_absolute_penalty + yawrate_absolute_penalty
     total_action_penalty = action_diff_penalty + absolute_action_penalty
+    speed = torch.norm(velocities, dim=1)
+    danger_factor = torch.sigmoid((1.0 - min_lidar) * 4.0)
+    danger_penalty = danger_factor * (5 + speed ** 2)
+
+    # 坠毁惩罚 (0.25m 以内)
+    crash_mask = (min_lidar < 0.25).float()
+    crash_penalty = crash_mask * (15 + speed ** 2)
+
+    total_action_penalty = total_action_penalty - danger_penalty - crash_penalty
 
     # combined reward
     reward = (
@@ -519,3 +577,7 @@ def compute_reward(
         reward,
     )
     return reward, crashes
+
+
+
+

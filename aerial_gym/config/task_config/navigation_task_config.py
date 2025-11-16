@@ -10,10 +10,11 @@ class task_config:
     controller_name = "lmf2_velocity_control"
     args = {}
     num_envs = 256
-    use_warp = False
+    use_warp = True   #激光雷达必须启用 Warp 渲染管线
     headless = True
     device = "cuda:0"
-    observation_space_dim = 13 + 4 + 64  # root_state + action_dim _+ latent_dims
+    # observation_space_dim = 13 + 4 + 64  # root_state + action_dim _+ latent_dims
+    observation_space_dim = 13 + 4 + 6
     privileged_observation_space_dim = 0
     action_space_dim = 4
     episode_len_steps = 100  # real physics time for simulation is this value multiplied by sim.dt
@@ -48,7 +49,7 @@ class task_config:
     }
 
     class vae_config:
-        use_vae = True
+        use_vae = False
         latent_dims = 64
         model_file = (
             AERIAL_GYM_DIRECTORY
