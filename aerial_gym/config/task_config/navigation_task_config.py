@@ -17,7 +17,7 @@ class task_config:
     observation_space_dim = 13 + 4 + 6
     privileged_observation_space_dim = 0
     action_space_dim = 4
-    episode_len_steps = 100  # real physics time for simulation is this value multiplied by sim.dt
+    episode_len_steps = 500  # real physics time for simulation is this value multiplied by sim.dt
 
     return_state_before_reset = (
         False  # False as usually state is returned for next episode after reset
@@ -37,6 +37,8 @@ class task_config:
         "x_action_diff_penalty_exponent": 3.333,
         "z_action_diff_penalty_magnitude": 0.8,
         "z_action_diff_penalty_exponent": 5.0,
+        "y_action_diff_penalty_magnitude": 0.8,
+        "y_action_diff_penalty_exponent": 3.333,
         "yawrate_action_diff_penalty_magnitude": 0.8,
         "yawrate_action_diff_penalty_exponent": 3.33,
         "x_absolute_action_penalty_magnitude": 0.1,
@@ -61,8 +63,8 @@ class task_config:
         return_sampled_latent = True
 
     class curriculum:
-        min_level = 15
-        max_level = 50
+        min_level = 0
+        max_level = 1
         check_after_log_instances = 2048
         increase_step = 2
         decrease_step = 1
@@ -75,44 +77,45 @@ class task_config:
             elif success_rate < self.success_rate_for_decrease:
                 return max(current_level - self.decrease_step, self.min_level)
             return current_level
-
-    # def action_transformation_function(action):
-    #     clamped_action = torch.clamp(action, -1.0, 1.0)
-    #     max_speed = 1.5  # [m/s]
-    #     max_yawrate = torch.pi / 3  # [rad/s]
-    #     processed_action = clamped_action.clone()
-    #     processed_action[:, 0:3] = max_speed*processed_action[:, 0:3]
-    #     processed_action[:, 3] = max_yawrate*processed_action[:, 3]
-    #     return processed_action
-
     def action_transformation_function(action):
         clamped_action = torch.clamp(action, -1.0, 1.0)
-        max_speed = 2.0  # [m/s]
+        # #对第一个动作维度加 1，再映射到前向/上向速度，导致策略输出 0 时仍然保持向前飞
+
+
+        max_speed = 1.5  # [m/s]
         max_yawrate = torch.pi / 3  # [rad/s]
-
-        # clamped_action[:, 0:3] = max_speed * clamped_action[:, 0:3]
-        # clamped_action[:, 3] = max_yawrate * clamped_action[:, 3]
-        # return clamped_action
-
-        max_inclination_angle = torch.pi / 4  # [rad]
-
-        clamped_action[:, 0] += 1.0
-
-        processed_action = torch.zeros(
-            (clamped_action.shape[0], 4), device=task_config.device, requires_grad=False
-        )
-        processed_action[:, 0] = (
-            clamped_action[:, 0]
-            * torch.cos(max_inclination_angle * clamped_action[:, 1])
-            * max_speed
-            / 2.0
-        )
-        processed_action[:, 1] = 0
-        processed_action[:, 2] = (
-            clamped_action[:, 0]
-            * torch.sin(max_inclination_angle * clamped_action[:, 1])
-            * max_speed
-            / 2.0
-        )
-        processed_action[:, 3] = clamped_action[:, 2] * max_yawrate
+        processed_action = clamped_action.clone()
+        processed_action[:, 0:3] = max_speed*processed_action[:, 0:3] # <-- 正确使用了 0, 1, 2
+        processed_action[:, 3] = max_yawrate*clamped_action[:, 3] # <-- 正确使用了 3
         return processed_action
+    # def action_transformation_function(action):
+    #     clamped_action = torch.clamp(action, -1.0, 1.0)
+    #     max_speed = 2.0  # [m/s]
+    #     max_yawrate = torch.pi / 3  # [rad/s]
+
+    #     # clamped_action[:, 0:3] = max_speed * clamped_action[:, 0:3]
+    #     # clamped_action[:, 3] = max_yawrate * clamped_action[:, 3]
+    #     # return clamped_action
+
+    #     max_inclination_angle = torch.pi / 4  # [rad]
+
+    #     clamped_action[:, 0] += 1.0
+
+    #     processed_action = torch.zeros(
+    #         (clamped_action.shape[0], 4), device=task_config.device, requires_grad=False
+    #     )
+    #     processed_action[:, 0] = (
+    #         clamped_action[:, 0]
+    #         * torch.cos(max_inclination_angle * clamped_action[:, 1])
+    #         * max_speed
+    #         / 2.0
+    #     )
+    #     processed_action[:, 1] = 0
+    #     processed_action[:, 2] = (
+    #         clamped_action[:, 0]
+    #         * torch.sin(max_inclination_angle * clamped_action[:, 1])
+    #         * max_speed
+    #         / 2.0
+    #     )
+    #     processed_action[:, 3] = clamped_action[:, 2] * max_yawrate
+    #     return processed_action

@@ -33,7 +33,7 @@ class EnvWithObstaclesCfg:
         reset_on_collision = (
             True  # reset environment when contact force on quadrotor is above a threshold
         )
-        collision_force_threshold = 0.05  # collision force threshold [N]
+        collision_force_threshold = 2.0  # collision force threshold [N]
         create_ground_plane = False  # create a ground plane
         sample_timestep_for_latency = True  # sample the timestep for the latency noise
         perturb_observations = True
@@ -41,24 +41,35 @@ class EnvWithObstaclesCfg:
         write_to_sim_at_every_timestep = False  # write to sim at every timestep
 
         use_warp = True
-        lower_bound_min = [-2.0, -4.0, -3.0]  # lower bound for the environment space
-        lower_bound_max = [-1.0, -2.5, -2.0]  # lower bound for the environment space
+        lower_bound_min = [-2.0, -4.0, 0.0]  # lower bound for the environment space
+        lower_bound_max = [-1.0, -2.5, 0.0]  # lower bound for the environment space
         upper_bound_min = [9.0, 2.5, 2.0]  # upper bound for the environment space
         upper_bound_max = [10.0, 4.0, 3.0]  # upper bound for the environment space
 
     class env_config:
         include_asset_type = {
-            "panels": True,
+            # "panels": True,
+            # "tiles": False,
+            # "thin": False,
+            # "trees": False,
+            # "objects": True,
+            # "left_wall": True,
+            # "right_wall": True,
+            # "back_wall": True,
+            # "front_wall": True,
+            # "top_wall": True,
+            # "bottom_wall": True,
+            "panels": False,
             "tiles": False,
             "thin": False,
             "trees": False,
-            "objects": True,
-            "left_wall": True,
-            "right_wall": True,
-            "back_wall": True,
-            "front_wall": True,
-            "top_wall": True,
-            "bottom_wall": True,
+            "objects": False,
+            "left_wall": False,    # <--- 关掉
+            "right_wall": False,   # <--- 关掉
+            "back_wall": False,    # <--- 关掉
+            "front_wall": False,   # <--- 关掉
+            "top_wall": False,     # <--- 关掉
+            "bottom_wall": False,  # <--- 关掉
         }
 
         # maps the above names to the classes defining the assets. They can be enabled and disabled above in include_asset_type

@@ -69,7 +69,7 @@ class panel_asset_params(asset_state_params):
 
     collision_mask = 1  # objects with the same collision mask will not collide
 
-    min_position_ratio = [0.3, 0.05, 0.05]  # max position as a ratio of the bounds
+    min_position_ratio = [0.5, 0.05, 0.05]  # max position as a ratio of the bounds
     max_position_ratio = [0.85, 0.95, 0.95]  # min position as a ratio of the bounds
 
     specified_position = [

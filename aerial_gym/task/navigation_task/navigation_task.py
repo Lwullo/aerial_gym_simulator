@@ -162,6 +162,8 @@ class NavigationTask(BaseTask):
 
     def reset(self):
         self.reset_idx(torch.arange(self.sim_env.num_envs))
+        self.obs_dict = self.sim_env.get_obs() 
+        self.process_lidar_observation()
         return self.get_return_tuple()
 
     def reset_idx(self, env_ids):
@@ -282,6 +284,7 @@ class NavigationTask(BaseTask):
         lidar_map_2d = self.obs_dict["depth_range_pixels"]
         lidar_map_2d = lidar_map_2d.squeeze(1) # 移除通道维度 -> [num_envs, 64, 512]
 
+        lidar_map_2d[lidar_map_2d <= 0.1] = 10.0
         # 2. 模仿新项目的 6 向 LiDAR
         #    OSDome 512 像素是 360 度，64 像素是 0-90 度（上半球）
 
@@ -291,7 +294,7 @@ class NavigationTask(BaseTask):
 
         # 将 512 像素（360度）切分为 4 个 90 度的扇区
         # (注意: 索引是估算的。 256=正前方, 0/512=正后方)
-        sector_size = 128 // 2 # 90度 / 2 = 45度
+        sector_size = 85 // 2 
 
         min_front = torch.amin(horizontal_scan[:, 256-sector_size : 256+sector_size], dim=1)
         min_left  = torch.amin(horizontal_scan[:, 384-sector_size : 384+sector_size], dim=1) # 90度
@@ -304,7 +307,8 @@ class NavigationTask(BaseTask):
 
         # --- 垂直方向 ---
         # OSDome 只能看 0-90 度的上半球
-        min_up   = torch.amin(lidar_map_2d, dim=(1, 2)) # 取整个上半球的最小值
+        top_patch = lidar_map_2d[:, 0:4, :]      # 只取第 0~3 行
+        min_up = torch.amin(top_patch, dim=(1, 2)) # 取整个上半球的最小值
 
         # OSDome 看不到下方, 必须设为一个安全的“最大值”
         min_down = torch.full_like(min_up, 10.0) # 假设最大距离为 10.0
@@ -342,12 +346,27 @@ class NavigationTask(BaseTask):
         # This step must be done since the reset is done after the reward is calculated.
         # This enables the robot to send back an updated state, and an updated observation to the RL agent after the reset.
         # This is important for the RL agent to get the correct state after the reset.
-        #self.rewards[:], self.terminations[:] = self.compute_rewards_and_crashes(self.obs_dict)
+        
+        # --- (BUG 1: 修复开始) ---
 
+        # 1. (原第 455 行) 先完成物理步进
+        reset_envs = self.sim_env.post_reward_calculation_step()
+        if len(reset_envs) > 0:
+            self.reset_idx(reset_envs)
+        self.num_task_steps += 1
+        
+        # 2. (原第 458 行) 立刻处理“新”的 Lidar 数据
+        self.process_lidar_observation()
+
+        # 3. (原第 414 行) 现在才使用“新”的 Lidar 数据
         min_lidar, _ = torch.min(self.lidar_data, dim=1)
         velocities = self.obs_dict["robot_body_linvel"]
 
+        # 4. (原第 416 行) 现在才计算奖励
         self.rewards[:], self.terminations[:] = self.compute_rewards_and_crashes(self.obs_dict, min_lidar, velocities)
+        
+        # --- (BUG 1: 修复结束) ---
+
         # logger.info(f"Curricluum Level: {self.curriculum_level}")
 
         if self.task_config.return_state_before_reset == True:
@@ -381,25 +400,27 @@ class NavigationTask(BaseTask):
         )
         # rendering happens at the post-reward calculation step since the newer measurement is required to be
         # sent to the RL algorithm as an observation and it helps if the camera image is updated then
-        reset_envs = self.sim_env.post_reward_calculation_step()
-        if len(reset_envs) > 0:
-            self.reset_idx(reset_envs)
-        self.num_task_steps += 1
-        # do stuff with the image observations here
-        # self.process_image_observation()
-        self.process_lidar_observation()
-        self.post_image_reward_addition()
+        
+        # (这部分已移到前面)
+        # reset_envs = self.sim_env.post_reward_calculation_step()
+        # if len(reset_envs) > 0:
+        #     self.reset_idx(reset_envs)
+        # self.num_task_steps += 1
+        
+        # (这部分已移到前面)
+        # self.process_lidar_observation()
+    
         if self.task_config.return_state_before_reset == False:
             return_tuple = self.get_return_tuple()
         return return_tuple
 
-    def post_image_reward_addition(self):
-        image_obs = 10.0 * self.obs_dict["depth_range_pixels"].squeeze(1)
-        image_obs[image_obs < 0] = 10.0
-        self.min_pixel_dist = torch.amin(image_obs, dim=(1, 2))
-        self.rewards[self.terminations < 0] += -exponential_reward_function(
-            4.0, 1.0, self.min_pixel_dist[self.terminations < 0]
-        )
+    # def post_image_reward_addition(self):
+    #     image_obs = 10.0 * self.obs_dict["depth_range_pixels"].squeeze(1)
+    #     image_obs[image_obs < 0] = 10.0
+    #     self.min_pixel_dist = torch.amin(image_obs, dim=(1, 2))
+    #     self.rewards[self.terminations < 0] += -exponential_reward_function(
+    #         4.0, 1.0, self.min_pixel_dist[self.terminations < 0]
+    #     )
 
     def get_return_tuple(self):
         self.process_obs_for_task()
@@ -427,13 +448,13 @@ class NavigationTask(BaseTask):
         perturbed_euler_angles = euler_angles + 0.1 * (torch.rand_like(euler_angles) - 0.5)
         self.task_obs["observations"][:, 4] = perturbed_euler_angles[:, 0]
         self.task_obs["observations"][:, 5] = perturbed_euler_angles[:, 1]
-        self.task_obs["observations"][:, 6] = 0.0
+        self.task_obs["observations"][:, 6] = perturbed_euler_angles[:, 2]
         self.task_obs["observations"][:, 7:10] = self.obs_dict["robot_body_linvel"]
         self.task_obs["observations"][:, 10:13] = self.obs_dict["robot_body_angvel"]
         self.task_obs["observations"][:, 13:17] = self.obs_dict["robot_actions"]
         # if self.task_config.vae_config.use_vae:
         #     self.task_obs["observations"][:, 17:] = self.image_latents
-        self.task_obs["observations"][:, 17:23] = self.lidar_data
+        self.task_obs["observations"][:, 17:23] = self.lidar_data / 20.0
         # self.task_obs["rewards"] = self.rewards
         # self.task_obs["terminations"] = self.terminations
         # self.task_obs["truncations"] = self.truncations
@@ -491,29 +512,35 @@ def compute_reward(
     min_lidar,
     velocities,
 ):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, float, Dict[str, Tensor]) -> Tuple[Tensor, Tensor]
-    MULTIPLICATION_FACTOR_REWARD = 1.0 + (2.0) * curriculum_progress_fraction
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, float, Dict[str, Tensor], Tensor, Tensor) -> Tuple[Tensor, Tensor]
+
     dist = torch.norm(pos_error, dim=1)
-    prev_dist_to_goal = torch.norm(prev_pos_error, dim=1)
-    pos_reward = exponential_reward_function(
-        parameter_dict["pos_reward_magnitude"],
-        parameter_dict["pos_reward_exponent"],
-        dist,
-    )
-    very_close_to_goal_reward = exponential_reward_function(
+    speed = torch.norm(velocities, dim=1)
+
+    # --- 1. 正面奖励 (融合 RL.py 的思路) ---
+
+    # 奖励 1: 朝向目标移动 (来自 RL.py 的 'direction_reward' 逻辑)
+    # pos_error 是指向目标的向量(在机体坐标系下)，velocities 也是机体坐标系下的速度
+    goal_dir = torch.nn.functional.normalize(pos_error + 1e-6, dim=1)
+    vel_dir = torch.nn.functional.normalize(velocities + 1e-6, dim=1)
+    
+    # 奖励朝向目标的速度分量
+    # 5.0 是一个可调的系数，你可以加到 parameter_dict 中
+    direction_reward = 5.0 * torch.clamp(torch.sum(goal_dir * vel_dir, dim=1), min=0.0)
+
+    # 奖励 2: 接近目标的指数奖励 (保留, 作为"到达"奖励)
+    close_to_goal_reward = exponential_reward_function(
         parameter_dict["very_close_to_goal_reward_magnitude"],
         parameter_dict["very_close_to_goal_reward_exponent"],
         dist,
     )
+    
+    positive_reward = direction_reward + close_to_goal_reward
 
-    getting_closer = prev_dist_to_goal - dist
-    getting_closer_reward = torch.where(
-        getting_closer > 0,
-        parameter_dict["getting_closer_reward_multiplier"] * getting_closer,
-        2.0 * parameter_dict["getting_closer_reward_multiplier"] * getting_closer,
-    )
+    # --- 2. 负面惩罚 (保留动作平滑，但修复危险惩罚) ---
 
-    distance_from_goal_reward = (20.0 - dist) / 20.0
+    # 惩罚 1: 动作平滑惩罚 (保留)
+    # (注意: 建议将 parameter_dict 中的..._penalty_magnitude 幅度降低 5-10 倍)
     action_diff = action - prev_action
     x_diff_penalty = exponential_penalty_function(
         parameter_dict["x_action_diff_penalty_magnitude"],
@@ -525,59 +552,44 @@ def compute_reward(
         parameter_dict["z_action_diff_penalty_exponent"],
         action_diff[:, 2],
     )
+    y_diff_penalty = exponential_penalty_function(
+        parameter_dict["y_action_diff_penalty_magnitude"],
+        parameter_dict["y_action_diff_penalty_exponent"],
+        action_diff[:, 1],
+    )
     yawrate_diff_penalty = exponential_penalty_function(
         parameter_dict["yawrate_action_diff_penalty_magnitude"],
         parameter_dict["yawrate_action_diff_penalty_exponent"],
         action_diff[:, 3],
     )
-    action_diff_penalty = x_diff_penalty + z_diff_penalty + yawrate_diff_penalty
-    # absolute action penalty
-    x_absolute_penalty = curriculum_progress_fraction * exponential_penalty_function(
-        parameter_dict["x_absolute_action_penalty_magnitude"],
-        parameter_dict["x_absolute_action_penalty_exponent"],
-        action[:, 0],
-    )
-    z_absolute_penalty = curriculum_progress_fraction * exponential_penalty_function(
-        parameter_dict["z_absolute_action_penalty_magnitude"],
-        parameter_dict["z_absolute_action_penalty_exponent"],
-        action[:, 2],
-    )
-    yawrate_absolute_penalty = curriculum_progress_fraction * exponential_penalty_function(
-        parameter_dict["yawrate_absolute_action_penalty_magnitude"],
-        parameter_dict["yawrate_absolute_action_penalty_exponent"],
-        action[:, 3],
-    )
-    absolute_action_penalty = x_absolute_penalty + z_absolute_penalty + yawrate_absolute_penalty
-    total_action_penalty = action_diff_penalty + absolute_action_penalty
-    speed = torch.norm(velocities, dim=1)
-    danger_factor = torch.sigmoid((1.0 - min_lidar) * 4.0)
-    danger_penalty = danger_factor * (5 + speed ** 2)
+    
+    # (为简洁起见，此处省略了 absolute_action_penalty，但你可以保留它)
+    total_action_penalty = x_diff_penalty + z_diff_penalty + y_diff_penalty + yawrate_diff_penalty
 
-    # 坠毁惩罚 (0.25m 以内)
-    crash_mask = (min_lidar < 0.25).float()
-    crash_penalty = crash_mask * (15 + speed ** 2)
 
-    total_action_penalty = total_action_penalty - danger_penalty - crash_penalty
+    # 惩罚 2: **修复后的**危险惩罚 (不再使用 sigmoid)
+    # 仅在 0.8m 安全区内才开始惩罚
+    safe_zone_threshold = 0.8  # [米]
+    danger_penalty_magnitude = 2.0 # 可调系数
+    
+    # 当 min_lidar < 0.8 时, (1.0 - min_lidar / safe_zone_threshold) > 0
+    danger_penalty = danger_penalty_magnitude * torch.relu(1.0 - min_lidar / safe_zone_threshold) * (1.0 + speed**2)
+    
+    # (删除了基于 LiDAR 的 'crash_penalty')
 
-    # combined reward
-    reward = (
-        MULTIPLICATION_FACTOR_REWARD
-        * (
-            pos_reward
-            + very_close_to_goal_reward
-            + getting_closer_reward
-            + distance_from_goal_reward
-        )
-        + total_action_penalty
-    )
+    # --- 3. 组合奖励 ---
+    # total_action_penalty 已经是负值, danger_penalty 是正数，所以要减去
+    reward = positive_reward- danger_penalty
 
+    # --- 4. 最终的物理碰撞惩罚 (来自 navigation_task.py，最关键) ---
+    # 这是唯一应该终止 episode 并给予巨大惩罚的地方
     reward[:] = torch.where(
         crashes > 0,
         parameter_dict["collision_penalty"] * torch.ones_like(reward),
         reward,
     )
+    
     return reward, crashes
-
 
 
 
