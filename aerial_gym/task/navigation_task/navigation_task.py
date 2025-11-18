@@ -90,7 +90,9 @@ class NavigationTask(BaseTask):
             )
         else:
             self.vae_model = lambda x: x
-
+        self.min_pixel_dist = torch.zeros(
+            (self.sim_env.num_envs), device=self.device, requires_grad=False
+        )
         # Get the dictionary once from the environment and use it to get the observations later.
         # This is to avoid constant retuning of data back anf forth across functions as the tensors update and can be read in-place.
         self.obs_dict = self.sim_env.get_obs()
@@ -271,6 +273,36 @@ class NavigationTask(BaseTask):
             self.success_aggregate = 0
             self.crashes_aggregate = 0
             self.timeouts_aggregate = 0
+        # def process_lidar_observation(self):
+        #     if "depth_range_pixels" not in self.obs_dict:
+        #         return  # 传感器未启用或尚未更新
+
+        #     lidar_map = self.obs_dict["depth_range_pixels"].squeeze(1)  # [num_envs, 64, 512]
+
+        #     # 取“赤道”附近的 4 行，计算水平 360° 的最小距离
+        #     horizontal_scan = torch.amin(lidar_map[:, 30:34, :], dim=1)  # [num_envs, 512]
+        #     sector_size = 64  # 90° 覆盖的像素数 /2
+
+        #     min_front = torch.amin(horizontal_scan[:, 256 - sector_size : 256 + sector_size], dim=1)
+        #     min_right = torch.amin(horizontal_scan[:, 128 - sector_size : 128 + sector_size], dim=1)
+        #     min_left  = torch.amin(horizontal_scan[:, 384 - sector_size : 384 + sector_size], dim=1)
+
+        #     back_left  = horizontal_scan[:, 0 : sector_size]
+        #     back_right = horizontal_scan[:, 512 - sector_size : 512]
+        #     min_back = torch.amin(torch.cat((back_left, back_right), dim=1), dim=1)
+
+        #     # 取顶部 4 行、±15° 的区域作为“向上”距离
+        #     top_patch = lidar_map[:, 0:4, 240:272]
+        #     min_up = torch.amin(top_patch, dim=(1, 2))
+
+        #     # OS-Dome 看不到下方，设定成一个安全的最大距离
+        #     min_down = torch.full_like(min_up, fill_value=self.sim_env.env_bounds_max[0, 2])
+
+        #     self.lidar_data[:] = torch.stack(
+        #         [min_front, min_back, min_left, min_right, min_up, min_down], dim=1
+        #     )
+        #     self.process_lidar_observation()
+
 
     def process_image_observation(self):
         image_obs = self.obs_dict["depth_range_pixels"].squeeze(1)
@@ -340,9 +372,12 @@ class NavigationTask(BaseTask):
         reset_envs = self.sim_env.post_reward_calculation_step()
         if len(reset_envs) > 0:
             self.reset_idx(reset_envs)
+            # self.process_lidar_observation()
+
         self.num_task_steps += 1
         # do stuff with the image observations here
         self.process_image_observation()
+        # self.process_lidar_observation()
         self.post_image_reward_addition()
         if self.task_config.return_state_before_reset == False:
             return_tuple = self.get_return_tuple()
@@ -352,9 +387,9 @@ class NavigationTask(BaseTask):
         image_obs = 10.0 * self.obs_dict["depth_range_pixels"].squeeze(1)
         image_obs[image_obs < 0] = 10.0
         self.min_pixel_dist = torch.amin(image_obs, dim=(1, 2))
-        self.rewards[self.terminations < 0] += -exponential_reward_function(
-            4.0, 1.0, self.min_pixel_dist[self.terminations < 0]
-        )
+        # self.rewards[self.terminations < 0] += -exponential_reward_function(
+        #     4.0, 1.0, self.min_pixel_dist[self.terminations < 0]
+        # )
 
     def get_return_tuple(self):
         self.process_obs_for_task()
@@ -413,6 +448,7 @@ class NavigationTask(BaseTask):
             obs_dict["robot_prev_actions"],
             self.curriculum_progress_fraction,
             self.task_config.reward_parameters,
+            self.min_pixel_dist,
         )
 
 
@@ -441,8 +477,9 @@ def compute_reward(
     prev_action,
     curriculum_progress_fraction,
     parameter_dict,
+    min_pixel_dist,
 ):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, float, Dict[str, Tensor]) -> Tuple[Tensor, Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, float, Dict[str, Tensor], Tensor) -> Tuple[Tensor, Tensor]
     MULTIPLICATION_FACTOR_REWARD = 1.0 + (2.0) * curriculum_progress_fraction
     dist = torch.norm(pos_error, dim=1)
     prev_dist_to_goal = torch.norm(prev_pos_error, dim=1)
@@ -512,6 +549,11 @@ def compute_reward(
         )
         + total_action_penalty
     )
+
+    lidar_min_dist_penalty = -exponential_reward_function(
+        4.0, 1.0, min_pixel_dist
+    )
+    reward = reward + lidar_min_dist_penalty
 
     reward[:] = torch.where(
         crashes > 0,
