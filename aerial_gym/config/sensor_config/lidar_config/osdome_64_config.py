@@ -16,7 +16,7 @@ class OSDome_64_Config(BaseLidarConfig):
     segmentation_camera = True
 
     # randomize placement of the sensor
-    randomize_placement = False
+    randomize_placement = False #  控制是否随机放置传感器
     min_translation = [0.0, 0.0, 0.0]
     max_translation = [0.0, 0.0, 0.0]
     # example of a front-mounted dome lidar
