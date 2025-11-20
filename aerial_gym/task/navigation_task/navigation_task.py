@@ -470,13 +470,13 @@ def exponential_penalty_function(
 
 @torch.jit.script
 def compute_reward(
-    pos_error,
-    prev_pos_error,
-    crashes,
-    action,
-    prev_action,
-    curriculum_progress_fraction,
-    parameter_dict,
+    pos_error,           # 位置误差张量
+    prev_pos_error,      # 之前的位置误差张量
+    crashes,             # 碰撞状态张量
+    action,              # 当前动作张量
+    prev_action,         # 之前的动作张量
+    curriculum_progress_fraction,  # 课程进度分数(0-1)
+    parameter_dict,      # 包含各种奖励/惩罚参数的字典
     min_pixel_dist,
 ):
     # type: (Tensor, Tensor, Tensor, Tensor, Tensor, float, Dict[str, Tensor], Tensor) -> Tuple[Tensor, Tensor]

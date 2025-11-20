@@ -112,6 +112,37 @@ class panel_asset_params(asset_state_params):
         0.0,
     ]
 
+    # min_state_ratio = [
+    #     0.85,
+    #     0.95,
+    #     0.95,
+    #     0.0,
+    #     0.0,
+    #     np.pi / 3.0,
+    #     1.0,
+    #     0.0,
+    #     0.0,
+    #     0.0,
+    #     0.0,
+    #     0.0,
+    #     0.0,
+    # ]
+    # max_state_ratio = [
+    #     0.85,
+    #     0.95,
+    #     0.95,
+    #     0.0,
+    #     0.0,
+    #     np.pi / 3.0,
+    #     1.0,
+    #     0.0,
+    #     0.0,
+    #     0.0,
+    #     0.0,
+    #     0.0,
+    #     0.0,
+    # ]
+
     keep_in_env = True
 
     collapse_fixed_joints = True

@@ -18,9 +18,9 @@ class control:
     max_inclination_angle_rad = np.pi / 3.0
     max_yaw_rate = np.pi / 3.0
     scale_pos=0.5
-    scale_vel=0.5
+    scale_vel=0.3
     scale_rot=1.5
-    scale_angvel=3.0
+    scale_angvel=2.7
 
     K_pos_tensor_max =torch.tensor([0.7, 0.7, 1.0]) * scale_pos  # “当前位置”和“目标位置”之间的误差，输出一个期望的速度指令给K_vel
     K_pos_tensor_min =torch.tensor([0.7, 0.7, 1.0]) * scale_pos# used for lee_position_control only

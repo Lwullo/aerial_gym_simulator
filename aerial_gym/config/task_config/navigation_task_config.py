@@ -31,20 +31,20 @@ class task_config:
         "pos_reward_exponent": 1.0 / 3.5,
         "very_close_to_goal_reward_magnitude": 5.0,
         "very_close_to_goal_reward_exponent": 2.0,
-        "getting_closer_reward_multiplier": 10.0,
-        "x_action_diff_penalty_magnitude": 0.8,
-        "x_action_diff_penalty_exponent": 3.333,
+        "getting_closer_reward_multiplier": 3.0,
+        "x_action_diff_penalty_magnitude": 0.1,
+        "x_action_diff_penalty_exponent": 2.0,
         "z_action_diff_penalty_magnitude": 0.8,
         "z_action_diff_penalty_exponent": 5.0,
         "yawrate_action_diff_penalty_magnitude": 0.8,
         "yawrate_action_diff_penalty_exponent": 3.33,
         "x_absolute_action_penalty_magnitude": 0.1,
         "x_absolute_action_penalty_exponent": 0.3,
-        "z_absolute_action_penalty_magnitude": 1.5,
+        "z_absolute_action_penalty_magnitude": 0.5,
         "z_absolute_action_penalty_exponent": 1.0,
-        "yawrate_absolute_action_penalty_magnitude": 1.5,
+        "yawrate_absolute_action_penalty_magnitude": 0.1,
         "yawrate_absolute_action_penalty_exponent": 2.0,
-        "collision_penalty": -100.0,
+        "collision_penalty": -200.0,
     }
 
     class vae_config:
@@ -77,7 +77,7 @@ class task_config:
 
     def action_transformation_function(action):
         clamped_action = torch.clamp(action, -1.0, 1.0)
-        max_speed = 1.5  # [m/s]
+        max_speed = torch.tensor([1.2, 0.5, 0.8], device=clamped_action.device) 
         max_yawrate = torch.pi / 3  # [rad/s]
         processed_action = clamped_action.clone()
         processed_action[:, 0:3] = max_speed*processed_action[:, 0:3]
