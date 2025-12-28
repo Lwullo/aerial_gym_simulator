@@ -302,18 +302,31 @@ def update_config(config, args):
 
 
 if __name__ == "__main__":
+    runner_dir = os.path.dirname(os.path.abspath(__file__))
+    original_cwd = os.getcwd()
+    os.chdir(runner_dir)
     os.makedirs("nn", exist_ok=True)
     os.makedirs("runs", exist_ok=True)
 
     args = vars(get_args())
 
     config_name = args["file"]
+    if not os.path.isabs(config_name):
+        config_name = os.path.abspath(os.path.join(original_cwd, config_name))
 
     print("Loading config: ", config_name)
     with open(config_name, "r") as stream:
         config = yaml.safe_load(stream)
 
         config = update_config(config, args)
+
+        experiment_name = config.get("params", {}).get("config", {}).get("name", "gen_ppo")
+        runs_dir = os.path.join(runner_dir, "runs")
+        os.environ["AERIAL_GYM_RUNS_DIR"] = runs_dir
+        os.environ["AERIAL_GYM_EXPERIMENT_NAME"] = experiment_name
+        learning_rate = config.get("params", {}).get("config", {}).get("learning_rate")
+        if learning_rate is not None:
+            os.environ["AERIAL_GYM_LR"] = str(learning_rate)
 
         from rl_games.torch_runner import Runner
 

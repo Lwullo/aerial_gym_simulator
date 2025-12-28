@@ -25,32 +25,17 @@ class task_config:
 
     # fixed bounds for the rectangular space
     env_bounds_min = [0.0, 0.0, 0.0]
-    env_bounds_max = [20.0, 20.0, 10.0]
+    env_bounds_max = [15.0, 15.0, 6.0]
 
     # fixed number of obstacles to keep in the environment (excluding keep_in_env assets)
-    num_obstacles_in_env = 44
+    num_obstacles_in_env = 20
     target_min_ratio = [0.90, 0.1, 0.1]  # target ratio w.r.t environment bounds in x,y,z
     target_max_ratio = [0.94, 0.90, 0.90]  # target ratio w.r.t environment bounds in x,y,z
 
     reward_parameters = {
-        "pos_reward_magnitude": 5.0,
-        "pos_reward_exponent": 1.0 / 3.5,
-        "very_close_to_goal_reward_magnitude": 5.0,
-        "very_close_to_goal_reward_exponent": 2.0,
-        "getting_closer_reward_multiplier": 3.0,
-        "x_action_diff_penalty_magnitude": 0.1,
-        "x_action_diff_penalty_exponent": 2.0,
-        "z_action_diff_penalty_magnitude": 0.8,
-        "z_action_diff_penalty_exponent": 5.0,
-        "yawrate_action_diff_penalty_magnitude": 0.8,
-        "yawrate_action_diff_penalty_exponent": 3.33,
-        "x_absolute_action_penalty_magnitude": 0.1,
-        "x_absolute_action_penalty_exponent": 0.3,
-        "z_absolute_action_penalty_magnitude": 0.5,
-        "z_absolute_action_penalty_exponent": 1.0,
-        "yawrate_absolute_action_penalty_magnitude": 0.1,
-        "yawrate_absolute_action_penalty_exponent": 2.0,
-        "collision_penalty": -200.0,
+        "goal_reward_weight": 1.0,
+        "noise_reward_weight": 0.7,
+        "collision_penalty": -50.0,
     }
 
     class vae_config:
@@ -76,11 +61,11 @@ class task_config:
         resample_on_reset = True
 
     class score_config:
-        w1 = 1.0    #障碍物安全项权重
-        w2 = 0.7    #目标距离项权重
-        w3 = 0.5   #噪声项权重
+        w1 = 0.6    #目标距离项权重 (s_dist)
+        w2 = 0.5    #噪声项权重 (s_noise)
+        w3 = 1.0   #障碍物安全项权重 (s_obs)
         c  = 1.5
-        r_obs = 2.0
+        r_obs = 1.0
         grid_step = 0.8
 
     class curriculum:

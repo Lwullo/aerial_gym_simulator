@@ -8,6 +8,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # Registers 3D projection.
 
 import aerial_gym.task  # registers tasks
 from aerial_gym.registry.task_registry import task_registry
@@ -107,21 +108,22 @@ def main():
     output_dir = os.path.dirname(__file__)
     txt_path = os.path.join(output_dir, "score_components_boxplot.txt")
     png_path = os.path.join(output_dir, "score_components_boxplot.png")
+    heatmap_path = os.path.join(output_dir, "score_3d_heatmap.png")
 
     s_safe = s_obs
     w1 = float(score_cfg.w1)
     w2 = float(score_cfg.w2)
     w3 = float(score_cfg.w3)
 
-    w1_safe = torch.where(valid_mask, w1 * s_safe, torch.tensor(float("nan"), device=device))
-    w2_dist = torch.where(valid_mask, w2 * s_dist, torch.tensor(float("nan"), device=device))
-    w3_noise = torch.where(valid_mask, w3 * s_noise, torch.tensor(float("nan"), device=device))
+    w1_dist = torch.where(valid_mask, w1 * s_dist, torch.tensor(float("nan"), device=device))
+    w2_noise = torch.where(valid_mask, w2 * s_noise, torch.tensor(float("nan"), device=device))
+    w3_safe = torch.where(valid_mask, w3 * s_safe, torch.tensor(float("nan"), device=device))
 
     data = torch.cat(
-        [points, w1_safe.unsqueeze(1), w2_dist.unsqueeze(1), w3_noise.unsqueeze(1)], dim=1
+        [points, w1_dist.unsqueeze(1), w2_noise.unsqueeze(1), w3_safe.unsqueeze(1)], dim=1
     ).detach().cpu().numpy()
     header = (
-        "x y z w1S_safe w2S_dist w3S_noise\n"
+        "x y z w1S_dist w2S_noise w3S_safe\n"
         f"bounds_min={bounds_min.detach().cpu().tolist()}\n"
         f"bounds_max={bounds_max.detach().cpu().tolist()}\n"
         f"grid_step={grid_step}\n"
@@ -131,14 +133,14 @@ def main():
     )
     np.savetxt(txt_path, data, fmt="%.6f", header=header)
 
-    safe_vals = w1_safe[valid_mask].detach().cpu().numpy()
-    dist_vals = w2_dist[valid_mask].detach().cpu().numpy()
-    noise_vals = w3_noise[valid_mask].detach().cpu().numpy()
+    dist_vals = w1_dist[valid_mask].detach().cpu().numpy()
+    noise_vals = w2_noise[valid_mask].detach().cpu().numpy()
+    safe_vals = w3_safe[valid_mask].detach().cpu().numpy()
 
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.boxplot(
-        [safe_vals, dist_vals, noise_vals],
-        labels=["w1*S_safe", "w2*S_dist", "w3*S_noise"],
+        [dist_vals, noise_vals, safe_vals],
+        labels=["w1*S_dist", "w2*S_noise", "w3*S_safe"],
         showfliers=False,
     )
     ax.set_ylabel("Score")
@@ -147,8 +149,82 @@ def main():
     fig.savefig(png_path, dpi=200)
     plt.close(fig)
 
+    points_cpu = points[valid_mask].detach().cpu().numpy()
+    scores_cpu = total_score[valid_mask].detach().cpu().numpy()
+    goal_cpu = goal.detach().cpu().numpy()
+    best_cpu = best_point.detach().cpu().numpy()
+    obs_pos_cpu = obs_pos.detach().cpu().numpy()
+    bounds_min_cpu = bounds_min.detach().cpu().numpy()
+    bounds_max_cpu = bounds_max.detach().cpu().numpy()
+    r_obs = float(score_cfg.r_obs)
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    sc = ax.scatter(
+        points_cpu[:, 0],
+        points_cpu[:, 1],
+        points_cpu[:, 2],
+        c=scores_cpu,
+        s=4,
+        cmap="viridis",
+        alpha=0.6,
+        linewidth=0,
+    )
+    cbar = fig.colorbar(sc, ax=ax, pad=0.1, shrink=0.7)
+    cbar.set_label("Total Score")
+
+    sphere_u = np.linspace(0.0, 2.0 * np.pi, 18)
+    sphere_v = np.linspace(0.0, np.pi, 12)
+    sphere_x = np.outer(np.cos(sphere_u), np.sin(sphere_v))
+    sphere_y = np.outer(np.sin(sphere_u), np.sin(sphere_v))
+    sphere_z = np.outer(np.ones_like(sphere_u), np.cos(sphere_v))
+    for center in obs_pos_cpu:
+        ax.plot_surface(
+            r_obs * sphere_x + center[0],
+            r_obs * sphere_y + center[1],
+            r_obs * sphere_z + center[2],
+            color="gray",
+            alpha=0.25,
+            linewidth=0,
+            antialiased=False,
+        )
+
+    ax.scatter(
+        [goal_cpu[0]],
+        [goal_cpu[1]],
+        [goal_cpu[2]],
+        c="red",
+        s=120,
+        marker="*",
+        label="Goal",
+    )
+    ax.scatter(
+        [best_cpu[0]],
+        [best_cpu[1]],
+        [best_cpu[2]],
+        c="black",
+        s=80,
+        marker="X",
+        label="Best",
+    )
+
+    ax.set_xlim(bounds_min_cpu[0], bounds_max_cpu[0])
+    ax.set_ylim(bounds_min_cpu[1], bounds_max_cpu[1])
+    ax.set_zlim(bounds_min_cpu[2], bounds_max_cpu[2])
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.set_title("3D Score Heatmap")
+    ax.legend(loc="upper right")
+
+    fig.tight_layout()
+    fig.savefig(heatmap_path, dpi=200)
+    plt.close(fig)
+
     print(f"Best point: {best_point.detach().cpu().tolist()} score={float(best_score.detach().cpu())}")
     print(f"Saved PNG: {png_path}")
+    print(f"Saved 3D heatmap PNG: {heatmap_path}")
     print(f"Saved TXT: {txt_path}")
 
 
