@@ -1,3 +1,4 @@
+import argparse
 import os
 
 import isaacgym  # must be imported before torch
@@ -14,11 +15,35 @@ import aerial_gym.task  # registers tasks
 from aerial_gym.registry.task_registry import task_registry
 
 
-def main():
+def parse_args():
+    parser = argparse.ArgumentParser(description="Compute score map for navigation_task_gmm_noise.")
+    parser.add_argument("--preset_id", type=int, default=None, help="Fixed env preset id (0/1/2).")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed override.")
+    parser.add_argument(
+        "--out_tag",
+        type=str,
+        default="",
+        help="Optional suffix for output files (e.g., preset_0).",
+    )
+    return parser.parse_args()
+
+
+def main(args=None):
+    if args is None:
+        args = parse_args()
+
+    task_name = "navigation_task_gmm_noise"
+    task_config = task_registry.get_task_config(task_name)
+    if args.preset_id is not None:
+        task_config.preset_id = int(args.preset_id)
+    if args.seed is not None:
+        task_config.seed = int(args.seed)
+
     task = task_registry.make_task(
-        "navigation_task_gmm_noise",
+        task_name,
         headless=True,
         num_envs=1,
+        seed=args.seed,
     )
     task.reset()
 
@@ -106,9 +131,10 @@ def main():
     best_score = total_score[best_idx]
 
     output_dir = os.path.dirname(__file__)
-    txt_path = os.path.join(output_dir, "score_components_boxplot.txt")
-    png_path = os.path.join(output_dir, "score_components_boxplot.png")
-    heatmap_path = os.path.join(output_dir, "score_3d_heatmap.png")
+    suffix = f"_{args.out_tag}" if args.out_tag else ""
+    txt_path = os.path.join(output_dir, f"score_components_boxplot{suffix}.txt")
+    png_path = os.path.join(output_dir, f"score_components_boxplot{suffix}.png")
+    heatmap_path = os.path.join(output_dir, f"score_3d_heatmap{suffix}.png")
 
     s_safe = s_obs
     w1 = float(score_cfg.w1)
@@ -129,6 +155,7 @@ def main():
         f"grid_step={grid_step}\n"
         f"w1={score_cfg.w1} w2={score_cfg.w2} w3={score_cfg.w3} c={score_cfg.c} r_obs={score_cfg.r_obs}\n"
         f"d_max={float(d_max.detach().cpu())} G_max=1.0\n"
+        f"preset_id={getattr(task.task_config, 'preset_id', None)} seed={args.seed}\n"
         f"best_point={best_point.detach().cpu().tolist()} best_score={float(best_score.detach().cpu())}"
     )
     np.savetxt(txt_path, data, fmt="%.6f", header=header)
@@ -154,6 +181,7 @@ def main():
     goal_cpu = goal.detach().cpu().numpy()
     best_cpu = best_point.detach().cpu().numpy()
     obs_pos_cpu = obs_pos.detach().cpu().numpy()
+    noise_centers_cpu = centers.detach().cpu().numpy()
     bounds_min_cpu = bounds_min.detach().cpu().numpy()
     bounds_max_cpu = bounds_max.detach().cpu().numpy()
     r_obs = float(score_cfg.r_obs)
@@ -207,6 +235,15 @@ def main():
         s=80,
         marker="X",
         label="Best",
+    )
+    ax.scatter(
+        noise_centers_cpu[:, 0],
+        noise_centers_cpu[:, 1],
+        noise_centers_cpu[:, 2],
+        c="orange",
+        s=60,
+        marker="^",
+        label="Noise Source",
     )
 
     ax.set_xlim(bounds_min_cpu[0], bounds_max_cpu[0])

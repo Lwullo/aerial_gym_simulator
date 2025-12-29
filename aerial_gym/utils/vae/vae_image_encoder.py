@@ -35,8 +35,17 @@ class VAEImageEncoder:
         Class to encode the set of images to a latent space. We can return both the means and sampled latent space variables.
         """
         with torch.no_grad():
-            # need to squeeze 0th dimension and unsqueeze 1st dimension to make it work with the VAE
-            image_tensors = image_tensors.squeeze(0).unsqueeze(1)
+            # Ensure input is (N, 1, H, W). If multiple sensors are present, take per-pixel min.
+            if image_tensors.ndim == 2:
+                image_tensors = image_tensors.unsqueeze(0)
+            if image_tensors.ndim == 3:
+                image_tensors = image_tensors.unsqueeze(1)
+            elif image_tensors.ndim == 4:
+                image_tensors = torch.amin(image_tensors, dim=1, keepdim=True)
+            else:
+                raise ValueError(
+                    f"Expected image_tensors with 2-4 dims, got shape {tuple(image_tensors.shape)}"
+                )
             x_res, y_res = image_tensors.shape[-2], image_tensors.shape[-1]
             if self.config.image_res != (x_res, y_res):
                 interpolated_image = torch.nn.functional.interpolate(

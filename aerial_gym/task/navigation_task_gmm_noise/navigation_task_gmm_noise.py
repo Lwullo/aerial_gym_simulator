@@ -135,10 +135,17 @@ class NavigationTaskGmmNoise(BaseTask):
         self._apply_fixed_env_bounds()
         self._set_fixed_obstacle_count()
         self._init_noise_buffers()
+        self._load_fixed_env_preset()
 
         self.best_total_score = float("-inf")
         self.best_position = None
         self.best_point_path = self._resolve_best_point_path()
+        log_flag = os.environ.get("AERIAL_GYM_LOG_STEP_SCORES", "0").strip().lower()
+        self.log_step_scores = log_flag in ("1", "true", "yes", "y", "t")
+        self.log_step_env_id = 0
+        self._episode_step_log = []
+        self._episode_step_idx = 0
+        self._episode_log_written = False
 
         # Ensure assets are placed within the fixed bounds.
         self.sim_env.reset()
@@ -202,6 +209,143 @@ class NavigationTaskGmmNoise(BaseTask):
             self.noise_config.sigma_max, device=self.device, requires_grad=False
         )
 
+    def _load_fixed_env_preset(self):
+        preset_id = getattr(self.task_config, "preset_id", -1)
+        try:
+            preset_id = int(preset_id)
+        except (TypeError, ValueError):
+            preset_id = -1
+
+        self.fixed_env_enabled = False
+        self.fixed_env_preset_id = preset_id
+        self.fixed_env_preset_name = None
+
+        if preset_id < 0:
+            return
+
+        presets = getattr(self.task_config, "fixed_env_presets", None)
+        if not presets or preset_id >= len(presets):
+            raise ValueError(f"Invalid preset_id={preset_id}. Check fixed_env_presets.")
+
+        preset = presets[preset_id]
+        required_keys = (
+            "target_position",
+            "noise_centers",
+            "noise_sigmas",
+            "noise_weights",
+            "obstacle_positions",
+        )
+        for key in required_keys:
+            if key not in preset:
+                raise ValueError(f"Fixed preset {preset_id} missing key: {key}")
+
+        self.fixed_env_preset_name = preset.get("name", f"preset_{preset_id}")
+
+        target_position = torch.tensor(
+            preset["target_position"], device=self.device, dtype=torch.float32
+        )
+        if target_position.shape != (3,):
+            raise ValueError("Fixed target_position must be a 3D vector.")
+
+        obstacle_positions = torch.tensor(
+            preset["obstacle_positions"], device=self.device, dtype=torch.float32
+        )
+        if obstacle_positions.ndim != 2 or obstacle_positions.shape[1] != 3:
+            raise ValueError("Fixed obstacle_positions must be shaped as (N, 3).")
+
+        expected_obstacles = int(self.task_config.num_obstacles_in_env)
+        if obstacle_positions.shape[0] < expected_obstacles:
+            raise ValueError(
+                f"Fixed obstacle_positions count {obstacle_positions.shape[0]} "
+                f"is less than num_obstacles_in_env={expected_obstacles}."
+            )
+        if obstacle_positions.shape[0] != expected_obstacles:
+            obstacle_positions = obstacle_positions[:expected_obstacles]
+
+        noise_centers = torch.tensor(
+            preset["noise_centers"], device=self.device, dtype=torch.float32
+        )
+        noise_sigmas = torch.tensor(
+            preset["noise_sigmas"], device=self.device, dtype=torch.float32
+        )
+        noise_weights = torch.tensor(
+            preset["noise_weights"], device=self.device, dtype=torch.float32
+        )
+
+        expected_sources = int(self.num_noise_sources)
+        if noise_centers.shape != (expected_sources, 3):
+            raise ValueError("Fixed noise_centers must be shaped as (num_sources, 3).")
+        if noise_sigmas.shape != (expected_sources, 3):
+            raise ValueError("Fixed noise_sigmas must be shaped as (num_sources, 3).")
+        if noise_weights.shape != (expected_sources,):
+            raise ValueError("Fixed noise_weights must be shaped as (num_sources,).")
+
+        weight_sum = float(noise_weights.sum().item())
+        if weight_sum <= 0.0:
+            raise ValueError("Fixed noise_weights must sum to a positive value.")
+        noise_weights = noise_weights / weight_sum
+
+        self.fixed_target_position = target_position
+        self.fixed_obstacle_positions = obstacle_positions
+        self.fixed_noise_centers = noise_centers
+        self.fixed_noise_sigmas = noise_sigmas
+        self.fixed_noise_weights = noise_weights
+        self.fixed_obstacle_orientation = torch.tensor(
+            [0.0, 0.0, 0.0, 1.0], device=self.device, dtype=torch.float32
+        )
+
+        self.fixed_env_enabled = True
+        logger.info(
+            "Fixed env preset enabled: %s (id=%s)",
+            self.fixed_env_preset_name,
+            self.fixed_env_preset_id,
+        )
+
+    def _apply_fixed_target(self, env_ids):
+        target = self.fixed_target_position.view(1, 3).expand(env_ids.shape[0], -1)
+        self.target_position[env_ids] = target
+
+    def _apply_fixed_noise(self, env_ids):
+        num_envs = env_ids.shape[0]
+        centers = self.fixed_noise_centers.view(1, -1, 3).expand(num_envs, -1, -1)
+        sigmas = self.fixed_noise_sigmas.view(1, -1, 3).expand(num_envs, -1, -1)
+        weights = self.fixed_noise_weights.view(1, -1).expand(num_envs, -1)
+        self.noise_centers[env_ids] = centers
+        self.noise_sigmas[env_ids] = sigmas
+        self.noise_weights[env_ids] = weights
+
+    def _apply_fixed_obstacles(self, env_ids):
+        num_assets = self.obs_dict["obstacle_position"].shape[1]
+        keep_in_env = int(getattr(self.sim_env, "keep_in_env", 0) or 0)
+        num_obstacles = int(self.fixed_obstacle_positions.shape[0])
+        start_idx = keep_in_env
+        end_idx = start_idx + num_obstacles
+        if end_idx > num_assets:
+            raise ValueError(
+                f"Fixed obstacles exceed available assets: need {end_idx}, have {num_assets}."
+            )
+
+        positions = self.fixed_obstacle_positions.view(1, num_obstacles, 3).expand(
+            env_ids.shape[0], -1, -1
+        )
+        orientations = self.fixed_obstacle_orientation.view(1, 1, 4).expand(
+            env_ids.shape[0], num_obstacles, -1
+        )
+
+        self.obs_dict["obstacle_position"][env_ids, start_idx:end_idx, :] = positions
+        self.obs_dict["obstacle_orientation"][env_ids, start_idx:end_idx, :] = orientations
+        self.obs_dict["obstacle_linvel"][env_ids, start_idx:end_idx, :].zero_()
+        self.obs_dict["obstacle_angvel"][env_ids, start_idx:end_idx, :].zero_()
+
+        if end_idx < num_assets:
+            self.obs_dict["obstacle_position"][env_ids, end_idx:, :] = -1000.0
+            self.obs_dict["obstacle_linvel"][env_ids, end_idx:, :].zero_()
+            self.obs_dict["obstacle_angvel"][env_ids, end_idx:, :].zero_()
+
+        self.sim_env.IGE_env.write_to_sim()
+        if self.sim_env.use_warp:
+            self.sim_env.warp_env.reset_idx(env_ids)
+
     def _resample_noise_sources(self, env_ids):
         if not self.noise_config.enable_noise or self.num_noise_sources <= 0:
             return
@@ -228,6 +372,57 @@ class NavigationTaskGmmNoise(BaseTask):
         self.noise_centers[env_ids] = centers
         self.noise_sigmas[env_ids] = sigmas
         self.noise_weights[env_ids] = weights
+
+    def _draw_env0_debug_markers(self):
+        viewer_ctrl = getattr(self.sim_env.IGE_env, "viewer", None)
+        if viewer_ctrl is None or viewer_ctrl.viewer is None:
+            return
+
+        gym = self.sim_env.IGE_env.gym
+        env_handles = getattr(self.sim_env.IGE_env, "env_handles", None)
+        if not env_handles:
+            return
+        env_handle = env_handles[0]
+
+        if hasattr(gym, "clear_lines"):
+            gym.clear_lines(viewer_ctrl.viewer)
+
+        target = self.target_position[0].detach().cpu().numpy()
+        noise_centers = self.noise_centers[0].detach().cpu().numpy()
+
+        lines = []
+        colors = []
+
+        axis_half_len = 0.25  # axis length = 0.5
+        axes = np.eye(3, dtype=np.float32)
+        for i in range(3):
+            start = target - axis_half_len * axes[i]
+            end = target + axis_half_len * axes[i]
+            lines.append([start, end])
+            colors.append([0.0, 1.0, 0.0])
+
+        radius = 0.3
+        segments = 24
+        angles = np.linspace(0.0, 2.0 * np.pi, segments + 1, dtype=np.float32)
+        cos_a = np.cos(angles)
+        sin_a = np.sin(angles)
+        unit_xy = np.stack([cos_a, sin_a, np.zeros_like(cos_a)], axis=1)
+        unit_xz = np.stack([cos_a, np.zeros_like(cos_a), sin_a], axis=1)
+        unit_yz = np.stack([np.zeros_like(cos_a), cos_a, sin_a], axis=1)
+
+        for center in noise_centers:
+            for unit_circle in (unit_xy, unit_xz, unit_yz):
+                pts = center + radius * unit_circle
+                for idx in range(segments):
+                    lines.append([pts[idx], pts[idx + 1]])
+                    colors.append([1.0, 0.0, 0.0])
+
+        if not lines:
+            return
+
+        line_vertices = np.array(lines, dtype=np.float32).reshape(-1, 3)
+        line_colors = np.array(colors, dtype=np.float32)
+        gym.add_lines(viewer_ctrl.viewer, env_handle, line_colors.shape[0], line_vertices, line_colors)
 
     def _compute_position_noise(self):
         if not self.noise_config.enable_noise or self.num_noise_sources <= 0:
@@ -278,7 +473,10 @@ class NavigationTaskGmmNoise(BaseTask):
         s_dist, s_noise, s_obs, total_score = self._compute_score_components(position)
         reward_goal = self.reward_params["goal_reward_weight"] * s_dist
         reward_noise = self.reward_params["noise_reward_weight"] * s_noise
-        reward = reward_goal + reward_noise
+        body_rate_weight = self.reward_params["body_rate_penalty_weight"]
+        body_rates = self.obs_dict["robot_body_angvel"]
+        body_rate_penalty = -body_rate_weight * (body_rates * body_rates).sum(dim=1)
+        reward = reward_goal + reward_noise + body_rate_penalty
 
         collision_penalty = self.reward_params["collision_penalty"]
         reward = torch.where(
@@ -289,6 +487,19 @@ class NavigationTaskGmmNoise(BaseTask):
         return reward, total_score, s_dist, s_noise, s_obs, reward_goal, reward_noise
 
     def _update_best_point(self, total_score):
+        if self.log_step_scores:
+            env_id = min(self.log_step_env_id, total_score.shape[0] - 1)
+            step_best_score_val = float(total_score[env_id].item())
+            if step_best_score_val > self.best_total_score:
+                self.best_total_score = step_best_score_val
+                self.best_position = self.obs_dict["robot_position"][env_id].detach().cpu()
+                logger.info(
+                    "New best total_score=%s position=%s",
+                    self.best_total_score,
+                    self.best_position.tolist(),
+                )
+            return
+
         step_best_score, step_best_idx = torch.max(total_score, dim=0)
         step_best_score_val = float(step_best_score.item())
         if step_best_score_val > self.best_total_score:
@@ -310,6 +521,32 @@ class NavigationTaskGmmNoise(BaseTask):
         with open(self.best_point_path, "w", encoding="utf-8") as handle:
             handle.write(f"score={self.best_total_score}\n")
             handle.write(f"position={self.best_position.tolist()}\n")
+
+    def _record_step_score(self, total_score):
+        if self._episode_log_written:
+            return
+        env_id = self.log_step_env_id
+        if env_id < 0 or env_id >= total_score.shape[0]:
+            return
+        pos = self.obs_dict["robot_position"][env_id].detach().cpu().tolist()
+        score = float(total_score[env_id].item())
+        self._episode_step_log.append((self._episode_step_idx, pos, score))
+        self._episode_step_idx += 1
+
+    def _write_best_point_log(self):
+        if self.best_position is None:
+            return
+        self._resolve_best_point_path()
+        with open(self.best_point_path, "w", encoding="utf-8") as handle:
+            handle.write(f"score={self.best_total_score}\n")
+            handle.write(f"position={self.best_position.tolist()}\n")
+            handle.write("step,x,y,z,total_score\n")
+            for step_idx, pos, score in self._episode_step_log:
+                handle.write(
+                    f"{step_idx},{pos[0]:.6f},{pos[1]:.6f},{pos[2]:.6f},{score:.6f}\n"
+                )
+            handle.write(f"best_score={self.best_total_score}\n")
+            handle.write(f"best_position={self.best_position.tolist()}\n")
 
     def _populate_extras(
         self, total_score, reward, reward_goal, reward_noise, s_dist, s_noise, s_obs
@@ -343,16 +580,29 @@ class NavigationTaskGmmNoise(BaseTask):
         return self.get_return_tuple()
 
     def reset_idx(self, env_ids):
-        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device).view(-1)
+        if env_ids.numel() == 0:
+            return
+        if self.log_step_scores and not self._episode_log_written:
+            if (env_ids == self.log_step_env_id).any().item():
+                self._episode_step_log = []
+                self._episode_step_idx = 0
         self._set_fixed_obstacle_count()
-        target_ratio = torch_rand_float_tensor(self.target_min_ratio, self.target_max_ratio)
-        self.target_position[env_ids] = torch_interpolate_ratio(
-            min=self.obs_dict["env_bounds_min"][env_ids],
-            max=self.obs_dict["env_bounds_max"][env_ids],
-            ratio=target_ratio[env_ids],
-        )
-        if self.noise_config.resample_on_reset:
-            self._resample_noise_sources(env_ids)
+        if self.fixed_env_enabled:
+            self._apply_fixed_target(env_ids)
+            self._apply_fixed_noise(env_ids)
+            self._apply_fixed_obstacles(env_ids)
+        else:
+            target_ratio = torch_rand_float_tensor(self.target_min_ratio, self.target_max_ratio)
+            self.target_position[env_ids] = torch_interpolate_ratio(
+                min=self.obs_dict["env_bounds_min"][env_ids],
+                max=self.obs_dict["env_bounds_max"][env_ids],
+                ratio=target_ratio[env_ids],
+            )
+            if self.noise_config.resample_on_reset:
+                self._resample_noise_sources(env_ids)
+        if (env_ids == 0).any().item():
+            self._draw_env0_debug_markers()
         self.infos = {}
         return
 
@@ -496,8 +746,16 @@ class NavigationTaskGmmNoise(BaseTask):
             self.infos["successes"], self.infos["crashes"], self.infos["timeouts"]
         )
 
+        if self.log_step_scores and not self._episode_log_written:
+            self._record_step_score(total_score)
         self._update_best_point(total_score)
         self._populate_extras(total_score, self.rewards, reward_goal, reward_noise, s_dist, s_noise, s_obs)
+        if self.log_step_scores and not self._episode_log_written:
+            env_id = min(self.log_step_env_id, self.truncations.shape[0] - 1)
+            done = (self.terminations[env_id] > 0) | (self.truncations[env_id] > 0)
+            if bool(done.item()):
+                self._write_best_point_log()
+                self._episode_log_written = True
 
         reset_envs = self.sim_env.post_reward_calculation_step()
         if len(reset_envs) > 0:

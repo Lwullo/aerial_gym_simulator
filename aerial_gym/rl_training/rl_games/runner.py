@@ -244,6 +244,12 @@ def get_args():
             "help": "Name of the experiment to run or load. Overrides config file if provided.",
         },
         {
+            "name": "--preset_id",
+            "type": int,
+            "default": -1,
+            "help": "Fixed environment preset id for tasks that support it (-1 disables).",
+        },
+        {
             "name": "--headless",
             "type": lambda x: bool(distutils.util.strtobool(x)),
             "default": "False",
@@ -319,6 +325,10 @@ if __name__ == "__main__":
         config = yaml.safe_load(stream)
 
         config = update_config(config, args)
+
+        if args.get("preset_id", -1) is not None:
+            task_cfg = task_registry.get_task_config(args["task"])
+            task_cfg.preset_id = int(args["preset_id"])
 
         experiment_name = config.get("params", {}).get("config", {}).get("name", "gen_ppo")
         runs_dir = os.path.join(runner_dir, "runs")
