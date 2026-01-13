@@ -66,11 +66,12 @@ class panel_asset_params(asset_state_params):
     num_assets = 3
 
     asset_folder = f"{AERIAL_GYM_DIRECTORY}/resources/models/environment_assets/panels"
+    file = "panel.urdf"  # 固定使用 panel.urdf (尺寸: 0.1×1.2×3.0m)
 
     collision_mask = 1  # objects with the same collision mask will not collide
 
     min_position_ratio = [0.3, 0.05, 0.05]  # max position as a ratio of the bounds
-    max_position_ratio = [0.85, 0.95, 0.95]  # min position as a ratio of the bounds
+    max_position_ratio = [0.85, 0.95, 0.45]  # Z reduced: panel is 3m tall, max center at ~2m for 4.5m bounds
 
     specified_position = [
         -1000.0,
@@ -99,7 +100,7 @@ class panel_asset_params(asset_state_params):
     max_state_ratio = [
         0.85,
         0.95,
-        0.95,
+        0.45,  # Z reduced: panel is 3m tall, max center at ~2m for 4.5m bounds
         0.0,
         0.0,
         np.pi / 3.0,
@@ -305,6 +306,7 @@ class object_asset_params(asset_state_params):
     num_assets = 35
 
     asset_folder = f"{AERIAL_GYM_DIRECTORY}/resources/models/environment_assets/objects"
+    file = "small_cube.urdf"  # 默认使用 small_cube.urdf (尺寸: 0.4×0.4×0.4m)
 
     min_state_ratio = [
         0.30,
@@ -324,7 +326,7 @@ class object_asset_params(asset_state_params):
     max_state_ratio = [
         0.85,
         0.9,
-        0.9,
+        0.75,  # Z reduced: objects max center at ~3.4m for 4.5m bounds
         np.pi,
         np.pi,
         np.pi,

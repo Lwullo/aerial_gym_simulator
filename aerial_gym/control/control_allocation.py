@@ -65,19 +65,40 @@ class ControlAllocator:
         return forces, torques
 
     def update_wrench(self, ref_wrench):
+        
+        # DEBUG: Print every 100 calls
+        if not hasattr(self, 'debug_counter'):
+            self.debug_counter = 0
+        self.debug_counter += 1
+        
+        # if self.debug_counter % 100 == 0:
+        #     print(f"\n[ALLOC DEBUG] Step {self.debug_counter}:")
+        #     print(f"  Input wrench: {ref_wrench[0].cpu().numpy()}")
 
         ref_motor_thrusts = torch.bmm(
             self.inv_force_torque_allocation_matrix, ref_wrench.unsqueeze(-1)
         ).squeeze(-1)
+        
+        # if self.debug_counter % 100 == 0:
+        #     print(f"  Ref motor thrusts (before clamp): {ref_motor_thrusts[0].cpu().numpy()}")
 
         ref_motor_thrusts = torch.clamp(ref_motor_thrusts, min=0.5, max=40.0)
+        
+        # if self.debug_counter % 100 == 0:
+        #     print(f"  Ref motor thrusts (after clamp): {ref_motor_thrusts[0].cpu().numpy()}")
 
         # print("ref thrust:", ref_motor_thrusts[0])
         current_motor_thrust = self.motor_model.update_motor_thrusts(ref_motor_thrusts)
+        
+        # if self.debug_counter % 100 == 0:
+        #     print(f"  Actual motor thrusts (from motor model): {current_motor_thrust[0].cpu().numpy()}")
 
         self.output_wrench[:] = torch.bmm(
             self.force_torque_allocation_matrix, current_motor_thrust.unsqueeze(-1)
         ).squeeze(-1)
+        
+        # if self.debug_counter % 100 == 0:
+        #     print(f"  Output wrench (reconstructed): {self.output_wrench[0].cpu().numpy()}")
 
         return self.output_wrench
 

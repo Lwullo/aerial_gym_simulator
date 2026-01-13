@@ -6,6 +6,21 @@ import subprocess
 import sys
 import yaml
 
+PRESET_OBS_COUNTS = {
+    0: 6,
+    1: 12,
+    2: 15,
+}
+
+
+def _inject_preset_env(env, preset_id):
+    env["AERIAL_GYM_EVAL_MODE"] = "1"
+    if preset_id >= 0:
+        env["AERIAL_GYM_PRESET_ID"] = str(preset_id)
+    obs_count = PRESET_OBS_COUNTS.get(preset_id)
+    if obs_count is not None:
+        env["AERIAL_GYM_NUM_OBS"] = str(obs_count)
+
 
 def str2bool(value):
     if isinstance(value, bool):
@@ -132,6 +147,25 @@ def _write_single_episode_config(config_path, output_dir, tag):
     return out_path
 
 
+def _run_with_tee(cmd, log_path, env=None):
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+            bufsize=1,
+        )
+        if process.stdout is None:
+            return process.wait()
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            log_file.write(line)
+        return process.wait()
+
+
 def main():
     args = parse_args()
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -152,6 +186,8 @@ def main():
     out_tag = f"preset_{preset_id}"
 
     if args.run_score_map:
+        score_env = os.environ.copy()
+        _inject_preset_env(score_env, preset_id)
         score_cmd = [
             python,
             score_map_path,
@@ -164,7 +200,9 @@ def main():
             score_cmd += ["--seed", str(args.seed)]
         score_log = os.path.join(log_dir, f"compute_score_map_{out_tag}.log")
         with open(score_log, "w", encoding="utf-8") as log_file:
-            score_code = subprocess.call(score_cmd, stdout=log_file, stderr=subprocess.STDOUT)
+            score_code = subprocess.call(
+                score_cmd, stdout=log_file, stderr=subprocess.STDOUT, env=score_env
+            )
         if score_code != 0:
             print(f"score_map preset {preset_id} failed with code {score_code} (log: {score_log})")
             sys.exit(score_code)
@@ -214,12 +252,11 @@ def main():
     if args.seed is not None:
         runner_cmd += ["--seed", str(args.seed)]
     runner_log = os.path.join(log_dir, f"runner_{out_tag}.log")
-    with open(runner_log, "w", encoding="utf-8") as log_file:
-        runner_env = os.environ.copy()
-        runner_env["AERIAL_GYM_LOG_STEP_SCORES"] = "1"
-        runner_code = subprocess.call(
-            runner_cmd, stdout=log_file, stderr=subprocess.STDOUT, env=runner_env
-        )
+    runner_env = os.environ.copy()
+    _inject_preset_env(runner_env, preset_id)
+    runner_env["AERIAL_GYM_LOG_STEP_SCORES"] = "1"
+    runner_env["AERIAL_GYM_EVAL_MODE"] = "1"  # Enable eval mode: exit after first episode
+    runner_code = _run_with_tee(runner_cmd, runner_log, env=runner_env)
     if runner_code != 0:
         print(f"runner preset {preset_id} failed with code {runner_code} (log: {runner_log})")
         sys.exit(runner_code)

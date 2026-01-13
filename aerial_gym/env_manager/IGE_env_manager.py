@@ -445,7 +445,7 @@ class IsaacGymEnv(BaseManager):
             self.sim,
             gymtorch.unwrap_tensor(self.global_tensor_dict["global_force_tensor"]),
             gymtorch.unwrap_tensor(self.global_tensor_dict["global_torque_tensor"]),
-            gymapi.LOCAL_SPACE,
+            gymapi.ENV_SPACE,  # CHANGED: Use ENV_SPACE for world coordinate forces
         )
         if self.sim_has_dof:
             self.dof_control_mode = self.global_tensor_dict["dof_control_mode"]

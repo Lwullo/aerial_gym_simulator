@@ -23,31 +23,31 @@ class LMF2Cfg:
             0.1,
             0.15,
             0.15,
-            0,  # -np.pi / 6,
-            0,  # -np.pi / 6,
-            -np.pi / 6,
+            0,  # roll = 0° (fixed)
+            0,  # pitch = 0° (fixed)
+            -np.pi / 6,  # yaw random [-30°, +30°]
             1.0,
-            -0.2,
-            -0.2,
-            -0.2,
-            -0.2,
-            -0.2,
-            -0.2,
+            0.0,  # vx = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
+            0.0,  # vy = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
+            0.0,  # vz = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
+            0.0,  # wx = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
+            0.0,  # wy = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
+            0.0,  # wz = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
         ]
         max_init_state = [
             0.2,
             0.85,
             0.85,
-            0,  # np.pi / 6,
-            0,  # np.pi / 6,
-            np.pi / 6,
+            0,  # roll = 0° (fixed)
+            0,  # pitch = 0° (fixed)
+            np.pi / 6,  # yaw random [-30°, +30°]
             1.0,
-            0.2,
-            0.2,
-            0.2,
-            0.2,
-            0.2,
-            0.2,
+            0.0,  # vx = 0 (MODIFIED: was 0.2 for training, now 0 for stability test)
+            0.0,  # vy = 0 (MODIFIED: was 0.2 for training, now 0 for stability test)
+            0.0,  # vz = 0 (MODIFIED: was 0.2 for training, now 0 for stability test)
+            0.0,  # wx = 0 (MODIFIED: was 0.2 for training, now 0 for stability test)
+            0.0,  # wy = 0 (MODIFIED: was 0.2 for training, now 0 for stability test)
+            0.0,  # wz = 0 (MODIFIED: was 0.2 for training, now 0 for stability test)
         ]
         # min_init_state = [0.5, 0.5, 0.5, 0, 0, 0, 1.0, 0, 0, 0, 0, 0, 0]
         # max_init_state = min_init_state

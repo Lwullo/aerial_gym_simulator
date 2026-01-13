@@ -18,41 +18,21 @@ class control:
     max_inclination_angle_rad = np.pi / 3.0
     max_yaw_rate = np.pi / 3.0
     scale_pos=0.5
-    scale_vel=0.3
-    scale_rot=1.5
-    scale_angvel=2.7
+    scale_vel=1.0  # Set to 1.0 since using pre-scaled values
+    scale_rot=1.0  # Set to 1.0 since using pre-scaled values
+    scale_angvel=1.0  # Set to 1.0 since using pre-scaled values
 
-    K_pos_tensor_max =torch.tensor([0.7, 0.7, 1.0]) * scale_pos  # “当前位置”和“目标位置”之间的误差，输出一个期望的速度指令给K_vel
-    K_pos_tensor_min =torch.tensor([0.7, 0.7, 1.0]) * scale_pos# used for lee_position_control only
-#   K_pos_tensor_max =torch.tensor([2.0, 3.0, 1.0]) * scale_pos  # “当前位置”和“目标位置”之间的误差，输出一个期望的速度指令给K_vel
-#     K_pos_tensor_min =torch.tensor([2.0, 3.0, 1.0]) * scale_pos# used for lee_position_control only
+    K_pos_tensor_max = torch.tensor([0.7, 0.7, 1.0]) * scale_pos  # "当前位置"和"目标位置"之间的误差，输出一个期望的速度指令给K_vel
+    K_pos_tensor_min = torch.tensor([0.7, 0.7, 1.0]) * scale_pos  # used for lee_position_control only
 
-    # K_vel_tensor_max = [
-    #     0.33,
-    #     0.33,
-    #     0.13,
-    # ]  # used for lee_position_control, lee_velocity_control only
-    # K_vel_tensor_min = [0.27, 0.27, 0.17]
+    # Reference gains for faster velocity tracking
+    K_vel_tensor_max = torch.tensor([4.8, 4.8, 4.8])  # 从5.2降低
+    K_vel_tensor_min = torch.tensor([4.8, 4.8, 4.8])
 
-    K_vel_tensor_max =torch.tensor([
-        5.0,
-        5.0,
-        1.3,
-    ])*scale_vel # k_vel是“当前速度”和“期望速度”之间的误差，输出一个期望的姿态指令给K_rot
-    K_vel_tensor_min = torch.tensor([2.7,2.7,1.7])*scale_vel
+    K_rot_tensor_max = torch.tensor([6.5, 6.5, 1.5])  # 从7.0降低
+    K_rot_tensor_min = torch.tensor([6.5, 6.5, 1.5])
 
-    K_rot_tensor_max =torch.tensor([
-        1.85,
-        1.85,
-        0.4,
-    ])*scale_rot # 期望姿态”和“无人机当前姿态”之间的误差。输出一个期望的角速度指令给K_angvel
-    K_rot_tensor_min =torch.tensor( [1.6, 1.6, 0.25])*scale_rot
-
-    K_angvel_tensor_max = torch.tensor([
-        0.5,
-        0.5,
-        0.09,
-    ])*scale_angvel  # 期望角速度”和“无人机当前角速度”之间的误差，输出一个期望的推力指令，直接给电机
-    K_angvel_tensor_min = torch.tensor([0.4, 0.4, 0.075])*scale_angvel
+    K_angvel_tensor_max = torch.tensor([4.5, 4.5, 0.5])
+    K_angvel_tensor_min = torch.tensor([4.5, 4.5, 0.5])
 
     randomize_params = False

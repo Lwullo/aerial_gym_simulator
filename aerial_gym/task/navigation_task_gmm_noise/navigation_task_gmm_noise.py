@@ -1,6 +1,8 @@
 import os
+import sys
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 import gymnasium as gym
 from gym.spaces import Dict, Box
 
@@ -134,11 +136,48 @@ class NavigationTaskGmmNoise(BaseTask):
 
         self._apply_fixed_env_bounds()
         self._set_fixed_obstacle_count()
-        self._init_noise_buffers()
-        self._load_fixed_env_preset()
-
+        self.fixed_env_enabled = False
+        self.fixed_r_obs = 1.0
         self.best_total_score = float("-inf")
         self.best_position = None
+        
+        # Buffer for score gradient calculation
+        self.previous_total_score = torch.zeros(
+            self.sim_env.num_envs, device=self.device, requires_grad=False
+        )
+        
+        # GMM Physical Force buffers
+        self.gmm_force_config = self.task_config.gmm_force_config
+        self.gmm_force_direction = torch.zeros(
+            (self.sim_env.num_envs, 3), device=self.device, requires_grad=False
+        )
+        self.gmm_force_update_counter = torch.zeros(
+            self.sim_env.num_envs, device=self.device, dtype=torch.int32
+        )
+        
+        # Sliding average buffer for total_score (window size: 10)
+        self.score_window_size = 10
+        self.score_history = torch.zeros(
+            (self.sim_env.num_envs, self.score_window_size), device=self.device, requires_grad=False
+        )
+        self.score_history_idx = torch.zeros(
+            self.sim_env.num_envs, device=self.device, dtype=torch.int32
+        )
+        self.score_history_filled = torch.zeros(
+            self.sim_env.num_envs, device=self.device, dtype=torch.bool
+        )
+
+        # Cache score configuration for performance
+        sc = self.task_config.score_config
+        self.score_w1 = float(sc.w1)
+        self.score_w2 = float(sc.w2)
+        self.score_w3 = float(sc.w3)
+        self.score_c = float(sc.c)
+        self.score_r_obs = float(sc.r_obs)
+        
+        self._init_noise_buffers()
+        self._load_fixed_env_preset()
+        
         self.best_point_path = self._resolve_best_point_path()
         log_flag = os.environ.get("AERIAL_GYM_LOG_STEP_SCORES", "0").strip().lower()
         self.log_step_scores = log_flag in ("1", "true", "yes", "y", "t")
@@ -146,6 +185,24 @@ class NavigationTaskGmmNoise(BaseTask):
         self._episode_step_log = []
         self._episode_step_idx = 0
         self._episode_log_written = False
+
+        # Early crash handling configuration
+        self.early_crash_config = self.task_config.early_crash_config
+        self._early_crash_retries = torch.zeros(
+            self.sim_env.num_envs, device=self.device, dtype=torch.int32
+        )
+
+        # Eval mode: exit after first episode ends (only for run_parallel_eval.py --run-runner)
+        eval_mode_flag = os.environ.get("AERIAL_GYM_EVAL_MODE", "0").strip().lower()
+        self._eval_mode = eval_mode_flag in ("1", "true", "yes", "y", "t")
+        self._eval_init_phase_complete = False  # Track if we've passed initialization phase
+
+        # TensorBoard writer for direct metric logging
+        runs_dir = os.environ.get("AERIAL_GYM_RUNS_DIR", "runs")
+        experiment_name = os.environ.get("AERIAL_GYM_EXPERIMENT_NAME", "gmm_noise_diagnostics")
+        tb_log_dir = os.path.join(runs_dir, f"{experiment_name}_tb")
+        self._tb_writer = SummaryWriter(log_dir=tb_log_dir)
+        logger.info(f"TensorBoard logging to: {tb_log_dir}")
 
         # Ensure assets are placed within the fixed bounds.
         self.sim_env.reset()
@@ -190,6 +247,14 @@ class NavigationTaskGmmNoise(BaseTask):
     def _init_noise_buffers(self):
         num_envs = self.sim_env.num_envs
         num_sources = self.num_noise_sources
+        
+        # Initialize previous state buffers for reward calculation
+        self.previous_position = torch.zeros(
+            (num_envs, 3), device=self.device, requires_grad=False
+        )
+        self.previous_actions = torch.zeros(
+            (num_envs, 4), device=self.device, requires_grad=False
+        )
 
         self.noise_centers = torch.zeros(
             (num_envs, num_sources, 3), device=self.device, requires_grad=False
@@ -425,8 +490,14 @@ class NavigationTaskGmmNoise(BaseTask):
         gym.add_lines(viewer_ctrl.viewer, env_handle, line_colors.shape[0], line_vertices, line_colors)
 
     def _compute_position_noise(self):
+        # DEBUG: Print noise status every 50 steps
+        # if hasattr(self, 'num_task_steps') and self.num_task_steps % 50 == 0:
+        #     print(f"[NOISE DEBUG] enable_noise={self.noise_config.enable_noise}, num_sources={self.num_noise_sources}")
+        
         if not self.noise_config.enable_noise or self.num_noise_sources <= 0:
             self.position_noise.zero_()
+            # if hasattr(self, 'num_task_steps') and self.num_task_steps % 50 == 0:
+            #     print(f"[NOISE DEBUG] Position noise is DISABLED (returning zeros)")
             return self.position_noise
 
         position = self.obs_dict["robot_position"]
@@ -437,7 +508,90 @@ class NavigationTaskGmmNoise(BaseTask):
 
         noise = torch.randn_like(position) * mixture.unsqueeze(1) * self.noise_config.noise_scale
         self.position_noise[:] = noise
+        
+        # if hasattr(self, 'num_task_steps') and self.num_task_steps % 50 == 0:
+        #     print(f"[NOISE DEBUG] Position noise magnitude: {torch.norm(noise[0]).item():.4f}")
+        
         return self.position_noise
+    
+    def _update_gmm_force_direction(self):
+        """Update random force direction periodically based on force_update_steps."""
+        if not self.gmm_force_config.enable_physical_force:
+            return
+        
+        # Increment counter for all environments
+        self.gmm_force_update_counter += 1
+        
+        # Find environments that need direction update
+        update_mask = self.gmm_force_update_counter >= self.gmm_force_config.force_update_steps
+        
+        if update_mask.any():
+            num_to_update = update_mask.sum().item()
+            
+            # Generate random unit vectors for environments needing update
+            random_dirs = torch.randn((num_to_update, 3), device=self.device)
+            random_dirs = random_dirs / torch.norm(random_dirs, dim=1, keepdim=True)
+            
+            # Update directions and reset counters
+            self.gmm_force_direction[update_mask] = random_dirs
+            self.gmm_force_update_counter[update_mask] = 0
+    
+    def _apply_gmm_physical_forces(self):
+        """Apply GMM-based physical forces to the robot."""
+        # DEBUG: Print force status every 50 steps
+        # if hasattr(self, 'num_task_steps') and self.num_task_steps % 50 == 0:
+        #     print(f"[FORCE DEBUG] enable_physical_force={self.gmm_force_config.enable_physical_force}, num_sources={self.num_noise_sources}")
+        
+        if not self.gmm_force_config.enable_physical_force or self.num_noise_sources <= 0:
+            # if hasattr(self, 'num_task_steps') and self.num_task_steps % 50 == 0:
+            #     print(f"[FORCE DEBUG] GMM physical force is DISABLED")
+            return
+        
+        # Compute GMM mixture intensity at current position
+        position = self.obs_dict["robot_position"]
+        deltas = position.unsqueeze(1) - self.noise_centers
+        scaled = (deltas / self.noise_sigmas).pow(2).sum(dim=-1)
+        mixture = torch.exp(-0.5 * scaled)
+        mixture_intensity = (self.noise_weights * mixture).sum(dim=1)  # Shape: (num_envs,)
+        
+        # Convert intensity to force magnitude: F = Mixture(P) × mass × g × k
+        mass = self.gmm_force_config.drone_mass
+        g = self.gmm_force_config.gravity
+        k = self.gmm_force_config.disturbance_coefficient
+        force_magnitude = mixture_intensity * mass * g * k  # Shape: (num_envs,)
+        
+        # DEBUG: Print GMM force diagnostics for environment 0
+        # if hasattr(self, 'num_task_steps'):
+        #     if self.num_task_steps % 10 == 0:  # Print every 10 steps to reduce spam
+        #         env_id = 0
+        #         print(f"[GMM Force Debug - Step {self.num_task_steps}]")
+        #         print(f"  Position: {position[env_id].cpu().numpy()}")
+        #         print(f"  Mixture Intensity: {mixture_intensity[env_id].item():.4f}")
+        #         print(f"  Force Magnitude: {force_magnitude[env_id].item():.2f} N")
+        #         print(f"  Force Direction: {self.gmm_force_direction[env_id].cpu().numpy()}")
+        #         print(f"  Force Vector: {(force_magnitude[env_id] * self.gmm_force_direction[env_id]).cpu().numpy()}")
+        
+        # Apply force in random direction
+        # robot_force_tensor shape: (num_envs, num_robot_rigid_bodies, 3)
+        # We apply force only to the base link (index 0)
+        force_vector = force_magnitude.unsqueeze(1) * self.gmm_force_direction  # Shape: (num_envs, 3)
+        
+        # Access robot force tensor from global dict (only base link)
+        robot_force_tensor = self.obs_dict.get("robot_force_tensor", None)
+        if robot_force_tensor is not None:
+            # Apply to base link (first rigid body)
+            robot_force_tensor[:, 0, :] = force_vector
+        else:
+            # Fallback: directly access global force tensor
+            # Robot rigid bodies start at index 0
+            global_force_tensor = self.sim_env.IGE_env.global_tensor_dict["global_force_tensor"]
+            num_rigid_bodies_per_env = self.sim_env.IGE_env.num_rigid_bodies_per_env
+            
+            for env_id in range(self.sim_env.num_envs):
+                base_idx = env_id * num_rigid_bodies_per_env
+                global_force_tensor[base_idx] = force_vector[env_id]
+
+
 
     def _compute_score_components(self, position):
         dist = torch.norm(position - self.target_position, dim=1)
@@ -452,16 +606,27 @@ class NavigationTaskGmmNoise(BaseTask):
         s_noise = 1.0 - g_noise
         s_noise = torch.clamp(s_noise, 0.0, 1.0)
 
-        obs_pos = self.obs_dict["obstacle_position"]
-        bounds_min = self.env_bounds_min.view(1, 1, 3)
-        bounds_max = self.env_bounds_max.view(1, 1, 3)
-        in_bounds = ((obs_pos >= bounds_min) & (obs_pos <= bounds_max)).all(dim=2)
-        obs_deltas = position.unsqueeze(1) - obs_pos
-        obs_dist = torch.norm(obs_deltas, dim=-1)
-        large = torch.tensor(1e6, device=self.device)
-        obs_dist = torch.where(in_bounds, obs_dist, large)
-        d_obs_surface = torch.clamp(obs_dist - self.score_r_obs, min=0.0)
-        d_obs = d_obs_surface.min(dim=1).values
+        # Use LiDAR minimum distance for s_obs (handles rotated obstacles)
+        if "depth_range_pixels" in self.obs_dict:
+            depth_pixels = self.obs_dict["depth_range_pixels"]
+            # Get minimum distance from LiDAR depth image
+            min_depth = depth_pixels.view(depth_pixels.shape[0], -1).min(dim=1).values
+            # Clamp to valid range
+            lidar_max_range = self.reward_params.get("lidar_max_range", 10.0)
+            d_obs = torch.clamp(min_depth, min=0.01, max=lidar_max_range)
+        else:
+            # Fallback to spherical approximation if LiDAR not available
+            obs_pos = self.obs_dict["obstacle_position"]
+            bounds_min = self.env_bounds_min.view(1, 1, 3)
+            bounds_max = self.env_bounds_max.view(1, 1, 3)
+            in_bounds = ((obs_pos >= bounds_min) & (obs_pos <= bounds_max)).all(dim=2)
+            obs_deltas = position.unsqueeze(1) - obs_pos
+            obs_dist = torch.norm(obs_deltas, dim=-1)
+            large = torch.tensor(1e6, device=self.device)
+            obs_dist = torch.where(in_bounds, obs_dist, large)
+            d_obs_surface = torch.clamp(obs_dist - self.score_r_obs, min=0.0)
+            d_obs = d_obs_surface.min(dim=1).values
+        
         s_obs = 1.0 - torch.exp(-self.score_c * d_obs.pow(2))
         s_obs = torch.clamp(s_obs, 0.0, 1.0)
 
@@ -471,20 +636,67 @@ class NavigationTaskGmmNoise(BaseTask):
     def _compute_reward_and_scores(self):
         position = self.obs_dict["robot_position"]
         s_dist, s_noise, s_obs, total_score = self._compute_score_components(position)
-        reward_goal = self.reward_params["goal_reward_weight"] * s_dist
-        reward_noise = self.reward_params["noise_reward_weight"] * s_noise
-        body_rate_weight = self.reward_params["body_rate_penalty_weight"]
-        body_rates = self.obs_dict["robot_body_angvel"]
-        body_rate_penalty = -body_rate_weight * (body_rates * body_rates).sum(dim=1)
-        reward = reward_goal + reward_noise + body_rate_penalty
-
-        collision_penalty = self.reward_params["collision_penalty"]
-        reward = torch.where(
-            self.obs_dict["crashes"] > 0,
-            collision_penalty * torch.ones_like(reward),
-            reward,
+        
+        # Update sliding average window
+        for env_id in range(self.sim_env.num_envs):
+            idx = self.score_history_idx[env_id].item()
+            self.score_history[env_id, idx] = total_score[env_id]
+            self.score_history_idx[env_id] = (idx + 1) % self.score_window_size
+            if idx == self.score_window_size - 1:
+                self.score_history_filled[env_id] = True
+        
+        # Compute averaged score (use mean of available history)
+        averaged_score = torch.where(
+            self.score_history_filled,  # Fixed: removed .unsqueeze(1)
+            self.score_history.mean(dim=1),
+            self.score_history.sum(dim=1) / (self.score_history_idx + 1).float()
         )
-        return reward, total_score, s_dist, s_noise, s_obs, reward_goal, reward_noise
+        
+        # 1. Goal Reward (Position based)
+        goal_pos = self.target_position
+        dist_to_goal = torch.norm(position - goal_pos, dim=1)
+        prev_dist_to_goal = torch.norm(self.previous_position - goal_pos, dim=1)
+        
+        pos_reward_magnitude = self.reward_params["pos_reward_magnitude"]
+        pos_reward_exponent = self.reward_params["pos_reward_exponent"]
+        pos_reward = pos_reward_magnitude * (1.0 / (1.0 + dist_to_goal)).pow(pos_reward_exponent)
+        
+        # 2. Getting Closer Reward
+        getting_closer = (prev_dist_to_goal - dist_to_goal) > 0
+        getting_closer_reward = getting_closer.float() * self.reward_params["getting_closer_reward_multiplier"]
+        
+        # 3. Very Close to Goal Reward
+        very_close = dist_to_goal < 0.5
+        very_close_reward = very_close.float() * self.reward_params["very_close_to_goal_reward_magnitude"]
+        
+        # 4. Action Penalty
+        # Action difference penalty
+        action_diff = self.actions - self.previous_actions
+        x_diff_penalty = -self.reward_params["x_action_diff_penalty_magnitude"] * (action_diff[:, 0].abs().pow(self.reward_params["x_action_diff_penalty_exponent"]))
+        z_diff_penalty = -self.reward_params["z_action_diff_penalty_magnitude"] * (action_diff[:, 2].abs().pow(self.reward_params["z_action_diff_penalty_exponent"]))
+        yawrate_diff_penalty = -self.reward_params["yawrate_action_diff_penalty_magnitude"] * (action_diff[:, 3].abs().pow(self.reward_params["yawrate_action_diff_penalty_exponent"]))
+        
+        # Absolute action penalty
+        x_abs_penalty = -self.reward_params["x_absolute_action_penalty_magnitude"] * (self.actions[:, 0].abs().pow(self.reward_params["x_absolute_action_penalty_exponent"]))
+        z_abs_penalty = -self.reward_params["z_absolute_action_penalty_magnitude"] * (self.actions[:, 2].abs().pow(self.reward_params["z_absolute_action_penalty_exponent"]))
+        yawrate_abs_penalty = -self.reward_params["yawrate_absolute_action_penalty_magnitude"] * (self.actions[:, 3].abs().pow(self.reward_params["yawrate_absolute_action_penalty_exponent"]))
+
+        action_penalty = x_diff_penalty + z_diff_penalty + yawrate_diff_penalty + x_abs_penalty + z_abs_penalty + yawrate_abs_penalty
+
+        # 5. Collision Penalty
+        collision_penalty = self.reward_params["collision_penalty"]
+        collision_mask = (self.obs_dict["crashes"] > 0).float()
+        collision_reward = collision_penalty * collision_mask
+        
+        # Total Reward
+        reward = pos_reward + getting_closer_reward + very_close_reward + action_penalty + collision_reward
+        
+        # Update previous state
+        self.previous_total_score = averaged_score.clone()
+        self.previous_position = position.clone()
+        self.previous_actions = self.actions.clone() # Ensure self.previous_actions is updated in step() or init()
+        
+        return reward, total_score, s_dist, s_noise, s_obs, pos_reward, very_close_reward
 
     def _update_best_point(self, total_score):
         if self.log_step_scores:
@@ -551,11 +763,13 @@ class NavigationTaskGmmNoise(BaseTask):
     def _populate_extras(
         self, total_score, reward, reward_goal, reward_noise, s_dist, s_noise, s_obs
     ):
+        # Calculate diagnostic metrics
+        crash_rate = self.obs_dict["crashes"].float().mean().item()
+        avg_z_pos = self.obs_dict["robot_position"][:, 2].mean().item()
+        
         extras = {
             "total_score": float(total_score.mean().item()),
             "total_reward": float(reward.mean().item()),
-            "reward_goal": float(reward_goal.mean().item()),
-            "reward_noise": float(reward_noise.mean().item()),
             "score_s_dist": float(s_dist.mean().item()),
             "score_s_noise": float(s_noise.mean().item()),
             "score_s_obs": float(s_obs.mean().item()),
@@ -563,13 +777,31 @@ class NavigationTaskGmmNoise(BaseTask):
             "score_w2": self.score_w2,
             "score_w3": self.score_w3,
             "best_total_score": float(self.best_total_score),
-            "reward_w_goal": float(self.reward_params["goal_reward_weight"].item()),
-            "reward_w_noise": float(self.reward_params["noise_reward_weight"].item()),
+            "score_gradient_weight": float(self.reward_params.get("score_gradient_weight", 10.0)),
             "episode_length": float(self.task_config.episode_len_steps),
+            # Diagnostic metrics for TensorBoard
+            "info/crash_rate": crash_rate,
+            "info/avg_z_position": avg_z_pos,
         }
         learning_rate = os.environ.get("AERIAL_GYM_LR")
         if learning_rate is not None:
             extras["learning_rate"] = float(learning_rate)
+        
+        # Periodic terminal logging (every 1000 steps)
+        if self.num_task_steps % 1000 == 0:
+            logger.info(f"[Step {self.num_task_steps}] crash_rate={crash_rate:.3f}, avg_z={avg_z_pos:.2f}m, reward={reward.mean().item():.2f}")
+        
+        # Direct TensorBoard logging (every 100 steps to reduce overhead)
+        if self.num_task_steps % 100 == 0:
+            step = self.num_task_steps
+            self._tb_writer.add_scalar("info/crash_rate", crash_rate, step)
+            self._tb_writer.add_scalar("info/avg_z_position", avg_z_pos, step)
+            self._tb_writer.add_scalar("reward/total", reward.mean().item(), step)
+            self._tb_writer.add_scalar("score/total", total_score.mean().item(), step)
+            self._tb_writer.add_scalar("score/s_dist", s_dist.mean().item(), step)
+            self._tb_writer.add_scalar("score/s_noise", s_noise.mean().item(), step)
+            self._tb_writer.add_scalar("score/s_obs", s_obs.mean().item(), step)
+        
         self.infos["extras"] = extras
 
     def close(self):
@@ -603,6 +835,24 @@ class NavigationTaskGmmNoise(BaseTask):
                 self._resample_noise_sources(env_ids)
         if (env_ids == 0).any().item():
             self._draw_env0_debug_markers()
+        
+        # Initialize previous score to reasonable default (avoids first-step spike)
+        # Typical score is around 1.0-2.0, using 1.5 as stable initial value
+        self.previous_total_score[env_ids] = 1.5
+        
+        # Reset sliding average buffers
+        self.score_history[env_ids] = 0.0
+        self.score_history_idx[env_ids] = 0
+        self.score_history_filled[env_ids] = False
+        
+        # Reset GMM force buffers
+        self.gmm_force_direction[env_ids] = 0.0
+        self.gmm_force_update_counter[env_ids] = 0
+        
+        # Reset previous state for reward calculation
+        self.previous_position[env_ids] = self.obs_dict["robot_position"][env_ids]
+        self.previous_actions[env_ids] = 0.0
+        
         self.infos = {}
         return
 
@@ -618,7 +868,8 @@ class NavigationTaskGmmNoise(BaseTask):
             self.sim_env.sim_steps,
             self.task_config.episode_len_steps * torch.ones_like(self.sim_env.sim_steps),
         )
-        env_list_for_toc = (time_at_crash < 5).nonzero(as_tuple=False).squeeze(-1)
+        threshold = int(self.early_crash_config.threshold_steps)
+        env_list_for_toc = (time_at_crash < threshold).nonzero(as_tuple=False).squeeze(-1)
         crash_envs = crashes.nonzero(as_tuple=False).squeeze(-1)
         success_envs = successes.nonzero(as_tuple=False).squeeze(-1)
         timeout_envs = timeouts.nonzero(as_tuple=False).squeeze(-1)
@@ -627,6 +878,8 @@ class NavigationTaskGmmNoise(BaseTask):
             logger.critical("Crash is happening too soon.")
             logger.critical(f"Envs crashing too soon: {env_list_for_toc}")
             logger.critical(f"Time at crash: {time_at_crash[env_list_for_toc]}")
+            # Handle early crash with retry logic
+            self._handle_early_crash(env_list_for_toc)
 
         if torch.sum(torch.logical_and(successes, crashes)) > 0:
             logger.critical("Success and crash are occuring at the same time")
@@ -662,6 +915,94 @@ class NavigationTaskGmmNoise(BaseTask):
                 f"Number of common instances: {torch.count_nonzero(torch.logical_and(crashes, timeouts))}"
             )
         return
+
+    def _handle_early_crash(self, env_ids):
+        """Handle environments that crashed too early by retrying with position offset."""
+        if env_ids.numel() == 0:
+            return
+
+        env_ids = env_ids.to(dtype=torch.long, device=self.device)
+        self._early_crash_retries[env_ids] += 1
+
+        max_retries = int(self.early_crash_config.max_retries)
+        exceeded_mask = self._early_crash_retries[env_ids] > max_retries
+        exceeded_envs = env_ids[exceeded_mask]
+        retry_envs = env_ids[~exceeded_mask]
+
+        if exceeded_envs.numel() > 0:
+            logger.error(
+                f"Envs {exceeded_envs.tolist()} exceeded max retries ({max_retries}) for early crash."
+            )
+            if self.early_crash_config.fallback_to_center:
+                self._move_to_safe_position(exceeded_envs)
+            else:
+                logger.error("fallback_to_center is disabled. Skipping recovery.")
+
+        if retry_envs.numel() > 0:
+            logger.warning(
+                f"Retrying reset for envs: {retry_envs.tolist()} "
+                f"(attempt {self._early_crash_retries[retry_envs].tolist()})"
+            )
+            self._reset_with_position_offset(retry_envs)
+
+    def _move_to_safe_position(self, env_ids):
+        """Move drone to the center of the environment as a safe fallback."""
+        if env_ids.numel() == 0:
+            return
+
+        env_ids = env_ids.to(dtype=torch.long, device=self.device)
+        center = (self.env_bounds_min + self.env_bounds_max) / 2.0
+        center_expanded = center.view(1, 3).expand(env_ids.shape[0], -1)
+
+        # Set robot position to center
+        self.obs_dict["robot_position"][env_ids] = center_expanded
+
+        # Reset velocity to zero
+        self.obs_dict["robot_linvel"][env_ids] = 0.0
+        self.obs_dict["robot_angvel"][env_ids] = 0.0
+
+        # Write changes to simulation
+        self.sim_env.IGE_env.write_to_sim()
+
+        # Reset retry counter for these environments
+        self._early_crash_retries[env_ids] = 0
+
+        logger.info(f"Moved envs {env_ids.tolist()} to safe center position: {center.tolist()}")
+
+    def _reset_with_position_offset(self, env_ids):
+        """Reset environment with a random position offset to avoid repeated collision."""
+        if env_ids.numel() == 0:
+            return
+
+        env_ids = env_ids.to(dtype=torch.long, device=self.device)
+        margin = float(self.early_crash_config.safe_spawn_margin)
+
+        # Generate random offset in range [-margin, +margin]
+        offset = (torch.rand(env_ids.shape[0], 3, device=self.device) - 0.5) * 2.0 * margin
+
+        # Get current position and apply offset
+        current_pos = self.obs_dict["robot_position"][env_ids].clone()
+        new_pos = current_pos + offset
+
+        # Clamp to stay within environment bounds with margin
+        bounds_min = self.env_bounds_min + margin
+        bounds_max = self.env_bounds_max - margin
+        new_pos = torch.clamp(new_pos, bounds_min, bounds_max)
+
+        # Apply new position
+        self.obs_dict["robot_position"][env_ids] = new_pos
+
+        # Reset velocity to zero
+        self.obs_dict["robot_linvel"][env_ids] = 0.0
+        self.obs_dict["robot_angvel"][env_ids] = 0.0
+
+        # Write changes to simulation
+        self.sim_env.IGE_env.write_to_sim()
+
+        logger.info(
+            f"Reset envs {env_ids.tolist()} with position offset. "
+            f"Original: {current_pos[0].tolist()}, New: {new_pos[0].tolist()}"
+        )
 
     def check_and_update_curriculum_level(self, successes, crashes, timeouts):
         return
@@ -705,6 +1046,15 @@ class NavigationTaskGmmNoise(BaseTask):
         )
 
     def step(self, actions):
+        # Update GMM force direction periodically
+        self._update_gmm_force_direction()
+        
+        # Apply GMM physical forces to robot
+        self._apply_gmm_physical_forces()
+        
+        # Store actions for reward calculation
+        self.actions = actions
+        
         transformed_action = self.action_transformation_function(actions)
         logger.debug(f"raw_action: {actions[0]}, transformed action: {transformed_action[0]}")
         self.sim_env.step(actions=transformed_action)
@@ -746,6 +1096,11 @@ class NavigationTaskGmmNoise(BaseTask):
             self.infos["successes"], self.infos["crashes"], self.infos["timeouts"]
         )
 
+        # Reset early crash retry counter for environments that didn't crash this step
+        non_crash_envs = (self.terminations == 0).nonzero(as_tuple=False).squeeze(-1)
+        if non_crash_envs.numel() > 0:
+            self._early_crash_retries[non_crash_envs] = 0
+
         if self.log_step_scores and not self._episode_log_written:
             self._record_step_score(total_score)
         self._update_best_point(total_score)
@@ -758,6 +1113,37 @@ class NavigationTaskGmmNoise(BaseTask):
                 self._episode_log_written = True
 
         reset_envs = self.sim_env.post_reward_calculation_step()
+        
+        # EVAL mode: track if we've passed the early crash threshold
+        if self._eval_mode and not self._eval_init_phase_complete:
+            env_id = self.log_step_env_id if self.log_step_scores else 0
+            threshold = int(self.early_crash_config.threshold_steps)
+            if self.sim_env.sim_steps[env_id] >= threshold:
+                self._eval_init_phase_complete = True
+                logger.info(f"EVAL mode: init phase complete (passed {threshold} steps)")
+        
+        # EVAL mode: exit on crash or timeout after init phase is complete
+        if self._eval_mode and self._eval_init_phase_complete and len(reset_envs) > 0:
+            env_id = self.log_step_env_id if self.log_step_scores else 0
+            if env_id in reset_envs:
+                # Check if it's a crash or timeout (not success)
+                is_crash = self.terminations[env_id] > 0
+                is_timeout = self.truncations[env_id] > 0
+                is_success = self.infos.get("successes", torch.zeros_like(self.terminations))[env_id] > 0
+                
+                if (is_crash or is_timeout) and not is_success:
+                    # Save best point before exiting
+                    if self.log_step_scores and not self._episode_log_written:
+                        self._write_best_point_log()
+                        self._episode_log_written = True
+                    else:
+                        self._write_best_point()
+                    
+                    reason = "crash" if is_crash else "timeout"
+                    logger.info(f"EVAL mode: {reason} detected, exiting.")
+                    print("done")
+                    sys.exit(0)
+        
         if len(reset_envs) > 0:
             self.reset_idx(reset_envs)
 

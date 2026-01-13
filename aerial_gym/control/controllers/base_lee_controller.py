@@ -129,9 +129,14 @@ class BaseLeeController(BaseController):
         # logger.debug(
         #     f"position_error_world_frame: {position_error_world_frame}, setpoint_position: {setpoint_position}, robot_position: {self.robot_position}"
         # )
+        
+        # ORIGINAL LOGIC RESTORED: Input velocity is in vehicle frame (yaw-only)
+        # Transform from vehicle frame to world frame for comparison with robot_linvel
+        # See lmf2_controller_config.py Line 9: "command_actions in vehicle frame"
         setpoint_velocity_world_frame = quat_rotate(
             self.robot_vehicle_orientation, setpoint_velocity
         )
+        
         velocity_error = setpoint_velocity_world_frame - self.robot_linvel
 
         accel_command = (
