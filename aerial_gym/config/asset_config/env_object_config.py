@@ -303,7 +303,7 @@ class tree_asset_params(asset_state_params):
 
 
 class object_asset_params(asset_state_params):
-    num_assets = 35
+    num_assets = 10  # Reduced from 15 for easier navigation
 
     asset_folder = f"{AERIAL_GYM_DIRECTORY}/resources/models/environment_assets/objects"
     file = "small_cube.urdf"  # 默认使用 small_cube.urdf (尺寸: 0.4×0.4×0.4m)
@@ -339,7 +339,7 @@ class object_asset_params(asset_state_params):
         0.0,
     ]
 
-    keep_in_env = False
+    keep_in_env = True  # Changed from False to True
     per_link_semantic = False
     semantic_id = -1  # will be assigned incrementally per instance
 

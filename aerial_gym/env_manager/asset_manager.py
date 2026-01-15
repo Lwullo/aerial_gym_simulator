@@ -50,7 +50,7 @@ class AssetManager:
 
     def reset_idx(self, env_ids, num_obstacles_per_env=0):
         if num_obstacles_per_env < self.num_keep_in_env:
-            logger.info(
+            logger.debug(  # Changed from info to debug to avoid spam
                 "Number of obstacles required in the environment by the \
                   code is lesser than the minimum number of obstacles that the environment configuration specifies."
             )

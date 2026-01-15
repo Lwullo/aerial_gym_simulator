@@ -5,6 +5,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 import gymnasium as gym
 from gym.spaces import Dict, Box
+from collections import deque
 
 from aerial_gym.task.base_task import BaseTask
 from aerial_gym.sim.sim_builder import SimBuilder
@@ -39,12 +40,8 @@ class NavigationTaskGmmNoise(BaseTask):
                 self.task_config.reward_parameters[key], device=self.device
             )
 
-        self.score_config = self.task_config.score_config
-        self.score_w1 = float(self.score_config.w1)
-        self.score_w2 = float(self.score_config.w2)
-        self.score_w3 = float(self.score_config.w3)
-        self.score_c = float(self.score_config.c)
-        self.score_r_obs = float(self.score_config.r_obs)
+        # Success condition configuration
+        self.success_config = self.task_config.success_config
 
         logger.info("Building environment for navigation task (GMM noise).")
         logger.info(
@@ -141,9 +138,12 @@ class NavigationTaskGmmNoise(BaseTask):
         self.best_total_score = float("-inf")
         self.best_position = None
         
-        # Buffer for score gradient calculation
-        self.previous_total_score = torch.zeros(
-            self.sim_env.num_envs, device=self.device, requires_grad=False
+        # Spawn position and d_max buffers (for distance reward calculation)
+        self.spawn_position = torch.zeros(
+            (num_envs, 3), device=self.device, requires_grad=False
+        )
+        self.d_max = torch.zeros(
+            num_envs, device=self.device, requires_grad=False
         )
         
         # GMM Physical Force buffers
@@ -151,29 +151,27 @@ class NavigationTaskGmmNoise(BaseTask):
         self.gmm_force_direction = torch.zeros(
             (self.sim_env.num_envs, 3), device=self.device, requires_grad=False
         )
+        self.gmm_target_direction = torch.zeros(
+            (self.sim_env.num_envs, 3), device=self.device, requires_grad=False
+        )
         self.gmm_force_update_counter = torch.zeros(
             self.sim_env.num_envs, device=self.device, dtype=torch.int32
         )
         
-        # Sliding average buffer for total_score (window size: 10)
-        self.score_window_size = 10
-        self.score_history = torch.zeros(
-            (self.sim_env.num_envs, self.score_window_size), device=self.device, requires_grad=False
-        )
-        self.score_history_idx = torch.zeros(
-            self.sim_env.num_envs, device=self.device, dtype=torch.int32
-        )
-        self.score_history_filled = torch.zeros(
-            self.sim_env.num_envs, device=self.device, dtype=torch.bool
-        )
-
-        # Cache score configuration for performance
-        sc = self.task_config.score_config
-        self.score_w1 = float(sc.w1)
-        self.score_w2 = float(sc.w2)
-        self.score_w3 = float(sc.w3)
-        self.score_c = float(sc.c)
-        self.score_r_obs = float(sc.r_obs)
+        # Success counter for continuous success check (NEW)
+        self.success_counter = torch.zeros(self.sim_env.num_envs, device=self.device)
+        
+        # Episode outcome tracking for success rate calculation (last 100 episodes)
+        self.recent_episodes = deque(maxlen=100)
+        
+        # Distance tracking for improvement reward
+        self.previous_distance = torch.zeros(self.sim_env.num_envs, device=self.device)
+        
+        # Velocity tracking for acceleration penalty
+        self.previous_velocity = torch.zeros(self.sim_env.num_envs, 3, device=self.device)
+        
+        # Hover time counter for cumulative hover reward (NEW)
+        self.hover_time_counter = torch.zeros(self.sim_env.num_envs, device=self.device)
         
         self._init_noise_buffers()
         self._load_fixed_env_preset()
@@ -197,12 +195,11 @@ class NavigationTaskGmmNoise(BaseTask):
         self._eval_mode = eval_mode_flag in ("1", "true", "yes", "y", "t")
         self._eval_init_phase_complete = False  # Track if we've passed initialization phase
 
-        # TensorBoard writer for direct metric logging
-        runs_dir = os.environ.get("AERIAL_GYM_RUNS_DIR", "runs")
-        experiment_name = os.environ.get("AERIAL_GYM_EXPERIMENT_NAME", "gmm_noise_diagnostics")
-        tb_log_dir = os.path.join(runs_dir, f"{experiment_name}_tb")
-        self._tb_writer = SummaryWriter(log_dir=tb_log_dir)
-        logger.info(f"TensorBoard logging to: {tb_log_dir}")
+        # TensorBoard writer for motor thrust logging (lazily initialized on first use)
+        self._writer_initialized = False
+        self.writer = None
+
+
 
         # Ensure assets are placed within the fixed bounds.
         self.sim_env.reset()
@@ -515,26 +512,36 @@ class NavigationTaskGmmNoise(BaseTask):
         return self.position_noise
     
     def _update_gmm_force_direction(self):
-        """Update random force direction periodically based on force_update_steps."""
+        """
+        Update GMM force direction smoothly using a low-pass filter.
+        New direction = 0.9 * old_direction + 0.1 * target_direction
+        Prevents sudden "kicks" to the drone during hover.
+        """
         if not self.gmm_force_config.enable_physical_force:
             return
-        
-        # Increment counter for all environments
+
         self.gmm_force_update_counter += 1
         
-        # Find environments that need direction update
+        # Periodically update the random target direction (not the actual force direction)
         update_mask = self.gmm_force_update_counter >= self.gmm_force_config.force_update_steps
-        
         if update_mask.any():
-            num_to_update = update_mask.sum().item()
+            env_ids = update_mask.nonzero(as_tuple=False).squeeze(-1)
             
-            # Generate random unit vectors for environments needing update
-            random_dirs = torch.randn((num_to_update, 3), device=self.device)
-            random_dirs = random_dirs / torch.norm(random_dirs, dim=1, keepdim=True)
+            # Generate new random target directions for these envs
+            random_dirs = torch.randn((len(env_ids), 3), device=self.device)
+            random_dirs = torch.nn.functional.normalize(random_dirs, dim=1)
+            self.gmm_target_direction[env_ids] = random_dirs
             
-            # Update directions and reset counters
-            self.gmm_force_direction[update_mask] = random_dirs
-            self.gmm_force_update_counter[update_mask] = 0
+            # Reset counter
+            self.gmm_force_update_counter[env_ids] = 0
+            
+        # Smoothly interpolate current direction towards target direction (Low-pass filter)
+        # alpha = 0.1 (smoothing factor)
+        alpha = 0.1
+        self.gmm_force_direction = (1.0 - alpha) * self.gmm_force_direction + alpha * self.gmm_target_direction
+        
+        # Re-normalize to ensure unit magnitude
+        self.gmm_force_direction = torch.nn.functional.normalize(self.gmm_force_direction, dim=1)
     
     def _apply_gmm_physical_forces(self):
         """Apply GMM-based physical forces to the robot."""
@@ -571,7 +578,7 @@ class NavigationTaskGmmNoise(BaseTask):
         #         print(f"  Force Direction: {self.gmm_force_direction[env_id].cpu().numpy()}")
         #         print(f"  Force Vector: {(force_magnitude[env_id] * self.gmm_force_direction[env_id]).cpu().numpy()}")
         
-        # Apply force in random direction
+        # Apply force in random direction as additive disturbance
         # robot_force_tensor shape: (num_envs, num_robot_rigid_bodies, 3)
         # We apply force only to the base link (index 0)
         force_vector = force_magnitude.unsqueeze(1) * self.gmm_force_direction  # Shape: (num_envs, 3)
@@ -579,124 +586,215 @@ class NavigationTaskGmmNoise(BaseTask):
         # Access robot force tensor from global dict (only base link)
         robot_force_tensor = self.obs_dict.get("robot_force_tensor", None)
         if robot_force_tensor is not None:
-            # Apply to base link (first rigid body)
-            robot_force_tensor[:, 0, :] = force_vector
+            # CRITICAL FIX: Add disturbance force instead of replacing controller force
+            # This preserves the control forces while adding GMM-based perturbation
+            robot_force_tensor[:, 0, :] += force_vector  # Additive disturbance ✅
         else:
             # Fallback: directly access global force tensor
             # Robot rigid bodies start at index 0
             global_force_tensor = self.sim_env.IGE_env.global_tensor_dict["global_force_tensor"]
             num_rigid_bodies_per_env = self.sim_env.IGE_env.num_rigid_bodies_per_env
-            
             for env_id in range(self.sim_env.num_envs):
                 base_idx = env_id * num_rigid_bodies_per_env
                 global_force_tensor[base_idx] = force_vector[env_id]
 
-
-
-    def _compute_score_components(self, position):
-        dist = torch.norm(position - self.target_position, dim=1)
-        s_dist = 1.0 - dist / self.d_max
-        s_dist = torch.clamp(s_dist, 0.0, 1.0)
-
-        deltas = position.unsqueeze(1) - self.noise_centers
-        scaled = (deltas / self.noise_sigmas).pow(2).sum(dim=-1)
-        mixture = torch.exp(-0.5 * scaled)
-        mixture = (mixture * self.noise_weights).sum(dim=1)
-        g_noise = mixture.pow(2)
-        s_noise = 1.0 - g_noise
-        s_noise = torch.clamp(s_noise, 0.0, 1.0)
-
-        # Use LiDAR minimum distance for s_obs (handles rotated obstacles)
-        if "depth_range_pixels" in self.obs_dict:
-            depth_pixels = self.obs_dict["depth_range_pixels"]
-            # Get minimum distance from LiDAR depth image
-            min_depth = depth_pixels.view(depth_pixels.shape[0], -1).min(dim=1).values
-            # Clamp to valid range
-            lidar_max_range = self.reward_params.get("lidar_max_range", 10.0)
-            d_obs = torch.clamp(min_depth, min=0.01, max=lidar_max_range)
-        else:
-            # Fallback to spherical approximation if LiDAR not available
-            obs_pos = self.obs_dict["obstacle_position"]
-            bounds_min = self.env_bounds_min.view(1, 1, 3)
-            bounds_max = self.env_bounds_max.view(1, 1, 3)
-            in_bounds = ((obs_pos >= bounds_min) & (obs_pos <= bounds_max)).all(dim=2)
-            obs_deltas = position.unsqueeze(1) - obs_pos
-            obs_dist = torch.norm(obs_deltas, dim=-1)
-            large = torch.tensor(1e6, device=self.device)
-            obs_dist = torch.where(in_bounds, obs_dist, large)
-            d_obs_surface = torch.clamp(obs_dist - self.score_r_obs, min=0.0)
-            d_obs = d_obs_surface.min(dim=1).values
+    def _compute_gmm_mixture(self, position):
+        """
+        Compute GMM mixture intensity at given position.
         
-        s_obs = 1.0 - torch.exp(-self.score_c * d_obs.pow(2))
-        s_obs = torch.clamp(s_obs, 0.0, 1.0)
+        Args:
+            position: (num_envs, 3) - positions to evaluate
+            
+        Returns:
+            mixture_intensity: (num_envs,) - GMM intensity at each position, ∈ [0, ~1]
+        """
+        # position: (num_envs, 3)
+        # noise_centers: (num_envs, num_sources, 3)
+        # noise_sigmas: (num_envs, num_sources, 3)
+        # noise_weights: (num_envs, num_sources)
+        
+        deltas = position.unsqueeze(1) - self.noise_centers  # (num_envs, num_sources, 3)
+        scaled = (deltas / self.noise_sigmas).pow(2).sum(dim=-1)  # (num_envs, num_sources)
+        mixture = torch.exp(-0.5 * scaled)  # Gaussian PDF
+        weighted_mixture = (self.noise_weights * mixture).sum(dim=1)  # (num_envs,)
+        
+        return weighted_mixture
 
-        total_score = self.score_w1 * s_dist + self.score_w2 * s_noise + self.score_w3 * s_obs
-        return s_dist, s_noise, s_obs, total_score
+
+
 
     def _compute_reward_and_scores(self):
+        """
+        Unified reward function design (no explicit stage switching):
+        - Navigation behavior emerges from improvement + direction rewards
+        - Optimization behavior emerges from noise_reduction reward
+        - Hovering behavior emerges from hover_bonus when position_quality is good
+        """
         position = self.obs_dict["robot_position"]
-        s_dist, s_noise, s_obs, total_score = self._compute_score_components(position)
+        linvel = self.obs_dict["robot_linvel"]
         
-        # Update sliding average window
-        for env_id in range(self.sim_env.num_envs):
-            idx = self.score_history_idx[env_id].item()
-            self.score_history[env_id, idx] = total_score[env_id]
-            self.score_history_idx[env_id] = (idx + 1) % self.score_window_size
-            if idx == self.score_window_size - 1:
-                self.score_history_filled[env_id] = True
+        # ==== Core Metrics ====
+        dist_to_target = torch.norm(position - self.target_position, dim=1)
+        linvel_magnitude = torch.norm(linvel, dim=1)
+        current_noise = self._compute_gmm_mixture(position)
         
-        # Compute averaged score (use mean of available history)
-        averaged_score = torch.where(
-            self.score_history_filled,  # Fixed: removed .unsqueeze(1)
-            self.score_history.mean(dim=1),
-            self.score_history.sum(dim=1) / (self.score_history_idx + 1).float()
+        # 1. Distance Improvement Reward (gradient - main navigation driver) ⭐
+        distance_improvement = self.previous_distance - dist_to_target  # Positive if getting closer
+        improvement_reward = self.reward_params["distance_improvement_reward_magnitude"] * torch.clamp(
+            distance_improvement, min=0.0
         )
         
-        # 1. Goal Reward (Position based)
-        goal_pos = self.target_position
-        dist_to_goal = torch.norm(position - goal_pos, dim=1)
-        prev_dist_to_goal = torch.norm(self.previous_position - goal_pos, dim=1)
+        # 2. Noise Reduction Reward (gradient - encourages moving to low-noise areas) ⭐
+        prev_noise = self._compute_gmm_mixture(self.previous_position)
+        noise_reduction = prev_noise - current_noise
+        noise_reduction_reward = self.reward_params["noise_reduction_reward_magnitude"] * torch.clamp(
+            noise_reduction, min=0.0
+        )
         
-        pos_reward_magnitude = self.reward_params["pos_reward_magnitude"]
-        pos_reward_exponent = self.reward_params["pos_reward_exponent"]
-        pos_reward = pos_reward_magnitude * (1.0 / (1.0 + dist_to_goal)).pow(pos_reward_exponent)
+        # 3. Direction Alignment Reward (auxiliary navigation guidance)
+        vec_to_target = self.target_position - position
+        distance_safe = torch.clamp(dist_to_target, min=0.01)
+        direction_to_target = vec_to_target / distance_safe.unsqueeze(1)
         
-        # 2. Getting Closer Reward
-        getting_closer = (prev_dist_to_goal - dist_to_goal) > 0
-        getting_closer_reward = getting_closer.float() * self.reward_params["getting_closer_reward_multiplier"]
+        velocity = self.obs_dict["robot_linvel"]
+        speed = torch.norm(velocity, dim=1, keepdim=True)
+        speed_safe = torch.clamp(speed, min=0.01)
         
-        # 3. Very Close to Goal Reward
-        very_close = dist_to_goal < 0.5
-        very_close_reward = very_close.float() * self.reward_params["very_close_to_goal_reward_magnitude"]
+        velocity_direction = velocity / speed_safe
+        alignment = (direction_to_target * velocity_direction).sum(dim=1)
         
-        # 4. Action Penalty
-        # Action difference penalty
+        direction_reward = self.reward_params["direction_alignment_reward_magnitude"] * torch.clamp(
+            alignment, min=0.0
+        )
+        
+        # Set to zero if speed is very low (stationary)
+        moving_mask = (speed.squeeze(1) > 0.05).float()
+        direction_reward = direction_reward * moving_mask
+        
+        # ==== Position Quality Hover Reward (NEW - PROGRESSIVE) ⭐⭐⭐ ====
+        # Comprehensive position evaluation: position_quality = -(distance*8 + noise*8)
+        # Higher value = better position (close to target + low noise)
+        position_quality = -(dist_to_target * 8.0 + current_noise * 8.0)
+        
+        quality_threshold = self.reward_params["hover_quality_threshold"]  # e.g., -3.0
+        speed_threshold = self.reward_params["hover_speed_threshold"]      # e.g., 0.3 m/s
+        
+        is_good_position = position_quality > quality_threshold
+        
+        # Progressive hover bonus: rewards scale with how slow the drone is
+        # speed_factor ranges from 0 (at threshold) to 1 (at zero speed)
+        speed_factor = torch.clamp(1.0 - linvel_magnitude / speed_threshold, min=0.0, max=1.0)
+        
+        # Only give reward if in good position, scaled by speed_factor
+        hover_bonus = torch.where(
+            is_good_position,
+            self.reward_params["hover_bonus_magnitude"] * speed_factor,
+            torch.zeros_like(position_quality)
+        )
+        
+        
+        # ==== Cumulative Hover Reward (NEW) ⭐⭐ ====
+        # Encourages staying at optimal position, prevents restless exploration
+        # Trigger when in good position AND moving slowly (speed < threshold)
+        is_in_optimal_zone = torch.logical_and(is_good_position, linvel_magnitude < speed_threshold)
+        
+        # Update counter: increment if in zone, reset otherwise
+        self.hover_time_counter = torch.where(
+            is_in_optimal_zone,
+            self.hover_time_counter + 1.0,
+            torch.zeros_like(self.hover_time_counter)
+        )
+        
+        # Cumulative bonus (capped at max value)
+        cumulative_hover_bonus = torch.clamp(
+            self.hover_time_counter * self.reward_params["cumulative_hover_rate"],
+            max=self.reward_params["cumulative_hover_max"]
+        )
+
+        
+        # ==== Dynamic Velocity Smoothness Penalty (NEW) ⭐ ====
+        # Far from target: low penalty (allow acceleration/deceleration)
+        # Near target: higher penalty (encourage smooth motion)
+        velocity_xy = linvel[:, :2]
+        velocity_change_xy = velocity_xy - self.previous_velocity[:, :2]
+        velocity_diff_norm = torch.norm(velocity_change_xy, dim=1)
+        
+        smooth_weight = torch.where(
+            dist_to_target > self.reward_params["distance_threshold_for_smooth"],
+            torch.full_like(dist_to_target, self.reward_params["velocity_smoothness_penalty_far"]),
+            torch.full_like(dist_to_target, self.reward_params["velocity_smoothness_penalty_near"])
+        )
+        velocity_smooth_penalty = -smooth_weight * velocity_diff_norm
+        
+        # ==== Action Smoothness Penalties ====
         action_diff = self.actions - self.previous_actions
-        x_diff_penalty = -self.reward_params["x_action_diff_penalty_magnitude"] * (action_diff[:, 0].abs().pow(self.reward_params["x_action_diff_penalty_exponent"]))
-        z_diff_penalty = -self.reward_params["z_action_diff_penalty_magnitude"] * (action_diff[:, 2].abs().pow(self.reward_params["z_action_diff_penalty_exponent"]))
-        yawrate_diff_penalty = -self.reward_params["yawrate_action_diff_penalty_magnitude"] * (action_diff[:, 3].abs().pow(self.reward_params["yawrate_action_diff_penalty_exponent"]))
         
-        # Absolute action penalty
-        x_abs_penalty = -self.reward_params["x_absolute_action_penalty_magnitude"] * (self.actions[:, 0].abs().pow(self.reward_params["x_absolute_action_penalty_exponent"]))
-        z_abs_penalty = -self.reward_params["z_absolute_action_penalty_magnitude"] * (self.actions[:, 2].abs().pow(self.reward_params["z_absolute_action_penalty_exponent"]))
-        yawrate_abs_penalty = -self.reward_params["yawrate_absolute_action_penalty_magnitude"] * (self.actions[:, 3].abs().pow(self.reward_params["yawrate_absolute_action_penalty_exponent"]))
-
-        action_penalty = x_diff_penalty + z_diff_penalty + yawrate_diff_penalty + x_abs_penalty + z_abs_penalty + yawrate_abs_penalty
-
-        # 5. Collision Penalty
+        x_diff_penalty = -self.reward_params["x_action_diff_penalty_magnitude"] * (
+            action_diff[:, 0].abs().pow(self.reward_params["x_action_diff_penalty_exponent"])
+        )
+        y_diff_penalty = -self.reward_params["y_action_diff_penalty_magnitude"] * (
+            action_diff[:, 1].abs().pow(self.reward_params["y_action_diff_penalty_exponent"])
+        )
+        z_diff_penalty = -self.reward_params["z_action_diff_penalty_magnitude"] * (
+            action_diff[:, 2].abs().pow(self.reward_params["z_action_diff_penalty_exponent"])
+        )
+        
+        # ==== Anti-Spinning Penalty ====
+        yaw_rate = self.obs_dict["robot_body_angvel"][:, 2]
+        yaw_rate_penalty = -self.reward_params["yaw_rate_penalty_magnitude"] * (
+            yaw_rate.abs().pow(self.reward_params["yaw_rate_penalty_exponent"])
+        )
+        
+        # ==== Speed Penalty (DISABLED) ====
+        max_safe_speed = self.reward_params["max_safe_speed"]
+        speed_excess = torch.clamp(linvel_magnitude - max_safe_speed, min=0.0)
+        speed_penalty = -self.reward_params["speed_penalty_magnitude"] * speed_excess.pow(2)
+        
+        # ==== Safety Reward (NEW) ⭐⭐ ====
+        # Based on depth map: r_ss = (1/(N_b × N_r)) × ΣΣ log(S_stat(b, j))
+        # Treat each pixel in depth map as a "ray" measurement
+        depth_pixels = self.obs_dict["depth_range_pixels"].squeeze(1)  # (num_envs, H, W)
+        distances = depth_pixels.view(self.sim_env.num_envs, -1)  # Flatten to (num_envs, H*W)
+        
+        # Clamp distances to prevent log(0)
+        safe_distances = torch.clamp(distances, min=self.reward_params["min_safe_distance_clamp"])
+        
+        # Compute log of distances and take mean (equivalent to formula in image)
+        log_distances = torch.log(safe_distances)
+        safety_reward = self.reward_params["safety_reward_magnitude"] * log_distances.mean(dim=1)
+        
+        # ==== Collision Penalty ====
         collision_penalty = self.reward_params["collision_penalty"]
         collision_mask = (self.obs_dict["crashes"] > 0).float()
         collision_reward = collision_penalty * collision_mask
         
-        # Total Reward
-        reward = pos_reward + getting_closer_reward + very_close_reward + action_penalty + collision_reward
+        # ==== Total Unified Reward (no explicit stage switching) ====
+        reward = (
+            improvement_reward           # 8.0 × improvement (navigation driver)
+            + noise_reduction_reward      # 8.0 × noise_reduction (optimization driver)
+            + direction_reward            # 2.0 × alignment (navigation guidance)
+            + hover_bonus                 # 50.0 if in good position + hovering
+            + cumulative_hover_bonus      # 0~10.0 cumulative (stay in optimal zone)
+            + velocity_smooth_penalty     # dynamic: -0.1 (far) or -0.2 (near)
+            + safety_reward               # 2.0 × mean(log(distances)) (obstacle avoidance)
+            + x_diff_penalty              # disabled (0.0)
+            + y_diff_penalty
+            + z_diff_penalty
+            + yaw_rate_penalty            # disabled (0.0)
+            + speed_penalty               # disabled (0.0)
+            + collision_reward            # -100
+        )
         
-        # Update previous state
-        self.previous_total_score = averaged_score.clone()
+        # ==== Update Previous State ====
         self.previous_position = position.clone()
-        self.previous_actions = self.actions.clone() # Ensure self.previous_actions is updated in step() or init()
+        self.previous_distance = dist_to_target.clone()
+        self.previous_actions = self.actions.clone()
+        self.previous_velocity = linvel.clone()
         
-        return reward, total_score, s_dist, s_noise, s_obs, pos_reward, very_close_reward
+        # For logging purposes
+        noise_intensity = current_noise
+        
+        return reward, improvement_reward, direction_reward, noise_reduction_reward, noise_intensity
 
     def _update_best_point(self, total_score):
         if self.log_step_scores:
@@ -755,66 +853,156 @@ class NavigationTaskGmmNoise(BaseTask):
             handle.write("step,x,y,z,total_score\n")
             for step_idx, pos, score in self._episode_step_log:
                 handle.write(
-                    f"{step_idx},{pos[0]:.6f},{pos[1]:.6f},{pos[2]:.6f},{score:.6f}\n"
+        f"{step_idx},{pos[0]:.6f},{pos[1]:.6f},{pos[2]:.6f},{score:.6f}\n"
                 )
             handle.write(f"best_score={self.best_total_score}\n")
             handle.write(f"best_position={self.best_position.tolist()}\n")
 
-    def _populate_extras(
-        self, total_score, reward, reward_goal, reward_noise, s_dist, s_noise, s_obs
-    ):
+    def _init_tensorboard_writer(self):
+        """Initialize TensorBoard writer lazily on first use."""
+        runs_dir = os.environ.get("AERIAL_GYM_RUNS_DIR")
+        experiment_name = os.environ.get("AERIAL_GYM_EXPERIMENT_NAME")
+        
+        if runs_dir and experiment_name:
+            # Now rl_games has created the directory, find it
+            run_dir = None
+            if os.path.isdir(runs_dir):
+                candidates = [
+                    os.path.join(runs_dir, name)
+                    for name in os.listdir(runs_dir)
+                    if name.startswith(experiment_name)
+                ]
+                if candidates:
+                    run_dir = max(candidates, key=os.path.getmtime)
+            
+            if run_dir is None:
+                run_dir = os.path.join(runs_dir, experiment_name)
+            
+            summary_dir = os.path.join(run_dir, "summaries")
+            self.writer = SummaryWriter(summary_dir)
+            logger.info(f"TensorBoard writer initialized at: {summary_dir}")
+        else:
+            self.writer = None
+            logger.warning("TensorBoard writer not initialized (env vars not set)")
+
+    def _populate_extras(self, improvement_reward, direction_reward, noise_reduction_reward, noise_intensity):
+        """Simplified extras logging for unified reward function"""
         # Calculate diagnostic metrics
-        crash_rate = self.obs_dict["crashes"].float().mean().item()
+        crash_rate_instant = self.obs_dict["crashes"].float().mean().item()
         avg_z_pos = self.obs_dict["robot_position"][:, 2].mean().item()
         
+        # Calculate hover metrics
+        avg_hover_time = self.hover_time_counter.mean().item()
+        
+        # Calculate success rate from completed episodes
+        if len(self.recent_episodes) > 0:
+            total_episodes = len(self.recent_episodes)
+            success_count = self.recent_episodes.count('success')
+            crash_count = self.recent_episodes.count('crash')
+            timeout_count = self.recent_episodes.count('timeout')
+            
+            success_rate = success_count / total_episodes
+            crash_rate_episodes = crash_count / total_episodes
+            timeout_rate = timeout_count / total_episodes
+        else:
+            success_rate = 0.0
+            crash_rate_episodes = 0.0
+            timeout_rate = 0.0
+        
+        # Get motor thrust values from environment 0 for monitoring
+        try:
+            motor_thrusts = self.sim_env.robot_manager.robot.control_allocator.motor_model.current_motor_thrust
+            motor_thrust_env0 = motor_thrusts[0]  # Get thrusts from environment 0 (shape: [4])
+            motor_thrust_0 = float(motor_thrust_env0[0].item())
+            motor_thrust_1 = float(motor_thrust_env0[1].item())
+            motor_thrust_2 = float(motor_thrust_env0[2].item())
+            motor_thrust_3 = float(motor_thrust_env0[3].item())
+        except Exception as e:
+            # If motor thrust data is unavailable, use default values
+            motor_thrust_0 = motor_thrust_1 = motor_thrust_2 = motor_thrust_3 = 0.0
+            if self.num_task_steps == 0:
+                logger.warning(f"Could not access motor thrust data: {e}")
+        
         extras = {
-            "total_score": float(total_score.mean().item()),
-            "total_reward": float(reward.mean().item()),
-            "score_s_dist": float(s_dist.mean().item()),
-            "score_s_noise": float(s_noise.mean().item()),
-            "score_s_obs": float(s_obs.mean().item()),
-            "score_w1": self.score_w1,
-            "score_w2": self.score_w2,
-            "score_w3": self.score_w3,
-            "best_total_score": float(self.best_total_score),
-            "score_gradient_weight": float(self.reward_params.get("score_gradient_weight", 10.0)),
+            "improvement_reward": float(improvement_reward.mean().item()),
+            "direction_reward": float(direction_reward.mean().item()),
+            "noise_reduction_reward": float(noise_reduction_reward.mean().item()),
+            "noise_intensity": float(noise_intensity.mean().item()),
+            "hover_time": avg_hover_time,
+            "total_reward": float(self.rewards.mean().item()),
             "episode_length": float(self.task_config.episode_len_steps),
+            # Episode-based metrics
+            "metrics/success_rate": success_rate,
+            "metrics/crash_rate": crash_rate_episodes,
+            "metrics/timeout_rate": timeout_rate,
             # Diagnostic metrics for TensorBoard
-            "info/crash_rate": crash_rate,
+            "info/crash_rate_instant": crash_rate_instant,
             "info/avg_z_position": avg_z_pos,
+            # Motor thrust metrics from environment 0
+            "motor_thrust_0": motor_thrust_0,
+            "motor_thrust_1": motor_thrust_1,
+            "motor_thrust_2": motor_thrust_2,
+            "motor_thrust_3": motor_thrust_3,
         }
         learning_rate = os.environ.get("AERIAL_GYM_LR")
         if learning_rate is not None:
             extras["learning_rate"] = float(learning_rate)
         
-        # Periodic terminal logging (every 1000 steps)
-        if self.num_task_steps % 1000 == 0:
-            logger.info(f"[Step {self.num_task_steps}] crash_rate={crash_rate:.3f}, avg_z={avg_z_pos:.2f}m, reward={reward.mean().item():.2f}")
+        # Write motor thrust data to TensorBoard (with lazy initialization)
+        if not self._writer_initialized:
+            self._init_tensorboard_writer()
+            self._writer_initialized = True
         
-        # Direct TensorBoard logging (every 100 steps to reduce overhead)
-        if self.num_task_steps % 100 == 0:
-            step = self.num_task_steps
-            self._tb_writer.add_scalar("info/crash_rate", crash_rate, step)
-            self._tb_writer.add_scalar("info/avg_z_position", avg_z_pos, step)
-            self._tb_writer.add_scalar("reward/total", reward.mean().item(), step)
-            self._tb_writer.add_scalar("score/total", total_score.mean().item(), step)
-            self._tb_writer.add_scalar("score/s_dist", s_dist.mean().item(), step)
-            self._tb_writer.add_scalar("score/s_noise", s_noise.mean().item(), step)
-            self._tb_writer.add_scalar("score/s_obs", s_obs.mean().item(), step)
+        if self.writer is not None:
+            self.writer.add_scalar("motor_thrust/motor_0", motor_thrust_0, self.num_task_steps)
+            self.writer.add_scalar("motor_thrust/motor_1", motor_thrust_1, self.num_task_steps)
+            self.writer.add_scalar("motor_thrust/motor_2", motor_thrust_2, self.num_task_steps)
+            self.writer.add_scalar("motor_thrust/motor_3", motor_thrust_3, self.num_task_steps)
+
+        
+        # Periodic terminal logging (every 1000 steps) - YELLOW COLOR with hover and noise monitoring
+        if self.num_task_steps % 1000 == 0:
+            # Calculate attitude angles
+            euler = self.obs_dict["robot_euler_angles"]
+            avg_tilt_deg = torch.norm(euler[:, :2], dim=1).mean().item() * 57.2958
+            
+            logger.warning(
+                f"[Step {self.num_task_steps}] success={success_rate:.1%}, crash={crash_rate_episodes:.1%}, "
+                f"timeout={timeout_rate:.1%}, hover_time={avg_hover_time:.1f}, "
+                f"noise={noise_intensity.mean().item():.3f}, tilt={avg_tilt_deg:.1f}°, "
+                f"reward={self.rewards.mean().item():.2f}"
+            )
+
         
         self.infos["extras"] = extras
 
     def close(self):
+        if hasattr(self, 'writer') and self.writer is not None:
+            self.writer.close()
+            logger.info("TensorBoard writer closed")
         self.sim_env.delete_env()
 
     def reset(self):
         self.reset_idx(torch.arange(self.sim_env.num_envs, device=self.device))
         return self.get_return_tuple()
 
+
     def reset_idx(self, env_ids):
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device).view(-1)
         if env_ids.numel() == 0:
             return
+            
+        # Record episode outcomes for success rate tracking (before reset)
+        if hasattr(self, 'infos') and 'successes' in self.infos:
+            for env_id in env_ids:
+                env_id_int = int(env_id.item())
+                if self.infos["successes"][env_id_int] > 0:
+                    self.recent_episodes.append('success')
+                elif self.infos["crashes"][env_id_int] > 0:
+                    self.recent_episodes.append('crash')
+                else:  # timeout
+                    self.recent_episodes.append('timeout')
+        
         if self.log_step_scores and not self._episode_log_written:
             if (env_ids == self.log_step_env_id).any().item():
                 self._episode_step_log = []
@@ -836,22 +1024,34 @@ class NavigationTaskGmmNoise(BaseTask):
         if (env_ids == 0).any().item():
             self._draw_env0_debug_markers()
         
-        # Initialize previous score to reasonable default (avoids first-step spike)
-        # Typical score is around 1.0-2.0, using 1.5 as stable initial value
-        self.previous_total_score[env_ids] = 1.5
+        # Record spawn position and compute d_max for distance reward
+        self.spawn_position[env_ids] = self.obs_dict["robot_position"][env_ids].clone()
+        dist_spawn_to_target = torch.norm(
+            self.target_position[env_ids] - self.spawn_position[env_ids], dim=1
+        )
+        self.d_max[env_ids] = torch.clamp(dist_spawn_to_target, min=0.1)  # Avoid division by zero
         
-        # Reset sliding average buffers
-        self.score_history[env_ids] = 0.0
-        self.score_history_idx[env_ids] = 0
-        self.score_history_filled[env_ids] = False
+        # Initialize previous distance for improvement reward
+        self.previous_distance[env_ids] = dist_spawn_to_target
+        
+        # Initialize previous velocity for acceleration penalty (NEW)
+        self.previous_velocity[env_ids] = self.obs_dict["robot_linvel"][env_ids]
         
         # Reset GMM force buffers
         self.gmm_force_direction[env_ids] = 0.0
+        self.gmm_target_direction[env_ids] = 0.0
         self.gmm_force_update_counter[env_ids] = 0
+        
+        # Reset success counter
+        self.success_counter[env_ids] = 0.0
         
         # Reset previous state for reward calculation
         self.previous_position[env_ids] = self.obs_dict["robot_position"][env_ids]
+        self.previous_distance[env_ids] = dist_spawn_to_target
         self.previous_actions[env_ids] = 0.0
+        
+        # Reset hover time counter
+        self.hover_time_counter[env_ids] = 0.0
         
         self.infos = {}
         return
@@ -1061,12 +1261,10 @@ class NavigationTaskGmmNoise(BaseTask):
 
         (
             self.rewards[:],
-            total_score,
-            s_dist,
-            s_noise,
-            s_obs,
-            reward_goal,
-            reward_noise,
+            improvement_reward,
+            direction_reward,
+            noise_reduction_reward,
+            noise_intensity,
         ) = self._compute_reward_and_scores()
 
         if self.task_config.return_state_before_reset is True:
@@ -1078,10 +1276,46 @@ class NavigationTaskGmmNoise(BaseTask):
             torch.zeros_like(self.truncations),
         )
 
-        successes = self.truncations * (
-            torch.norm(self.target_position - self.obs_dict["robot_position"], dim=1) < 1.0
+        # New success condition: Continuous hover stability
+        position = self.obs_dict["robot_position"]
+        dist_to_target = torch.norm(self.target_position - position, dim=1)
+        is_in_range = dist_to_target < self.success_config.success_radius
+        
+        linvel = self.obs_dict["robot_linvel"]
+        linvel_magnitude = torch.norm(linvel, dim=1)
+        is_velocity_low = linvel_magnitude < self.success_config.max_velocity
+        
+        euler = self.obs_dict["robot_euler_angles"]
+        max_angle_rad = torch.deg2rad(torch.tensor(self.success_config.max_roll_pitch_deg, device=self.device))
+        is_attitude_stable = (euler[:, 0].abs() < max_angle_rad) & (euler[:, 1].abs() < max_angle_rad)
+        
+        # Check if current step meets hover requirements
+        is_hovering = is_in_range * is_velocity_low * is_attitude_stable
+        
+        # Update continuous success counter
+        # Increment if hovering, reset to 0 if not
+        self.success_counter = torch.where(
+            is_hovering,
+            self.success_counter + 1.0,
+            torch.zeros_like(self.success_counter)
         )
+        
+        # Determine success: Counter exceeds threshold
+        # Once successful, it stays successful for logging purposes, but we don't necessarily terminate immediately
+        # unless you want early termination. For now, let's keep running to train stability.
+        # But for the "success" metric, we flag it if threshold is met.
+        has_succeeded = self.success_counter >= self.success_config.min_success_steps
+        
+        # We only mark success at the end of episode for success rate calculation to be simple
+        # OR we can track if it *ever* succeeded during the episode.
+        # Let's use the standard approach: Success if condition met at termination OR if persistent success achieved.
+        # To make it robust: If has_succeeded is true, we consider this episode a success.
+        
+        successes = has_succeeded.float()
+        
+        # Ensure crashes override success
         successes = torch.where(self.terminations > 0, torch.zeros_like(successes), successes)
+        
         timeouts = torch.where(
             self.truncations > 0, torch.logical_not(successes), torch.zeros_like(successes)
         )
@@ -1101,10 +1335,8 @@ class NavigationTaskGmmNoise(BaseTask):
         if non_crash_envs.numel() > 0:
             self._early_crash_retries[non_crash_envs] = 0
 
-        if self.log_step_scores and not self._episode_log_written:
-            self._record_step_score(total_score)
-        self._update_best_point(total_score)
-        self._populate_extras(total_score, self.rewards, reward_goal, reward_noise, s_dist, s_noise, s_obs)
+        # Simplified logging (no more total_score from old system)
+        self._populate_extras(improvement_reward, direction_reward, noise_reduction_reward, noise_intensity)
         if self.log_step_scores and not self._episode_log_written:
             env_id = min(self.log_step_env_id, self.truncations.shape[0] - 1)
             done = (self.terminations[env_id] > 0) | (self.truncations[env_id] > 0)

@@ -249,7 +249,9 @@ class EnvManager(BaseManager):
                 (self.cfg.env.num_envs, 0, 13), device=self.device
             )
 
-        self.global_tensor_dict["num_obstacles_in_env"] = self.num_obs_in_env
+        self.global_tensor_dict["num_obstacles_in_env"] = self.keep_in_env  # Use keep_in_env instead of num_obs_in_env
+        logger.warning(f"DEBUG: keep_in_env={self.keep_in_env}, num_obstacles_in_env={self.global_tensor_dict['num_obstacles_in_env']}")
+
 
     def prepare_sim(self):
         """

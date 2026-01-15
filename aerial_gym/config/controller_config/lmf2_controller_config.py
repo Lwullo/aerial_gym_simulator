@@ -15,7 +15,7 @@ class control:
     """
 
     num_actions = 4
-    max_inclination_angle_rad = np.pi / 3.0
+    max_inclination_angle_rad = np.pi / 6.0  # 30° (reduced from 60° for stability)
     max_yaw_rate = np.pi / 3.0
     scale_pos=0.5
     scale_vel=1.0  # Set to 1.0 since using pre-scaled values

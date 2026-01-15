@@ -35,7 +35,7 @@ params:
     #     before_mlp: False
     #     layer_norm: True
   config:
-    env_name: quad
+    env_name: navigation_task_gmm_noise
     env_config:
       num_envs: 8192
       
@@ -48,7 +48,7 @@ params:
     gamma: 0.99
     tau: 0.95
     ppo: True
-    learning_rate: 1e-4
+    learning_rate: 5e-5
     lr_schedule: adaptive
     kl_threshold: 0.008
     save_frequency: 10

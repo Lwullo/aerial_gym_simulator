@@ -254,7 +254,20 @@ class BaseMultirotor(BaseRobot):
         controller_output = self.controller(self.action_tensor)
         self.control_allocation(controller_output, self.output_mode)
 
-        self.robot_force_tensors[:] = self.output_forces
+        # CRITICAL FIX: Transform motor forces from body frame to world frame
+        # Motor forces are generated in body frame [0, 0, thrust_z]
+        # When body tilts, these forces must be rotated to world frame to produce XY motion
+        rotation_matrix = quat_to_rotation_matrix(self.robot_orientation)
+        
+        # Transform each motor's force vector from body to world frame
+        for i in range(self.output_forces.shape[1]):
+            # output_forces[:, i, :] is in body frame
+            world_force = torch.bmm(
+                rotation_matrix,  # [num_envs, 3, 3]
+                self.output_forces[:, i, :].unsqueeze(2)  # [num_envs, 3, 1]
+            ).squeeze(2)  # [num_envs, 3]
+            self.robot_force_tensors[:, i, :] = world_force
+        
         self.robot_torque_tensors[:] = self.output_torques
 
     def simulate_drag(self):

@@ -65,7 +65,7 @@ class task_config:
     observation_space_dim = 13 + 4 + 64  # root_state + action_dim + latent_dims
     privileged_observation_space_dim = 0
     action_space_dim = 4
-    episode_len_steps = 500  # real physics time for simulation is this value multiplied by sim.dt
+    episode_len_steps = 1200  # real physics time for simulation is this value multiplied by sim.dt
 
     return_state_before_reset = (
         False  # False as usually state is returned for next episode after reset
@@ -74,32 +74,65 @@ class task_config:
 
     # fixed bounds for the rectangular space
     env_bounds_min = [0.0, 0.0, 0.0]
-    env_bounds_max = [20.0, 20.0, 10.0]
+    env_bounds_max = [10.0, 10.0, 10.0]
 
     # fixed number of obstacles to keep in the environment (excluding keep_in_env assets)
-    num_obstacles_in_env = 44
-    target_min_ratio = [0.90, 0.1, 0.1]  # target ratio w.r.t environment bounds in x,y,z
-    target_max_ratio = [0.94, 0.90, 0.90]  # target ratio w.r.t environment bounds in x,y,z
+    num_obstacles_in_env = 11
+    target_min_ratio = [0.2, 0.2, 0.2]  # 2m from all boundaries: X: 2.0-8.0m, Y: 2.0-8.0m, Z: 2.0-8.0m
+    target_max_ratio = [0.8, 0.8, 0.8]  # Ensures 2m clearance from all walls and ceiling
 
     reward_parameters = {
-        "pos_reward_magnitude": 5.0,
-        "pos_reward_exponent": 1.0 / 3.5,
-        "very_close_to_goal_reward_magnitude": 5.0,
-        "very_close_to_goal_reward_exponent": 2.0,
-        "getting_closer_reward_multiplier": 3.0,
-        "x_action_diff_penalty_magnitude": 0.1,
+        # Distance reward (absolute - DISABLED, rely on gradient only)
+        "distance_reward_magnitude": 0.0,  # Keep disabled
+        
+        # Distance improvement reward (gradient - RE-ENABLED) ⭐
+        "distance_improvement_reward_magnitude": 8.0,  # Main navigation driver
+        
+        # Direction alignment reward (velocity direction alignment with goal) ⭐
+        "direction_alignment_reward_magnitude": 2.0,  # Subtle guidance
+        
+        # Noise reduction reward (gradient-based) ⭐
+        "noise_reduction_reward_magnitude": 8.0,  # Equal weight to distance
+        
+        # Position Quality Hover Reward (NEW) ⭐⭐⭐
+        "hover_bonus_magnitude": 25.0,              # Progressive bonus for hovering at good position (reduced from 50)
+        "hover_quality_threshold": -3.0,            # position_quality > threshold = good position
+        "hover_speed_threshold": 0.3,               # speed < threshold = hovering (m/s) (relaxed from 0.2)
+        "cumulative_hover_rate": 0.1,               # Cumulative reward per step
+        "cumulative_hover_max": 10.0,               # Max cumulative hover bonus
+        
+        # Safety reward (based on depth map for obstacle avoidance) (NEW) ⭐
+        "safety_reward_magnitude": 2.0,             # Weight for safety reward
+        "min_safe_distance_clamp": 0.1,             # Min distance clamp to prevent log(0) (meters)
+        
+        # Action smoothness penalty (DISABLED)
+        "x_action_diff_penalty_magnitude": 0.0,
         "x_action_diff_penalty_exponent": 2.0,
-        "z_action_diff_penalty_magnitude": 0.8,
+        "y_action_diff_penalty_magnitude": 0.0,
+        "y_action_diff_penalty_exponent": 2.0,
+        "z_action_diff_penalty_magnitude": 0.0,
         "z_action_diff_penalty_exponent": 5.0,
-        "yawrate_action_diff_penalty_magnitude": 0.8,
-        "yawrate_action_diff_penalty_exponent": 3.33,
-        "x_absolute_action_penalty_magnitude": 0.1,
-        "x_absolute_action_penalty_exponent": 0.3,
-        "z_absolute_action_penalty_magnitude": 0.5,
-        "z_absolute_action_penalty_exponent": 1.0,
-        "yawrate_absolute_action_penalty_magnitude": 0.1,
-        "yawrate_absolute_action_penalty_exponent": 2.0,
-        "collision_penalty": -200.0,
+        
+        # Anti-spinning penalty (DISABLED)
+        "yaw_rate_penalty_magnitude": 0.0,
+        "yaw_rate_penalty_exponent": 2.0,
+        
+        # Speed penalty (DISABLED - too restrictive)
+        "max_safe_speed": 100.0,  # Set very high to effectively disable
+        "speed_penalty_magnitude": 0.0,  # Disabled
+        
+        # Velocity smoothness penalty (XY only - dynamic weight based on distance) 
+        "velocity_smoothness_penalty_far": 0.1,     # Far from target: allow acceleration/deceleration
+        "velocity_smoothness_penalty_near": 0.3,    # Near target: encourage smooth motion (increased from 0.2)
+        "distance_threshold_for_smooth": 2.0,       # Distance threshold (m)
+        
+        # Tilt angle penalty (REMOVED - too restrictive)
+        # "max_safe_tilt_deg": 20.0,
+        # "tilt_penalty_magnitude": 2.0,
+        # "tilt_penalty_exponent": 2.0,
+        
+        # Collision penalty
+        "collision_penalty": -100.0,
     }
 
     class vae_config:
@@ -125,20 +158,17 @@ class task_config:
         resample_on_reset = True
 
     class gmm_force_config:
-        """GMM physical force configuration"""
-        enable_physical_force = False  # TEMPORARY: Disabled for testing Lee controller
-        drone_mass = 12.0  # kg
-        gravity = 9.8  # m/s^2
-        disturbance_coefficient = 0.2  # k ∈ [0.1, 0.2] - restored to original value
+        """GMM-based physical force disturbance (NOW ENABLED for realistic training)"""
+        enable_physical_force = True  # Re-enabled for realistic disturbance
+        disturbance_coefficient = 0.01  # k = 0.01 (reduced from 0.2 for gentler disturbance)
         force_update_steps = 5  # Update random direction every N steps
+        drone_mass = 12.04  # kg (CORRECTED to match actual robot mass from URDF)
+        gravity = 9.81  # m/s²
         
-    class score_config:
-        w1 = 0.6    #目标距离项权重 (s_dist)
-        w2 = 0.7    #噪声项权重 (s_noise)
-        w3 = 1.0   #障碍物安全项权重 (s_obs)
-        c  = 1.5
-        r_obs = 1.0
-        grid_step = 0.2
+    # Score config removed - formulas integrated into reward function
+    # Distance reward uses s_dist formula: 1 - dist/d_max
+    # Noise reward uses gradient: max(0, noise_prev - noise_curr)
+    # Obstacle safety (s_obs) removed per user request
 
     class adaptive_grid_config:
         """自适应网格细化配置"""
@@ -156,122 +186,22 @@ class task_config:
         polish_step = 0.05          # 精化步长 (m)
         polish_radius = 0.5         # 精化搜索范围 (m)
 
+    class success_config:
+        """Success condition configuration"""
+        success_radius = 2.0          # Target zone radius (m)
+        max_velocity = 0.4            # Max velocity to be considered stationary (m/s) (Relaxed from 0.2)
+        max_roll_pitch_deg = 15.0     # Max roll/pitch angle (degrees)
+        min_success_steps = 50        # Number of continuous steps required for success (NEW)
+    
     class early_crash_config:
         max_retries = 5              # 最大重试次数
         threshold_steps = 5          # 判定"过早碰撞"的步数阈值
         safe_spawn_margin = 0.5      # 与障碍物的安全边距（米）
         fallback_to_center = True    # 超过重试次数后移到中心
 
-    fixed_env_presets = [
-        {
-            # Preset 0: 面板 (panel.urdf) - 6个大型障碍物
-            "name": "preset_0_panels",
-            "target_position": [9.2, 5.0, 2.0],  # Z reduced for 4.5m bounds
-            "obstacle_type": "panels",  # 使用 panels 资产类型
-            "obstacle_urdf": "panel.urdf",  # URDF 尺寸: 0.1×1.2×3.0m
-            "r_obs": 1.62,  # 外接球半径用于暴力脚本
-            "noise_centers": [
-                [2.5, 2.5, 1.5],
-                [5.0, 5.0, 2.0],
-                [7.5, 2.5, 1.5],
-                [8.0, 8.0, 2.5],
-                [3.0, 8.0, 2.0],
-            ],
-            "noise_sigmas": [
-                [6.0, 6.0, 2.5],
-                [8.0, 8.0, 3.0],
-                [7.0, 9.0, 2.5],
-                [10.0, 10.0, 3.5],
-                [12.0, 7.0, 3.0],
-            ],
-            "noise_weights": [0.2, 0.2, 0.2, 0.2, 0.2],
-            "obstacle_positions": [
-                [2.0, 2.0, 1.5],  # Panel center Z ≤ 2.0 (3m height / 2 + margin)
-                [5.0, 2.0, 1.8],
-                [8.0, 2.0, 1.5],
-                [2.0, 7.0, 1.8],
-                [5.0, 7.0, 1.5],
-                [8.0, 7.0, 2.0],
-            ],
-        },
-        {
-            # Preset 1: 细长杆 (cuboidal_rod.urdf) - 12个中型障碍物
-            "name": "preset_1_rods",
-            "target_position": [8.9, 6.2, 1.0],  # Z reduced for 4.5m bounds
-            "obstacle_type": "objects",  # 使用 objects 资产类型
-            "obstacle_urdf": "cuboidal_rod.urdf",  # URDF 尺寸: 0.1×0.1×2.0m
-            "r_obs": 1.0,  # 外接球半径用于暴力脚本
-            "noise_centers": [
-                [2.0, 5.0, 1.5],
-                [5.0, 5.0, 2.5],
-                [8.0, 5.0, 3.0],
-                [4.0, 1.5, 1.5],
-                [6.0, 8.5, 2.0],
-            ],
-            "noise_sigmas": [
-                [6.0, 6.0, 2.5],
-                [8.0, 8.0, 3.0],
-                [7.0, 9.0, 2.5],
-                [10.0, 10.0, 3.5],
-                [12.0, 7.0, 3.0],
-            ],
-            "noise_weights": [0.2, 0.2, 0.2, 0.2, 0.2],
-            "obstacle_positions": [
-                [1.5, 1.5, 1.5],  # Rod center Z ≤ 3.0 (2m height / 2 + margin)
-                [3.5, 1.5, 2.5],
-                [6.0, 1.5, 1.5],
-                [8.5, 1.5, 2.0],
-                [1.5, 5.0, 2.0],
-                [5.0, 5.0, 1.5],
-                [8.5, 5.0, 2.5],
-                [1.5, 8.5, 2.0],
-                [3.5, 8.5, 2.5],
-                [6.0, 8.5, 1.5],
-                [8.5, 8.5, 2.5],
-                [5.0, 3.0, 2.0],
-            ],
-        },
-        {
-            # Preset 2: 立方体 (small_cube.urdf) - 15个小型障碍物
-            "name": "preset_2_cubes",
-            "target_position": [9.0, 2.0, 3.0],  # Z reduced for 4.5m bounds
-            "obstacle_type": "objects",  # 使用 objects 资产类型
-            "obstacle_urdf": "small_cube.urdf",  # URDF 尺寸: 0.4×0.4×0.4m
-            "r_obs": 0.35,  # 外接球半径用于暴力脚本
-            "noise_centers": [
-                [1.5, 5.0, 2.0],
-                [8.5, 5.0, 2.5],
-                [5.0, 1.5, 1.5],
-                [5.0, 8.5, 3.0],
-                [5.0, 5.0, 2.0],
-            ],
-            "noise_sigmas": [
-                [6.0, 6.0, 2.5],
-                [8.0, 8.0, 3.0],
-                [7.0, 9.0, 2.5],
-                [10.0, 10.0, 3.5],
-                [12.0, 7.0, 3.0],
-            ],
-            "noise_weights": [0.2, 0.2, 0.2, 0.2, 0.2],
-            "obstacle_positions": [
-                [1.5, 1.5, 1.0],
-                [3.5, 1.5, 1.5],
-                [5.5, 1.5, 2.0],
-                [7.5, 1.5, 2.5],
-                [1.5, 3.5, 1.2],
-                [3.5, 3.5, 1.8],
-                [5.5, 3.5, 2.5],
-                [7.5, 3.5, 3.0],
-                [1.5, 5.5, 1.5],
-                [3.5, 5.5, 2.0],
-                [5.5, 5.5, 2.8],
-                [7.5, 5.5, 3.5],
-                [2.5, 7.5, 2.0],
-                [5.0, 7.5, 2.5],
-                [7.5, 7.5, 3.2],
-            ],
-        },
-    ]
+    # Fixed presets removed - target and noise now randomly generated
+    # Target position: random within target_min/max_ratio
+    # Noise sources: random GMM parameters within configured ranges
 
     class curriculum:
         min_level = 15
@@ -291,9 +221,11 @@ class task_config:
 
     def action_transformation_function(action):
         clamped_action = torch.clamp(action, -1.0, 1.0)
-        max_speed = torch.tensor([1.0, 1.0, 0.8], device=clamped_action.device)  # Y-axis increased from 0.5 to 1.0
-        max_yawrate = torch.pi / 3  # [rad/s]
+        # Reduced XY speed for safety and stability
+        max_speed = torch.tensor([0.8, 0.8, 0.5], device=clamped_action.device)  # X/Y: 0.8, Z: 0.5 (reduced from 1.0)
+        max_yawrate = torch.pi / 6  # 30°/s (0.524 rad/s) - Reduced from 45°/s for stability
         processed_action = clamped_action.clone()
         processed_action[:, 0:3] = max_speed * processed_action[:, 0:3]
         processed_action[:, 3] = max_yawrate * processed_action[:, 3]
         return processed_action
+
