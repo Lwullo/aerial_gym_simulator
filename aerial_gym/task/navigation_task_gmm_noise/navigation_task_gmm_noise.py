@@ -416,9 +416,50 @@ class NavigationTaskGmmNoise(BaseTask):
         num_envs = env_ids.shape[0]
         num_sources = self.num_noise_sources
 
-        bounds_min = self.env_bounds_min.view(1, 1, 3).expand(num_envs, num_sources, 3)
-        bounds_max = self.env_bounds_max.view(1, 1, 3).expand(num_envs, num_sources, 3)
-        centers = torch_rand_float_tensor(bounds_min, bounds_max)
+        # Stratified Noise Sampling Strategy ⭐
+        # Total sources: 5 (defined in config)
+        # Group 1: Global Roaming (Indices 0, 1, 2)
+        #   - Randomly distributed across the entire environment
+        #   - Provide general wind/disturbance throughout the flight
+        # Group 2: Target Guardians (Indices 3, 4)
+        #   - Spawned within 1.0m to 3.0m radius of the target
+        #   - Create complex turbulence near the goal to test fine control
+        
+        # --- Group 1: Global Sources (First 3) ---
+        num_global = 3
+        bounds_min_global = self.env_bounds_min.view(1, 1, 3).expand(num_envs, num_global, 3)
+        bounds_max_global = self.env_bounds_max.view(1, 1, 3).expand(num_envs, num_global, 3)
+        centers_global = torch_rand_float_tensor(bounds_min_global, bounds_max_global)
+
+        # --- Group 2: Local Target Sources (Last 2) ---
+        num_local = num_sources - num_global
+        if num_local > 0:
+            # Generate random directions
+            random_dirs = torch.randn((num_envs, num_local, 3), device=self.device)
+            random_dirs = torch.nn.functional.normalize(random_dirs, dim=2)
+            
+            # Generate random distances between 1.0m and 3.0m
+            # dist = min + rand * (max - min)
+            local_dist_min = 1.0
+            local_dist_max = 3.0
+            random_dists = torch.rand((num_envs, num_local, 1), device=self.device) * (local_dist_max - local_dist_min) + local_dist_min
+            
+            # Calculate offsets: direction * distance
+            offsets = random_dirs * random_dists
+            
+            # Add to target position (need to reshape target to broadcast)
+            # self.target_position: (num_envs, 3) -> (num_envs, 1, 3)
+            # CRITICAL FIX: Must index target_position with env_ids to match current batch!
+            centers_local = self.target_position[env_ids].unsqueeze(1) + offsets
+            
+            # Clamp to environment bounds just in case target is near wall
+            centers_local = torch.max(centers_local, self.env_bounds_min.view(1, 1, 3))
+            centers_local = torch.min(centers_local, self.env_bounds_max.view(1, 1, 3))
+            
+            # Concatenate global and local centers
+            centers = torch.cat([centers_global, centers_local], dim=1)
+        else:
+            centers = centers_global
 
         sigma_min = self.noise_sigma_min.view(1, 1, 3).expand(num_envs, num_sources, 3)
         sigma_max = self.noise_sigma_max.view(1, 1, 3).expand(num_envs, num_sources, 3)

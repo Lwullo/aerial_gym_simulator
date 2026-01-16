@@ -78,27 +78,27 @@ class task_config:
 
     # fixed number of obstacles to keep in the environment (excluding keep_in_env assets)
     num_obstacles_in_env = 11
-    target_min_ratio = [0.2, 0.2, 0.2]  # 2m from all boundaries: X: 2.0-8.0m, Y: 2.0-8.0m, Z: 2.0-8.0m
-    target_max_ratio = [0.8, 0.8, 0.8]  # Ensures 2m clearance from all walls and ceiling
+    target_min_ratio = [0.2, 0.2, 0.3]  # Z updated to 3.0m (0.3)
+    target_max_ratio = [0.8, 0.8, 0.7]  # Z updated to 7.0m (0.7)
 
     reward_parameters = {
         # Distance reward (absolute - DISABLED, rely on gradient only)
         "distance_reward_magnitude": 0.0,  # Keep disabled
         
         # Distance improvement reward (gradient - RE-ENABLED) ⭐
-        "distance_improvement_reward_magnitude": 8.0,  # Main navigation driver
+        "distance_improvement_reward_magnitude": 10.0,  # 导航奖励
         
         # Direction alignment reward (velocity direction alignment with goal) ⭐
         "direction_alignment_reward_magnitude": 2.0,  # Subtle guidance
         
         # Noise reduction reward (gradient-based) ⭐
-        "noise_reduction_reward_magnitude": 8.0,  # Equal weight to distance
+        "noise_reduction_reward_magnitude": 5.0,  # E噪声降低奖励
         
         # Position Quality Hover Reward (NEW) ⭐⭐⭐
-        "hover_bonus_magnitude": 25.0,              # Progressive bonus for hovering at good position (reduced from 50)
+        "hover_bonus_magnitude": 0.0,              # Progressive bonus for hovering at good position (reduced from 25)
         "hover_quality_threshold": -3.0,            # position_quality > threshold = good position
         "hover_speed_threshold": 0.3,               # speed < threshold = hovering (m/s) (relaxed from 0.2)
-        "cumulative_hover_rate": 0.1,               # Cumulative reward per step
+        "cumulative_hover_rate": 0.0,               # Cumulative reward per step
         "cumulative_hover_max": 10.0,               # Max cumulative hover bonus
         
         # Safety reward (based on depth map for obstacle avoidance) (NEW) ⭐
@@ -122,8 +122,8 @@ class task_config:
         "speed_penalty_magnitude": 0.0,  # Disabled
         
         # Velocity smoothness penalty (XY only - dynamic weight based on distance) 
-        "velocity_smoothness_penalty_far": 0.1,     # Far from target: allow acceleration/deceleration
-        "velocity_smoothness_penalty_near": 0.3,    # Near target: encourage smooth motion (increased from 0.2)
+        "velocity_smoothness_penalty_far": 2.0,     # Far from target: moderate smoothness requirement
+        "velocity_smoothness_penalty_near": 2.0,    # Near target: encourage smooth motion (increased from 0.2)
         "distance_threshold_for_smooth": 2.0,       # Distance threshold (m)
         
         # Tilt angle penalty (REMOVED - too restrictive)
@@ -160,7 +160,7 @@ class task_config:
     class gmm_force_config:
         """GMM-based physical force disturbance (NOW ENABLED for realistic training)"""
         enable_physical_force = True  # Re-enabled for realistic disturbance
-        disturbance_coefficient = 0.01  # k = 0.01 (reduced from 0.2 for gentler disturbance)
+        disturbance_coefficient = 0.05  # k = 0.05 (reduced for stability)
         force_update_steps = 5  # Update random direction every N steps
         drone_mass = 12.04  # kg (CORRECTED to match actual robot mass from URDF)
         gravity = 9.81  # m/s²
@@ -196,7 +196,7 @@ class task_config:
     class early_crash_config:
         max_retries = 5              # 最大重试次数
         threshold_steps = 5          # 判定"过早碰撞"的步数阈值
-        safe_spawn_margin = 0.5      # 与障碍物的安全边距（米）
+        safe_spawn_margin = 1.0      # 与障碍物的安全边距（米）
         fallback_to_center = True    # 超过重试次数后移到中心
 
     # Fixed presets removed - target and noise now randomly generated
