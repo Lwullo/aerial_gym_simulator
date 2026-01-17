@@ -173,7 +173,7 @@ class LMF2Cfg:
             motor_time_constant_increasing_max = 0.08
             motor_time_constant_decreasing_min = 0.005
             motor_time_constant_decreasing_max = 0.005
-            max_thrust = 40.0
+            max_thrust = 50.0
             min_thrust = 0.5
             max_thrust_rate = 100000.0
             thrust_to_torque_ratio = 0.07

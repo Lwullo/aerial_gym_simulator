@@ -89,7 +89,7 @@ class task_config:
         "distance_improvement_reward_magnitude": 10.0,  # 导航奖励
         
         # Direction alignment reward (velocity direction alignment with goal) ⭐
-        "direction_alignment_reward_magnitude": 2.0,  # Subtle guidance
+        "direction_alignment_reward_magnitude": 2.0,  # 速度导向，引导项
         
         # Noise reduction reward (gradient-based) ⭐
         "noise_reduction_reward_magnitude": 5.0,  # E噪声降低奖励
