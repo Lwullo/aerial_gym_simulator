@@ -476,6 +476,52 @@ class NavigationTaskGmmNoise(BaseTask):
         self.noise_sigmas[env_ids] = sigmas
         self.noise_weights[env_ids] = weights
 
+    def _estimate_noise_range(self, env_ids):
+        """
+        Monte Carlo estimation of min and max noise intensity in the environment.
+        Used for normalizing noise intensity in the Unified Cost Function.
+        """
+        if not self.noise_config.enable_noise or self.num_noise_sources <= 0:
+            self.estimated_n_min[env_ids] = 0.0
+            self.estimated_n_max[env_ids] = 1.0
+            return
+
+        num_samples = int(self.reward_params.get("n_min_max_sample_size", 1000))
+        num_envs_reset = env_ids.shape[0]
+        
+        # 1. Sample random positions inside environment bounds
+        # shape: (num_envs_reset, num_samples, 3)
+        sample_positions = torch_rand_float_tensor(
+            self.env_bounds_min.view(1, 1, 3).expand(num_envs_reset, num_samples, 3),
+            self.env_bounds_max.view(1, 1, 3).expand(num_envs_reset, num_samples, 3)
+        )
+        
+        # 2. Compute noise intensity for all samples
+        # Expand noise params to match samples
+        # centers: (num_envs_reset, 1, num_sources, 3)
+        centers = self.noise_centers[env_ids].unsqueeze(1)
+        sigmas = self.noise_sigmas[env_ids].unsqueeze(1)
+        weights = self.noise_weights[env_ids].unsqueeze(1)
+        
+        # sample_positions: (num_envs_reset, num_samples, 1, 3)
+        pos = sample_positions.unsqueeze(2)
+        
+        # Vectorized GMM computation
+        deltas = pos - centers
+        scaled = (deltas / sigmas).pow(2).sum(dim=-1)
+        mixture = torch.exp(-0.5 * scaled)
+        intensity = (weights * mixture).sum(dim=2) # (num_envs_reset, num_samples)
+        
+        # 3. Find min and max for each environment
+        n_min, _ = intensity.min(dim=1)
+        n_max, _ = intensity.max(dim=1)
+        
+        # Avoid division by zero if flat
+        n_max = torch.max(n_max, n_min + 1e-6)
+        
+        self.estimated_n_min[env_ids] = n_min
+        self.estimated_n_max[env_ids] = n_max
+
     def _draw_env0_debug_markers(self):
         viewer_ctrl = getattr(self.sim_env.IGE_env, "viewer", None)
         if viewer_ctrl is None or viewer_ctrl.viewer is None:
@@ -639,25 +685,34 @@ class NavigationTaskGmmNoise(BaseTask):
                 base_idx = env_id * num_rigid_bodies_per_env
                 global_force_tensor[base_idx] = force_vector[env_id]
 
-    def _compute_gmm_mixture(self, position):
+    def _compute_gmm_mixture(self, position, env_ids=None):
         """
         Compute GMM mixture intensity at given position.
         
         Args:
-            position: (num_envs, 3) - positions to evaluate
+            position: (num_envs or subset, 3) - positions to evaluate
+            env_ids: (optional) indices of environments to compute for. 
+                     If provided, noise params are sliced.
             
         Returns:
-            mixture_intensity: (num_envs,) - GMM intensity at each position, ∈ [0, ~1]
+            mixture_intensity: (num_envs or subset,) - GMM intensity
         """
-        # position: (num_envs, 3)
+        # position: (N, 3)
         # noise_centers: (num_envs, num_sources, 3)
-        # noise_sigmas: (num_envs, num_sources, 3)
-        # noise_weights: (num_envs, num_sources)
         
-        deltas = position.unsqueeze(1) - self.noise_centers  # (num_envs, num_sources, 3)
-        scaled = (deltas / self.noise_sigmas).pow(2).sum(dim=-1)  # (num_envs, num_sources)
+        if env_ids is not None:
+            centers = self.noise_centers[env_ids]
+            sigmas = self.noise_sigmas[env_ids]
+            weights = self.noise_weights[env_ids]
+        else:
+            centers = self.noise_centers
+            sigmas = self.noise_sigmas
+            weights = self.noise_weights
+        
+        deltas = position.unsqueeze(1) - centers  # (N, num_sources, 3)
+        scaled = (deltas / sigmas).pow(2).sum(dim=-1)  # (N, num_sources)
         mixture = torch.exp(-0.5 * scaled)  # Gaussian PDF
-        weighted_mixture = (self.noise_weights * mixture).sum(dim=1)  # (num_envs,)
+        weighted_mixture = (weights * mixture).sum(dim=1)  # (N,)
         
         return weighted_mixture
 
@@ -679,18 +734,39 @@ class NavigationTaskGmmNoise(BaseTask):
         linvel_magnitude = torch.norm(linvel, dim=1)
         current_noise = self._compute_gmm_mixture(position)
         
-        # 1. Distance Improvement Reward (gradient - main navigation driver) ⭐
-        distance_improvement = self.previous_distance - dist_to_target  # Positive if getting closer
-        improvement_reward = self.reward_params["distance_improvement_reward_magnitude"] * torch.clamp(
-            distance_improvement, min=0.0
-        )
+        # ==== Unified Potential Function Reward (J(p)) ⭐ ====
+        # Calculate current potential J_t
+        if not hasattr(self, "estimated_n_min"):
+             # Fallback if uninitialized (should imply first step or error)
+             n_hat = torch.zeros_like(current_noise)
+        else:
+            n_hat = (current_noise - self.estimated_n_min) / (
+                self.estimated_n_max - self.estimated_n_min + 1e-6
+            )
+            n_hat = torch.clamp(n_hat, 0.0, 1.0)
+            
+        d0 = self.reward_params["potential_d0"]
+        w_d = self.reward_params["potential_w_d"]
+        w_n = self.reward_params["potential_w_n"]
         
-        # 2. Noise Reduction Reward (gradient - encourages moving to low-noise areas) ⭐
-        prev_noise = self._compute_gmm_mixture(self.previous_position)
-        noise_reduction = prev_noise - current_noise
-        noise_reduction_reward = self.reward_params["noise_reduction_reward_magnitude"] * torch.clamp(
-            noise_reduction, min=0.0
-        )
+        # J_t = w_d * (d/d0)^2 + w_n * n_hat
+        J_t = w_d * (dist_to_target / d0).pow(2) + w_n * n_hat
+        
+        # Reward = k_J * tanh( (J_prev - J_t) / s_J )
+        k_J = self.reward_params["potential_kj"]
+        s_J = self.reward_params["potential_sj"]
+        
+        potential_diff = self.previous_potential - J_t
+        
+        # Use tanh to saturate reward and normalize small gradients
+        potential_improvement_reward = k_J * torch.tanh(potential_diff / s_J)
+        
+        # Update previous potential for next step
+        self.previous_potential = J_t.clone()
+        
+        # For logging compatibility (keep variable names for return, but zero them or use proxies)
+        improvement_reward = potential_improvement_reward # Borrow this variable slot for logging
+        noise_reduction_reward = torch.zeros_like(potential_improvement_reward)
         
         # 3. Direction Alignment Reward (auxiliary navigation guidance)
         vec_to_target = self.target_position - position
@@ -712,97 +788,49 @@ class NavigationTaskGmmNoise(BaseTask):
         moving_mask = (speed.squeeze(1) > 0.05).float()
         direction_reward = direction_reward * moving_mask
         
-        # ==== Position Quality Hover Reward (NEW - PROGRESSIVE) ⭐⭐⭐ ====
-        # Comprehensive position evaluation: position_quality = -(distance*8 + noise*8)
-        # Higher value = better position (close to target + low noise)
-        position_quality = -(dist_to_target * 8.0 + current_noise * 8.0)
         
-        quality_threshold = self.reward_params["hover_quality_threshold"]  # e.g., -3.0
-        speed_threshold = self.reward_params["hover_speed_threshold"]      # e.g., 0.3 m/s
-        
-        is_good_position = position_quality > quality_threshold
-        
-        # Progressive hover bonus: rewards scale with how slow the drone is
-        # speed_factor ranges from 0 (at threshold) to 1 (at zero speed)
-        speed_factor = torch.clamp(1.0 - linvel_magnitude / speed_threshold, min=0.0, max=1.0)
-        
-        # Only give reward if in good position, scaled by speed_factor
-        hover_bonus = torch.where(
-            is_good_position,
-            self.reward_params["hover_bonus_magnitude"] * speed_factor,
-            torch.zeros_like(position_quality)
-        )
-        
-        
-        # ==== Cumulative Hover Reward (NEW) ⭐⭐ ====
-        # Encourages staying at optimal position, prevents restless exploration
-        # Trigger when in good position AND moving slowly (speed < threshold)
-        is_in_optimal_zone = torch.logical_and(is_good_position, linvel_magnitude < speed_threshold)
-        
-        # Update counter: increment if in zone, reset otherwise
-        self.hover_time_counter = torch.where(
-            is_in_optimal_zone,
-            self.hover_time_counter + 1.0,
-            torch.zeros_like(self.hover_time_counter)
-        )
-        
-        # Cumulative bonus (capped at max value)
-        cumulative_hover_bonus = torch.clamp(
-            self.hover_time_counter * self.reward_params["cumulative_hover_rate"],
-            max=self.reward_params["cumulative_hover_max"]
-        )
+        # ==== Action Smoothness Penalties (Action-based) ⭐ ====
+        # 1. Action Magnitude Penalty (Energy/Effort): -k_a * ||u_t||^2
+        # self.actions are already normalized (usually -1 to 1)
+        k_a = self.reward_params["action_magnitude_penalty_weight"]
+        action_norm_sq = torch.sum(self.actions.pow(2), dim=1)
+        action_magnitude_penalty = -k_a * action_norm_sq
 
+        # 2. Action Change Penalty (Smoothness/Jitter): -k_Delta_a * ||u_t - u_{t-1}||^2
+        k_Delta_a = self.reward_params["action_change_penalty_weight"]
+        action_diff_norm_sq = torch.sum((self.actions - self.previous_actions).pow(2), dim=1)
+        action_change_penalty = -k_Delta_a * action_diff_norm_sq
         
-        # ==== Dynamic Velocity Smoothness Penalty (NEW) ⭐ ====
-        # Far from target: low penalty (allow acceleration/deceleration)
-        # Near target: higher penalty (encourage smooth motion)
-        velocity_xy = linvel[:, :2]
-        velocity_change_xy = velocity_xy - self.previous_velocity[:, :2]
-        velocity_diff_norm = torch.norm(velocity_change_xy, dim=1)
+        # Combined smoothness penalty
+        action_smoothness_penalty = action_magnitude_penalty + action_change_penalty
         
-        smooth_weight = torch.where(
-            dist_to_target > self.reward_params["distance_threshold_for_smooth"],
-            torch.full_like(dist_to_target, self.reward_params["velocity_smoothness_penalty_far"]),
-            torch.full_like(dist_to_target, self.reward_params["velocity_smoothness_penalty_near"])
-        )
-        velocity_smooth_penalty = -smooth_weight * velocity_diff_norm
-        
-        # ==== Action Smoothness Penalties ====
-        action_diff = self.actions - self.previous_actions
-        
-        x_diff_penalty = -self.reward_params["x_action_diff_penalty_magnitude"] * (
-            action_diff[:, 0].abs().pow(self.reward_params["x_action_diff_penalty_exponent"])
-        )
-        y_diff_penalty = -self.reward_params["y_action_diff_penalty_magnitude"] * (
-            action_diff[:, 1].abs().pow(self.reward_params["y_action_diff_penalty_exponent"])
-        )
-        z_diff_penalty = -self.reward_params["z_action_diff_penalty_magnitude"] * (
-            action_diff[:, 2].abs().pow(self.reward_params["z_action_diff_penalty_exponent"])
-        )
-        
-        # ==== Anti-Spinning Penalty ====
-        yaw_rate = self.obs_dict["robot_body_angvel"][:, 2]
-        yaw_rate_penalty = -self.reward_params["yaw_rate_penalty_magnitude"] * (
-            yaw_rate.abs().pow(self.reward_params["yaw_rate_penalty_exponent"])
-        )
-        
-        # ==== Speed Penalty (DISABLED) ====
-        max_safe_speed = self.reward_params["max_safe_speed"]
-        speed_excess = torch.clamp(linvel_magnitude - max_safe_speed, min=0.0)
-        speed_penalty = -self.reward_params["speed_penalty_magnitude"] * speed_excess.pow(2)
-        
-        # ==== Safety Reward (NEW) ⭐⭐ ====
-        # Based on depth map: r_ss = (1/(N_b × N_r)) × ΣΣ log(S_stat(b, j))
-        # Treat each pixel in depth map as a "ray" measurement
+        # ==== Safety Reward (Penalty Log-Barrier) (NEW) ⭐⭐ ====
+        # Based on depth map for obstacle avoidance
         depth_pixels = self.obs_dict["depth_range_pixels"].squeeze(1)  # (num_envs, H, W)
-        distances = depth_pixels.view(self.sim_env.num_envs, -1)  # Flatten to (num_envs, H*W)
         
-        # Clamp distances to prevent log(0)
+        # 1. Handle Invalid/Zero Depth -> Max Range
+        # Assumption: 0 means invalid/too far. Using 10.0m as default max range for this env.
+        max_range = 10.0
+        depth_pixels = torch.where(depth_pixels <= 0.0, torch.tensor(max_range, device=self.device), depth_pixels)
+        
+        # Denormalize depth (pixels are 0-1, need meters)
+        # Assumes sensor config has normalize_range=True (default)
+        distances = depth_pixels.view(self.sim_env.num_envs, -1) * max_range
+        
+        # 2. Penalty Log-Barrier: R = k * min(log(d) - log(threshold), 0)
+        # Only penalize if distance < threshold. Reward is 0 if safe.
+        threshold = self.reward_params.get("safety_dist_threshold", torch.tensor(1.0, device=self.device))
+        
+        # Clamp minimal distance for stability in log calculation
         safe_distances = torch.clamp(distances, min=self.reward_params["min_safe_distance_clamp"])
         
-        # Compute log of distances and take mean (equivalent to formula in image)
-        log_distances = torch.log(safe_distances)
-        safety_reward = self.reward_params["safety_reward_magnitude"] * log_distances.mean(dim=1)
+        log_dist = torch.log(safe_distances)
+        log_threshold = torch.log(threshold)
+        
+        # Calculate penalty for each pixel (ray)
+        # Using mean over pixels as before
+        pixel_penalties = torch.clamp(log_dist - log_threshold, max=0.0)
+        safety_reward = self.reward_params["safety_reward_magnitude"] * pixel_penalties.mean(dim=1)
         
         # ==== Collision Penalty ====
         collision_penalty = self.reward_params["collision_penalty"]
@@ -811,18 +839,11 @@ class NavigationTaskGmmNoise(BaseTask):
         
         # ==== Total Unified Reward (no explicit stage switching) ====
         reward = (
-            improvement_reward           # 8.0 × improvement (navigation driver)
-            + noise_reduction_reward      # 8.0 × noise_reduction (optimization driver)
+            improvement_reward           # Now carries the Unified Potential Reward
+            # + noise_reduction_reward    # Removed (is 0.0)
             + direction_reward            # 2.0 × alignment (navigation guidance)
-            + hover_bonus                 # 50.0 if in good position + hovering
-            + cumulative_hover_bonus      # 0~10.0 cumulative (stay in optimal zone)
-            + velocity_smooth_penalty     # dynamic: -0.1 (far) or -0.2 (near)
+            + action_smoothness_penalty   # Action-based smoothness (-k_a, -k_da)
             + safety_reward               # 2.0 × mean(log(distances)) (obstacle avoidance)
-            + x_diff_penalty              # disabled (0.0)
-            + y_diff_penalty
-            + z_diff_penalty
-            + yaw_rate_penalty            # disabled (0.0)
-            + speed_penalty               # disabled (0.0)
             + collision_reward            # -100
         )
         
@@ -1093,6 +1114,37 @@ class NavigationTaskGmmNoise(BaseTask):
         
         # Reset hover time counter
         self.hover_time_counter[env_ids] = 0.0
+        
+        # ==== Unified Cost Function Initialization ====
+        # 1. Resample noise env parameters
+        self._resample_noise_sources(env_ids)
+        
+        # 2. Estimate noise range for normalization (min/max)
+        if not hasattr(self, "estimated_n_min"): # Initialize buffers if missing (first run)
+            self.estimated_n_min = torch.zeros(self.sim_env.num_envs, device=self.device)
+            self.estimated_n_max = torch.ones(self.sim_env.num_envs, device=self.device)
+            self.previous_potential = torch.zeros(self.sim_env.num_envs, device=self.device)
+            
+        self._estimate_noise_range(env_ids)
+        
+        # 3. Compute initial potential J_0
+        initial_noise_level = self._compute_gmm_mixture(self.previous_position[env_ids], env_ids)
+        
+        # Normalize noise: n_hat = (n - min) / (max - min)
+        n_hat = (initial_noise_level - self.estimated_n_min[env_ids]) / (
+            self.estimated_n_max[env_ids] - self.estimated_n_min[env_ids] + 1e-6
+        )
+        n_hat = torch.clamp(n_hat, 0.0, 1.0)
+        
+        # Distance component
+        d = self.previous_distance[env_ids]
+        d0 = self.reward_params["potential_d0"]
+        w_d = self.reward_params["potential_w_d"]
+        w_n = self.reward_params["potential_w_n"]
+        
+        # J = w_d * (d/d0)^2 + w_n * n_hat
+        J_0 = w_d * (d / d0).pow(2) + w_n * n_hat
+        self.previous_potential[env_ids] = J_0
         
         self.infos = {}
         return

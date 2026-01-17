@@ -82,57 +82,28 @@ class task_config:
     target_max_ratio = [0.8, 0.8, 0.7]  # Z updated to 7.0m (0.7)
 
     reward_parameters = {
-        # Distance reward (absolute - DISABLED, rely on gradient only)
-        "distance_reward_magnitude": 0.0,  # Keep disabled
-        
-        # Distance improvement reward (gradient - RE-ENABLED) ⭐
-        "distance_improvement_reward_magnitude": 10.0,  # 导航奖励
+        # Unified Cost Function Reward (J_prev - J_t) with Tanh Smoothing ⭐
+        "potential_kj": 1.0,               # Max reward per step (k_J)
+        "potential_sj": 0.1,               # Sensitivity scale (s_J), small change normalization
+        "potential_w_d": 1.0,              # Weight for distance cost (w_d)
+        "potential_w_n": 1.0,              # Weight for noise cost (w_n)
+        "potential_d0": 2.0,               # Reference distance (d0) for normalization
+        "n_min_max_sample_size": 1000,     # Number of samples to estimate noise range on reset
         
         # Direction alignment reward (velocity direction alignment with goal) ⭐
-        "direction_alignment_reward_magnitude": 2.0,  # 速度导向，引导项
-        
-        # Noise reduction reward (gradient-based) ⭐
-        "noise_reduction_reward_magnitude": 5.0,  # E噪声降低奖励
-        
-        # Position Quality Hover Reward (NEW) ⭐⭐⭐
-        "hover_bonus_magnitude": 0.0,              # Progressive bonus for hovering at good position (reduced from 25)
-        "hover_quality_threshold": -3.0,            # position_quality > threshold = good position
-        "hover_speed_threshold": 0.3,               # speed < threshold = hovering (m/s) (relaxed from 0.2)
-        "cumulative_hover_rate": 0.0,               # Cumulative reward per step
-        "cumulative_hover_max": 10.0,               # Max cumulative hover bonus
+        "direction_alignment_reward_magnitude": 0.0,  # 速度导向，暂时禁用 (2.0 -> 0.0)
         
         # Safety reward (based on depth map for obstacle avoidance) (NEW) ⭐
-        "safety_reward_magnitude": 2.0,             # Weight for safety reward
+        "safety_reward_magnitude": 0.1,             # Weight for safety reward (Penalty only)
+        "safety_dist_threshold": 1.0,               # Distance threshold for safety penalty (meters)
         "min_safe_distance_clamp": 0.1,             # Min distance clamp to prevent log(0) (meters)
         
-        # Action smoothness penalty (DISABLED)
-        "x_action_diff_penalty_magnitude": 0.0,
-        "x_action_diff_penalty_exponent": 2.0,
-        "y_action_diff_penalty_magnitude": 0.0,
-        "y_action_diff_penalty_exponent": 2.0,
-        "z_action_diff_penalty_magnitude": 0.0,
-        "z_action_diff_penalty_exponent": 5.0,
-        
-        # Anti-spinning penalty (DISABLED)
-        "yaw_rate_penalty_magnitude": 0.0,
-        "yaw_rate_penalty_exponent": 2.0,
-        
-        # Speed penalty (DISABLED - too restrictive)
-        "max_safe_speed": 100.0,  # Set very high to effectively disable
-        "speed_penalty_magnitude": 0.0,  # Disabled
-        
-        # Velocity smoothness penalty (XY only - dynamic weight based on distance) 
-        "velocity_smoothness_penalty_far": 2.0,     # Far from target: moderate smoothness requirement
-        "velocity_smoothness_penalty_near": 2.0,    # Near target: encourage smooth motion (increased from 0.2)
-        "distance_threshold_for_smooth": 2.0,       # Distance threshold (m)
-        
-        # Tilt angle penalty (REMOVED - too restrictive)
-        # "max_safe_tilt_deg": 20.0,
-        # "tilt_penalty_magnitude": 2.0,
-        # "tilt_penalty_exponent": 2.0,
+        # Action Smoothness Penalties (Action-based) ⭐
+        "action_magnitude_penalty_weight": 0.05,    # k_a (energy/effort penalty)
+        "action_change_penalty_weight": 0.1,        # k_Delta_a (smoothness/jitter penalty)
         
         # Collision penalty
-        "collision_penalty": -100.0,
+        "collision_penalty": -20.0,
     }
 
     class vae_config:
