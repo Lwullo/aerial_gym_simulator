@@ -203,6 +203,21 @@ class NavigationTaskGmmNoise(BaseTask):
 
         # Ensure assets are placed within the fixed bounds.
         self.sim_env.reset()
+        
+        # Initialize Arrival Metric Buffer
+        self.has_arrived = torch.zeros(self.sim_env.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.recent_arrivals = deque(maxlen=100)
+        
+        # Initialize success_buf before reset_idx
+        self.success_buf = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.long)
+        
+        # Initialize extras dictionary for TensorBoard logging
+        self.extras = {}
+        
+        # Initialize episode statistics buffers
+        self.episode_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
+        self.episode_lengths = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.int)
+        
         self.reset_idx(torch.arange(self.sim_env.num_envs, device=self.device))
 
     def _resolve_best_point_path(self):
@@ -1021,7 +1036,24 @@ class NavigationTaskGmmNoise(BaseTask):
             self.writer.add_scalar("motor_thrust/motor_2", motor_thrust_2, self.num_task_steps)
             self.writer.add_scalar("motor_thrust/motor_3", motor_thrust_3, self.num_task_steps)
 
+        if self.writer is None and not self._writer_initialized:
+             self._init_tensorboard_writer()
+             self._writer_initialized = True
+             
+        if self.writer:
+            self.writer.add_scalar("Performance/success_rate", success_rate, self.num_task_steps)
+            self.writer.add_scalar("Performance/crash_rate_episodes", crash_rate_episodes, self.num_task_steps)
+            self.writer.add_scalar("Performance/timeout_rate", timeout_rate, self.num_task_steps)
+            
+            # Log Arrival Rate (Intermediate Success)
+            arrival_rate = self.has_arrived.float().mean().item()
+            self.writer.add_scalar("Performance/arrival_rate", arrival_rate, self.num_task_steps)
+            
+            # Also log current batch stats
+            batch_success_rate = self.success_buf.float().mean().item()
+            self.writer.add_scalar("Performance/batch_success_rate", batch_success_rate, self.num_task_steps)
         
+        # Log to logging system (console)
         # Periodic terminal logging (every 1000 steps) - YELLOW COLOR with hover and noise monitoring
         if self.num_task_steps % 1000 == 0:
             # Calculate attitude angles
@@ -1115,6 +1147,9 @@ class NavigationTaskGmmNoise(BaseTask):
         # Reset hover time counter
         self.hover_time_counter[env_ids] = 0.0
         
+        # Reset arrival tracker
+        self.has_arrived[env_ids] = False
+        
         # ==== Unified Cost Function Initialization ====
         # 1. Resample noise env parameters
         self._resample_noise_sources(env_ids)
@@ -1124,6 +1159,49 @@ class NavigationTaskGmmNoise(BaseTask):
             self.estimated_n_min = torch.zeros(self.sim_env.num_envs, device=self.device)
             self.estimated_n_max = torch.ones(self.sim_env.num_envs, device=self.device)
             self.previous_potential = torch.zeros(self.sim_env.num_envs, device=self.device)
+            
+            # Scheme B Buffers
+            self.J_best_in_goal = torch.full((self.sim_env.num_envs,), float('inf'), device=self.device)
+            self.hold_counter = torch.zeros(self.sim_env.num_envs, device=self.device)
+            self.max_hold_counter = torch.zeros(self.sim_env.num_envs, device=self.device)
+            self.failure_log_path = os.path.join(self.task_config.log_dir if hasattr(self.task_config, "log_dir") else ".", "failure_log.txt")
+            # Create/Clear log file
+            with open(self.failure_log_path, "w") as f:
+                f.write("dist,speed,max_hold_steps\n")
+
+        # Failure Log (before reset) - Only for actually failed envs (not successful ones)
+        # Check success_buf (updated in step before reset_idx)
+        if hasattr(self, "success_buf"):
+            failed_mask = (self.success_buf[env_ids] == 0)
+            if failed_mask.any():
+                failed_ids = env_ids[failed_mask]
+                
+                # Get stats
+                dists = torch.norm(self.target_position[failed_ids] - self.obs_dict["robot_position"][failed_ids], dim=1)
+                speeds = torch.norm(self.obs_dict["robot_linvel"][failed_ids], dim=1)
+                holds = self.max_hold_counter[failed_ids]
+                
+                # Log to file
+                try:
+                    with open(self.failure_log_path, "a") as f:
+                        for d, s, h in zip(dists.cpu().numpy(), speeds.cpu().numpy(), holds.cpu().numpy()):
+                            line = f"{d:.4f},{s:.4f},{int(h)}\n"
+                            f.write(line)
+                        f.flush()
+                        os.fsync(f.fileno())
+                except Exception as e:
+                    # Fail silently or log error only
+                    pass
+        else:
+            # First run, initialize buffers if not done (though 'if not hasattr' above handles logic buffers)
+            # Ensure success_buf exists if we rely on it later? 
+            # It's usually created in create_sim -> allocate_buffers.
+            pass
+
+        # Reset Scheme B buffers
+        self.J_best_in_goal[env_ids] = float('inf')
+        self.hold_counter[env_ids] = 0.0
+        self.max_hold_counter[env_ids] = 0.0
             
         self._estimate_noise_range(env_ids)
         
@@ -1369,36 +1447,92 @@ class NavigationTaskGmmNoise(BaseTask):
             torch.zeros_like(self.truncations),
         )
 
-        # New success condition: Continuous hover stability
+        # Scheme B: Dynamic Stability & Terminal Reward
+        # 1. Update Best Potential in Goal
         position = self.obs_dict["robot_position"]
         dist_to_target = torch.norm(self.target_position - position, dim=1)
-        is_in_range = dist_to_target < self.success_config.success_radius
+        in_goal_mask = dist_to_target <= self.success_config.success_radius
         
+        # Update Arrival Tracker (Metric: "Have I ever been there?")
+        self.has_arrived = self.has_arrived | in_goal_mask
+        
+        # J_t is stored in self.previous_potential (updated in _compute_reward_and_scores)
+        J_t = self.previous_potential
+        
+        # Update J_best_in_goal where in_goal_mask is True
+        current_best = self.J_best_in_goal
+        new_best = torch.min(current_best, J_t)
+        self.J_best_in_goal = torch.where(in_goal_mask, new_best, current_best)
+        
+        # 2. Check Stability Conditions
+        # Cond 1: Position (d <= 2.0m) -> already in_goal_mask
+        
+        # Cond 2: Velocity (v <= v_hold)
         linvel = self.obs_dict["robot_linvel"]
         linvel_magnitude = torch.norm(linvel, dim=1)
-        is_velocity_low = linvel_magnitude < self.success_config.max_velocity
+        cond_vel = linvel_magnitude <= self.success_config.stability_velocity_threshold
         
-        euler = self.obs_dict["robot_euler_angles"]
-        max_angle_rad = torch.deg2rad(torch.tensor(self.success_config.max_roll_pitch_deg, device=self.device))
-        is_attitude_stable = (euler[:, 0].abs() < max_angle_rad) & (euler[:, 1].abs() < max_angle_rad)
+        # Cond 3: Potential Quality (J_t <= J_best + delta)
+        cond_pot = J_t <= (self.J_best_in_goal + self.success_config.stability_potential_delta)
         
-        # Check if current step meets hover requirements
-        is_hovering = is_in_range * is_velocity_low * is_attitude_stable
+        # Stable?
+        is_stable = in_goal_mask & cond_vel & cond_pot
         
-        # Update continuous success counter
-        # Increment if hovering, reset to 0 if not
-        self.success_counter = torch.where(
-            is_hovering,
-            self.success_counter + 1.0,
-            torch.zeros_like(self.success_counter)
+        # 3. Update Hold Counter
+        self.hold_counter = torch.where(
+            is_stable,
+            self.hold_counter + 1.0,
+            torch.zeros_like(self.hold_counter)
         )
         
-        # Determine success: Counter exceeds threshold
-        # Once successful, it stays successful for logging purposes, but we don't necessarily terminate immediately
-        # unless you want early termination. For now, let's keep running to train stability.
-        # But for the "success" metric, we flag it if threshold is met.
-        has_succeeded = self.success_counter >= self.success_config.min_success_steps
+        # Update max hold counter for logging
+        self.max_hold_counter = torch.max(self.max_hold_counter, self.hold_counter)
         
+        # 4. Trigger Success
+        has_succeeded = self.hold_counter >= self.success_config.min_success_steps
+        
+        # 5. Apply Terminal Reward (One-time +50)
+        success_bonus = torch.where(
+            has_succeeded,
+            torch.tensor(self.success_config.success_reward, device=self.device),
+            torch.zeros_like(self.rewards)
+        )
+        self.rewards += success_bonus
+        
+        # Update buffers & Terminate
+        # Use terminations to trigger reset. Ensure we keep the type consistent or use torch.where to update.
+        # has_succeeded is boolean. self.terminations is likely int/long/bool.
+        # To be safe and compatible with runner.py's torch.where expectation (which needs bool for condition),
+        # we set the successful termination flag.
+        
+        # If self.terminations is int/long (0/1), we should set it to 1.
+        self.terminations[:] = torch.where(has_succeeded, torch.ones_like(self.terminations), self.terminations)
+        self.success_buf[:] = torch.where(has_succeeded, torch.ones_like(self.success_buf), self.success_buf)
+        
+        # TensorBoard Logging
+        self.extras["improvement_reward"] = improvement_reward.mean()
+        self.extras["direction_reward"] = direction_reward.mean()
+        self.extras["step_reward"] = self.rewards.mean()
+        self.extras["success_rate"] = self.success_buf.float().mean()
+        self.extras["max_hold_steps"] = self.max_hold_counter.mean()
+        
+        # Accumulate episode statistics
+        self.episode_sums += self.rewards
+        self.episode_lengths += 1
+        
+        # Check for done envs (terminations or truncations)
+        dones = (self.terminations > 0) | (self.truncations > 0)
+        if dones.any():
+            done_indices = dones.nonzero(as_tuple=False).flatten()
+            
+            # Log episode rewards and lengths for rl_games
+            self.extras["episode_rewards"] = self.episode_sums[done_indices].cpu().numpy().tolist()
+            self.extras["episode_lengths"] = self.episode_lengths[done_indices].cpu().numpy().tolist()
+            
+            # Reset buffers for done envs
+            self.episode_sums[done_indices] = 0
+            self.episode_lengths[done_indices] = 0
+
         # We only mark success at the end of episode for success rate calculation to be simple
         # OR we can track if it *ever* succeeded during the episode.
         # Let's use the standard approach: Success if condition met at termination OR if persistent success achieved.
@@ -1422,6 +1556,23 @@ class NavigationTaskGmmNoise(BaseTask):
         self.check_and_update_curriculum_level(
             self.infos["successes"], self.infos["crashes"], self.infos["timeouts"]
         )
+        
+        # Update recent_episodes deque for success rate calculation
+        # Identify environments that are done (success, crash, or timeout)
+        done_envs = (self.terminations > 0) | (self.truncations > 0)
+        done_indices = done_envs.nonzero(as_tuple=False).squeeze(-1)
+        
+        if done_indices.numel() > 0:
+            for idx in done_indices:
+                if successes[idx] > 0:
+                    self.recent_episodes.append("success")
+                elif self.terminations[idx] > 0:
+                    self.recent_episodes.append("crash")
+                elif self.truncations[idx] > 0:
+                    self.recent_episodes.append("timeout")
+                
+                # Update arrival stats for done envs
+                self.recent_arrivals.append(bool(self.has_arrived[idx].item()))
 
         # Reset early crash retry counter for environments that didn't crash this step
         non_crash_envs = (self.terminations == 0).nonzero(as_tuple=False).squeeze(-1)
@@ -1438,6 +1589,10 @@ class NavigationTaskGmmNoise(BaseTask):
                 self._episode_log_written = True
 
         reset_envs = self.sim_env.post_reward_calculation_step()
+
+        if len(reset_envs) > 0:
+            # self.reset_idx(reset_envs) # Redundant: EnvManager already called it!
+            pass
         
         # EVAL mode: track if we've passed the early crash threshold
         if self._eval_mode and not self._eval_init_phase_complete:
@@ -1474,6 +1629,9 @@ class NavigationTaskGmmNoise(BaseTask):
 
         self.num_task_steps += 1
         self.process_image_observation()
+        
+        # Merge extras into infos so rl_games can see them
+        self.infos.update(self.extras)
 
         if self.task_config.return_state_before_reset is False:
             return_tuple = self.get_return_tuple()

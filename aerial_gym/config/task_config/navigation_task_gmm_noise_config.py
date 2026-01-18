@@ -158,11 +158,14 @@ class task_config:
         polish_radius = 0.5         # 精化搜索范围 (m)
 
     class success_config:
-        """Success condition configuration"""
+        """Success condition configuration (Scheme B)"""
+        success_reward = 0.0         # Terminal Reward (DISABLED per request)
         success_radius = 2.0          # Target zone radius (m)
-        max_velocity = 0.4            # Max velocity to be considered stationary (m/s) (Relaxed from 0.2)
-        max_roll_pitch_deg = 15.0     # Max roll/pitch angle (degrees)
-        min_success_steps = 50        # Number of continuous steps required for success (NEW)
+        
+        # Stability criteria
+        stability_velocity_threshold = 0.35  # v_hold (m/s)
+        stability_potential_delta = 0.03     # delta_J (potential tolerance)
+        min_success_steps = 60               # N_hold (0.6s)
     
     class early_crash_config:
         max_retries = 5              # 最大重试次数
