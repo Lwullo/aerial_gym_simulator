@@ -102,6 +102,12 @@ class task_config:
         "action_magnitude_penalty_weight": 0.05,    # k_a (energy/effort penalty)
         "action_change_penalty_weight": 0.1,        # k_Delta_a (smoothness/jitter penalty)
         
+        # Hover Reward (Continuous Gating Functions) ⭐
+        "hover_reward_kh": 1.0,                     # k_h (hover reward weight coefficient) [UPDATED: 0.5 → 1.0]
+        "hover_reward_dh": 2.0,                     # d_h (distance threshold for hover, meters)
+        "hover_reward_vh": 0.35,                    # v_h (velocity threshold for hover, m/s) [UPDATED: 0.25 → 0.35]
+        "hover_reward_jh": 1.0,                     # J_h (potential quality threshold for hover)
+        
         # Collision penalty
         "collision_penalty": -20.0,
     }

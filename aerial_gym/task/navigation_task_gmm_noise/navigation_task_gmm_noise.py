@@ -847,6 +847,26 @@ class NavigationTaskGmmNoise(BaseTask):
         pixel_penalties = torch.clamp(log_dist - log_threshold, max=0.0)
         safety_reward = self.reward_params["safety_reward_magnitude"] * pixel_penalties.mean(dim=1)
         
+        # ==== Hover Reward (Continuous Gating Functions) ⭐ ====
+        # Encourage stable hovering at "near target + low noise + low velocity" positions
+        # r_hover = k_h * g_d(d) * g_J(J) * g_v(||v||)
+        
+        # 1. Distance Gating: g_d(d) = exp(-(d/d_h)^2)
+        d_h = self.reward_params["hover_reward_dh"]
+        g_d = torch.exp(-(dist_to_target / d_h).pow(2))
+        
+        # 2. Quality Gating: g_J(J) = exp(-J/J_h)
+        J_h = self.reward_params["hover_reward_jh"]
+        g_J = torch.exp(-J_t / J_h)
+        
+        # 3. Velocity Gating: g_v(||v||) = exp(-(||v||/v_h)^2)
+        v_h = self.reward_params["hover_reward_vh"]
+        g_v = torch.exp(-(linvel_magnitude / v_h).pow(2))
+        
+        # Combined Hover Reward
+        k_h = self.reward_params["hover_reward_kh"]
+        hover_reward = k_h * g_d * g_J * g_v
+        
         # ==== Collision Penalty ====
         collision_penalty = self.reward_params["collision_penalty"]
         collision_mask = (self.obs_dict["crashes"] > 0).float()
@@ -859,6 +879,7 @@ class NavigationTaskGmmNoise(BaseTask):
             + direction_reward            # 2.0 × alignment (navigation guidance)
             + action_smoothness_penalty   # Action-based smoothness (-k_a, -k_da)
             + safety_reward               # 2.0 × mean(log(distances)) (obstacle avoidance)
+            + hover_reward                # Continuous hover reward (NEW)
             + collision_reward            # -100
         )
         
