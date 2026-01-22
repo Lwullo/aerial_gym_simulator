@@ -288,6 +288,16 @@ class EnvManager(BaseManager):
         self.robot_manager.reset_idx(env_ids)
         self.IGE_env.write_to_sim()
         self.sim_steps[env_ids] = 0
+        
+        # CONDITIONAL FIX: Clear crash flags (Only in Eval Mode)
+        # In training mode: preserve original behavior for consistency with existing models
+        # In eval mode: clear crash flags to prevent stale state from affecting statistics
+        import os
+        is_eval_mode = os.environ.get("AERIAL_GYM_EVAL_MODE", "0").strip() in ("1", "true", "True", "yes")
+        
+        if is_eval_mode:
+            self.global_tensor_dict["crashes"][env_ids] = 0
+            self.collision_tensor[env_ids] = 0
 
     def log_memory_use(self):
         """
@@ -403,15 +413,30 @@ class EnvManager(BaseManager):
             )
             self.prev_env_actions[:] = self.env_actions
             self.env_actions[:] = env_actions
-        num_physics_step_per_env_step = max(
-            math.floor(
-                random.gauss(
-                    self.cfg.env.num_physics_steps_per_env_step_mean,
-                    self.cfg.env.num_physics_steps_per_env_step_std,
-                )
-            ),
-            0,
-        )
+        
+        # CONDITIONAL FIX: Deterministic Physics (Only in Eval Mode)
+        # In training mode: preserve original random behavior for consistency with existing models
+        # In eval mode: use deterministic physics for fair comparison
+        import os
+        is_eval_mode = os.environ.get("AERIAL_GYM_EVAL_MODE", "0").strip() in ("1", "true", "True", "yes")
+        
+        if is_eval_mode:
+            # Deterministic physics for evaluation
+            num_physics_step_per_env_step = max(
+                int(self.cfg.env.num_physics_steps_per_env_step_mean),
+                0,
+            )
+        else:
+            # Original random physics for training (compatible with existing models)
+            num_physics_step_per_env_step = max(
+                math.floor(
+                    random.gauss(
+                        self.cfg.env.num_physics_steps_per_env_step_mean,
+                        self.cfg.env.num_physics_steps_per_env_step_std,
+                    )
+                ),
+                0,
+            )
         for timestep in range(num_physics_step_per_env_step):
             self.simulate(actions, env_actions)
             self.compute_observations()

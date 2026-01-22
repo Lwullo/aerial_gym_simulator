@@ -140,10 +140,10 @@ class NavigationTaskGmmNoise(BaseTask):
         
         # Spawn position and d_max buffers (for distance reward calculation)
         self.spawn_position = torch.zeros(
-            (num_envs, 3), device=self.device, requires_grad=False
+            (self.sim_env.num_envs, 3), device=self.device, requires_grad=False
         )
         self.d_max = torch.zeros(
-            num_envs, device=self.device, requires_grad=False
+            self.sim_env.num_envs, device=self.device, requires_grad=False
         )
         
         # GMM Physical Force buffers
@@ -214,9 +214,18 @@ class NavigationTaskGmmNoise(BaseTask):
         # Initialize extras dictionary for TensorBoard logging
         self.extras = {}
         
+        # Buffer for tracking Final J values of terminated episodes (NEW)
+        self.final_J_buffer = deque(maxlen=1000)
+        self.final_arrival_buffer = deque(maxlen=100)  # [NEW] Track arrival at episode end only
+        
         # Initialize episode statistics buffers
         self.episode_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
         self.episode_lengths = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.int)
+        
+        # Track minimum J value (closest approach/best state) per episode (NEW)
+        self.episode_min_J = torch.full((self.sim_env.num_envs,), 1000.0, device=self.device)
+        self.min_J_buffer = deque(maxlen=1000)
+        
         
         self.reset_idx(torch.arange(self.sim_env.num_envs, device=self.device))
 
@@ -765,7 +774,11 @@ class NavigationTaskGmmNoise(BaseTask):
         w_n = self.reward_params["potential_w_n"]
         
         # J_t = w_d * (d/d0)^2 + w_n * n_hat
+        # J_t = w_d * (d/d0)^2 + w_n * n_hat
         J_t = w_d * (dist_to_target / d0).pow(2) + w_n * n_hat
+        
+        # Update episode minimum J (track best performance in this episode)
+        self.episode_min_J = torch.min(self.episode_min_J, J_t.detach())
         
         # Reward = k_J * tanh( (J_prev - J_t) / s_J )
         k_J = self.reward_params["potential_kj"]
@@ -773,8 +786,13 @@ class NavigationTaskGmmNoise(BaseTask):
         
         potential_diff = self.previous_potential - J_t
         
+        # Calculate raw signal (before tanh) for diagnostic logging
+        # signal = delta_J / s_J
+        raw_signal = potential_diff / s_J
+        self.current_raw_signal = raw_signal.detach()  # Store for TensorBoard logging
+        
         # Use tanh to saturate reward and normalize small gradients
-        potential_improvement_reward = k_J * torch.tanh(potential_diff / s_J)
+        potential_improvement_reward = k_J * torch.tanh(raw_signal)
         
         # Update previous potential for next step
         self.previous_potential = J_t.clone()
@@ -1041,6 +1059,7 @@ class NavigationTaskGmmNoise(BaseTask):
             "motor_thrust_1": motor_thrust_1,
             "motor_thrust_2": motor_thrust_2,
             "motor_thrust_3": motor_thrust_3,
+            "metrics/final_J_mean": float(np.mean(self.final_J_buffer)) if len(self.final_J_buffer) > 0 else 0.0,
         }
         learning_rate = os.environ.get("AERIAL_GYM_LR")
         if learning_rate is not None:
@@ -1067,12 +1086,39 @@ class NavigationTaskGmmNoise(BaseTask):
             self.writer.add_scalar("Performance/timeout_rate", timeout_rate, self.num_task_steps)
             
             # Log Arrival Rate (Intermediate Success)
-            arrival_rate = self.has_arrived.float().mean().item()
+            # arrival_rate = self.has_arrived.float().mean().item()  # [OLD] "Ever arrived"
+            
+            # [NEW] Log Final Arrival Rate (from buffer of completed episodes)
+            if len(self.final_arrival_buffer) > 0:
+                arrival_rate = float(np.mean(self.final_arrival_buffer))
+            else:
+                arrival_rate = 0.0
+                
             self.writer.add_scalar("Performance/arrival_rate", arrival_rate, self.num_task_steps)
             
             # Also log current batch stats
             batch_success_rate = self.success_buf.float().mean().item()
             self.writer.add_scalar("Performance/batch_success_rate", batch_success_rate, self.num_task_steps)
+            
+            # Manually log Final J Mean (Guaranteed to show up)
+            final_J_val = float(np.mean(self.final_J_buffer)) if len(self.final_J_buffer) > 0 else 0.0
+            # Manually log Final J Mean (Guaranteed to show up)
+            final_J_val = float(np.mean(self.final_J_buffer)) if len(self.final_J_buffer) > 0 else 0.0
+            self.writer.add_scalar("Performance/final_J_mean", final_J_val, self.num_task_steps)
+            
+            # Manually log Min J (Best during episode)
+            min_J_val = float(np.mean(self.min_J_buffer)) if len(self.min_J_buffer) > 0 else 0.0
+            self.writer.add_scalar("Performance/J_min_near", min_J_val, self.num_task_steps)
+            
+            # --- Signal Distribution Analysis ---
+            # --- Signal Distribution Analysis ---
+            if hasattr(self, "current_raw_signal"):
+                # Histogram of (delta_J / s_J)
+                self.writer.add_histogram("Performance/delta_J_over_sj", self.current_raw_signal, self.num_task_steps)
+                # Mean Magnitude (Scalar summary)
+                mean_signal = self.current_raw_signal.abs().mean().item()
+                self.writer.add_scalar("Performance/mean_abs_signal", mean_signal, self.num_task_steps)
+                # print(f"DEBUG: Wrote signal histogram. Mean signal: {mean_signal:.4f}")
         
         # Log to logging system (console)
         # Periodic terminal logging (every 1000 steps) - YELLOW COLOR with hover and noise monitoring
@@ -1107,6 +1153,52 @@ class NavigationTaskGmmNoise(BaseTask):
         if env_ids.numel() == 0:
             return
             
+        # --- Capture Final J for Terminated Environments (Stats) ---
+        # Calculate J for the envs about to be reset.
+        try:
+            # 1. Get current state for reset envs
+            d_pos = self.obs_dict["robot_position"][env_ids]
+            
+            # 2. Compute current noise directly (obs_dict key may not exist)
+            current_noise = self._compute_gmm_mixture(d_pos, env_ids)
+            
+            # 3. Normalize noise
+            if hasattr(self, "estimated_n_min"):
+                n_range = self.estimated_n_max[env_ids] - self.estimated_n_min[env_ids] + 1e-6
+                n_hat = (current_noise - self.estimated_n_min[env_ids]) / n_range
+                n_hat = torch.clamp(n_hat, 0.0, 1.0)
+            else:
+                n_hat = torch.zeros_like(current_noise)
+                
+            # 4. Calculate Distance cost
+            dist_to_tgt = torch.norm(self.target_position[env_ids] - d_pos, dim=1)
+            
+            # 5. Compute J = w_d * (d/d0)^2 + w_n * n_hat
+            w_d = self.reward_params["potential_w_d"]
+            w_n = self.reward_params["potential_w_n"]
+            d0 = self.reward_params["potential_d0"]
+            
+            final_J = w_d * (dist_to_tgt / d0).pow(2) + w_n * n_hat
+            
+            # 6. Add to buffer (CPU side)
+            final_J_vals = final_J.detach().cpu().numpy()
+            self.final_J_buffer.extend(final_J_vals)
+            
+            # --- Capture Min J for Terminated Environments ---
+            min_J_vals = self.episode_min_J[env_ids].detach().cpu().numpy()
+            
+            # Filter out placeholder values (e.g., from initial reset before any steps)
+            valid_mask = min_J_vals < 999.0
+            if np.any(valid_mask):
+                self.min_J_buffer.extend(min_J_vals[valid_mask])
+                
+            # Reset Min J tracker for these envs
+            self.episode_min_J[env_ids] = 1000.0
+            
+        except Exception as e:
+            # Silent fail is safer during training loop than crashing
+            pass
+
         # Record episode outcomes for success rate tracking (before reset)
         if hasattr(self, 'infos') and 'successes' in self.infos:
             for env_id in env_ids:
@@ -1245,7 +1337,11 @@ class NavigationTaskGmmNoise(BaseTask):
         J_0 = w_d * (d / d0).pow(2) + w_n * n_hat
         self.previous_potential[env_ids] = J_0
         
-        self.infos = {}
+        self.infos = {
+            "successes": torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.bool),
+            "crashes": torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.bool),
+            "timeouts": torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.int32),
+        }
         return
 
     def render(self):
@@ -1545,6 +1641,50 @@ class NavigationTaskGmmNoise(BaseTask):
         dones = (self.terminations > 0) | (self.truncations > 0)
         if dones.any():
             done_indices = dones.nonzero(as_tuple=False).flatten()
+
+            # --- Capture Final J for Terminated Environments (Stats) ---
+            # Recompute J for these specific envs to log what J they ended up with.
+            # (Ideally we'd use the J computed in this step, but to be robust we re-calc efficiently)
+            try:
+                # 1. Get current state for done envs
+                d_pos = self.obs_dict["robot_position"][done_indices]
+                current_noise = self.obs_dict["noise_at_robot_position"][done_indices]
+                
+                # 2. Normalize noise
+                if hasattr(self, "estimated_n_min"):
+                    n_range = self.estimated_n_max - self.estimated_n_min + 1e-6
+                    n_hat = (current_noise - self.estimated_n_min) / n_range
+                    n_hat = torch.clamp(n_hat, 0.0, 1.0)
+                else:
+                    n_hat = torch.zeros_like(current_noise)
+                    
+                # 3. Calculate Distance cost
+                dist_to_tgt = torch.norm(self.target_position - d_pos, dim=1)
+                
+                # 4. Compute J = w_d * (d/d0)^2 + w_n * n_hat
+                # Retrieve current weights
+                w_d = self.reward_params["potential_w_d"]
+                w_n = self.reward_params["potential_w_n"]
+                d0 = self.reward_params["potential_d0"]
+                
+                final_J = w_d * (dist_to_tgt / d0).pow(2) + w_n * n_hat
+                
+                # 5. Add to buffer (CPU side)
+                final_J_vals = final_J.detach().cpu().numpy()
+                self.final_J_buffer.extend(final_J_vals)
+                
+                # --- Capture Final Arrival Status (Distance <= 2m at end) ---
+                # Check if distance <= 2.0 (hardcoded metric standard)
+                final_arrived = (dist_to_tgt <= 2.0).float()
+                final_arrived_vals = final_arrived.detach().cpu().numpy()
+                self.final_arrival_buffer.extend(final_arrived_vals)
+                
+
+                
+            except Exception as e:
+                # Fallback if calculation fails (e.g. at very start)
+                pass
+
             
             # Log episode rewards and lengths for rl_games
             self.extras["episode_rewards"] = self.episode_sums[done_indices].cpu().numpy().tolist()
@@ -1553,6 +1693,11 @@ class NavigationTaskGmmNoise(BaseTask):
             # Reset buffers for done envs
             self.episode_sums[done_indices] = 0
             self.episode_lengths[done_indices] = 0
+
+        # Populate infos for sanity check and external access
+        self.infos["successes"] = self.success_buf
+        self.infos["crashes"] = self.obs_dict["crashes"]
+        self.infos["timeouts"] = self.truncations.int() # Truncations are boolean/uint8, consistent with others
 
         # We only mark success at the end of episode for success rate calculation to be simple
         # OR we can track if it *ever* succeeded during the episode.

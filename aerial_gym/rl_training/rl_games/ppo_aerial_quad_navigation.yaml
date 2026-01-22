@@ -64,7 +64,7 @@ params:
     minibatch_size: 2048
     mini_epochs: 2
     critic_coef: 2
-    normalize_input: True
+    normalize_input: False
     bounds_loss_coef: 0.0001
     max_epochs: 5000
     normalize_value: True
