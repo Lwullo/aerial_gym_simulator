@@ -50,9 +50,10 @@ EPISODE_LENGTH = 450
 RANDOM_SEED = 10
 
 # J(p) parameters (from config)
-W_D = 1.0
-W_N = 1.0
-D_0 = 2.0
+# J(p) parameters (from config)
+W_D = task_config.reward_parameters["potential_w_d"]
+W_N = task_config.reward_parameters["potential_w_n"]
+D_0 = task_config.reward_parameters["potential_d0"]
 
 # EMA smoothing
 EMA_ALPHA = 0.99
@@ -76,6 +77,50 @@ class RunningMeanStd:
     def normalize(self, obs, epsilon=1e-8):
         """Normalize observations using running mean/std"""
         return (obs - self.mean) / (self.std + epsilon)
+
+
+def compute_normalization_stats(env, num_samples=2000):
+    """
+    Compute normalization statistics by sampling random actions in the environment.
+    
+    Args:
+        env: Environment instance
+        num_samples: Number of steps to collect observations
+    
+    Returns:
+        RunningMeanStd: Normalization statistics
+    """
+    logger.info(f"Computing normalization statistics from {num_samples} environment steps...")
+    
+    obs_list = []
+    
+    env.reset()
+    for i in range(num_samples):
+        # Random actions
+        random_actions = torch.rand(env.sim_env.num_envs, env.task_config.action_space_dim, device=env.device) * 2 - 1
+        
+        # Step environment
+        env.step(random_actions)
+        
+        # Collect observation
+        obs = env.task_obs["observations"].clone()
+        obs_list.append(obs)
+    
+    # Compute statistics
+    all_obs = torch.cat(obs_list, dim=0)
+    mean = all_obs.mean(dim=0)
+    std = all_obs.std(dim=0)
+    count = all_obs.shape[0]
+    
+    logger.info(f"Computed normalization stats: mean={mean[:3].cpu().numpy()}, std={std[:3].cpu().numpy()}")
+    
+    return RunningMeanStd(
+        mean=mean.cpu().numpy(),
+        std=std.cpu().numpy(),
+        count=count,
+        device=env.device
+    )
+
 
 # ============================================================================
 # Utility Functions
@@ -370,9 +415,11 @@ def load_ppo_model(checkpoint_path, env):
             count=rms_data['count'],
             device=env.device
         )
-        logger.info("Loaded running_mean_std for input normalization")
+        logger.info("✅ Loaded running_mean_std from checkpoint")
     else:
-        logger.warning("No running_mean_std found in checkpoint - using raw observations")
+        logger.warning("⚠️  No running_mean_std in checkpoint - will compute from environment")
+        # We'll compute it later after environment is fully set up
+        # For now, return None and handle in main()
     
     logger.info("PPO model loaded successfully")
     return model, running_mean_std
@@ -770,6 +817,18 @@ def main():
     logger.info("=" * 70)
     
     ppo_model, running_mean_std = load_ppo_model(PPO_CHECKPOINT, env)
+    
+    # Compute normalization if not in checkpoint
+    if running_mean_std is None:
+        logger.info("Computing normalization statistics from environment...")
+        # Save current state before computing stats
+        temp_snapshot = save_state_snapshot(env)
+        running_mean_std = compute_normalization_stats(env, num_samples=2000)
+        # Restore state after computation
+        env.reset()
+        restore_state_snapshot(env, temp_snapshot)
+        logger.info("✅ Normalization statistics computed and environment state restored")
+    
     rl_j_curve, rl_crash_data, rl_survival_data, rl_arrival_data = run_phase(env, ppo_model, EPISODE_LENGTH, "RL", running_mean_std)
     
     # Save RL raw data
@@ -790,7 +849,7 @@ def main():
     env.reset()
     restore_state_snapshot(env, initial_snapshot)
     
-    baseline_agent = LocalAPFAgent(env, w_dist=1.0, w_noise=5.0, w_obs=2.0, d_obs=1.5)
+    baseline_agent = LocalAPFAgent(env, w_dist=W_D, w_noise=W_N, w_obs=2.0, d_obs=1.5)
     baseline_j_curve, baseline_crash_data, baseline_survival_data, baseline_arrival_data = run_phase(env, baseline_agent, EPISODE_LENGTH, "Baseline")
     
     # Save Baseline raw data

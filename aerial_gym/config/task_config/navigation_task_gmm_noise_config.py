@@ -65,7 +65,7 @@ class task_config:
     observation_space_dim = 13 + 4 + 64  # root_state + action_dim + latent_dims
     privileged_observation_space_dim = 0
     action_space_dim = 4
-    episode_len_steps = 450  # real physics time for simulation is this value multiplied by sim.dt
+    episode_len_steps = 900  # [UPDATED] 450 -> 900  # real physics time for simulation is this value multiplied by sim.dt
 
     return_state_before_reset = (
         False  # False as usually state is returned for next episode after reset
@@ -83,10 +83,10 @@ class task_config:
 
     reward_parameters = {
         # Unified Cost Function Reward (J_prev - J_t) with Tanh Smoothing ⭐
-        "potential_kj": 5.0,               # Max reward per step (k_J) [UPDATED: 2.0 -> 5.0]
-        "potential_sj": 0.03,               # Sensitivity scale (s_J), small change normalization
-        "potential_w_d": 1.0,              # Weight for distance cost (w_d)
-        "potential_w_n": 1.0,              # Weight for noise cost (w_n)
+        "potential_kj": 1.0,  # [UPDATED] Reset to 1.0
+        "potential_sj": 0.05,               # Sensitivity scale (s_J), small change normalization [UPDATED] 0.02 -> 0.05
+        "potential_w_d": 0.6,              # Weight for distance cost (w_d) [UPDATED] 1.0 -> 0.6
+        "potential_w_n": 2.0,              # Weight for noise cost (w_n) [UPDATED] 5.0 -> 2.0
         "potential_d0": 2.0,               # Reference distance (d0) for normalization
         "n_min_max_sample_size": 1000,     # Number of samples to estimate noise range on reset
         
@@ -94,8 +94,8 @@ class task_config:
         "direction_alignment_reward_magnitude": 0.0,  # 速度导向，暂时禁用 (2.0 -> 0.0)
         
         # Safety reward (based on depth map for obstacle avoidance) (NEW) ⭐
-        "safety_reward_magnitude": 2.0,             # Weight for safety reward (Penalty only) [UPDATED: 1.0 -> 2.0]
-        "safety_dist_threshold": 0.6,               # Distance threshold for safety penalty (meters) [UPDATED: 1.0 -> 0.6]
+        "safety_reward_magnitude": 1.2,  # [UPDATED] Increased from 1.0 to 1.2             # Weight for safety reward (Penalty only) [UPDATED: 1.0 -> 2.0]
+        "safety_dist_threshold": 0.8,               # Distance threshold for safety penalty (meters) [UPDATED] 0.6 -> 0.8
         "min_safe_distance_clamp": 0.1,             # Min distance clamp to prevent log(0) (meters)
         
         # Action Smoothness Penalties (Action-based) ⭐
@@ -103,13 +103,14 @@ class task_config:
         "action_change_penalty_weight": 0.1,        # k_Delta_a (smoothness/jitter penalty)
         
         # Hover Reward (Continuous Gating Functions) ⭐
-        "hover_reward_kh": 0.3,                     # k_h (hover reward weight coefficient) [UPDATED: 1.0 → 0.3]
+        "hover_reward_kh": 0.6,                     # k_h (hover reward weight coefficient) [UPDATED] 0.3 → 0.6
         "hover_reward_dh": 2.0,                     # d_h (distance threshold for hover, meters)
         "hover_reward_vh": 0.35,                    # v_h (velocity threshold for hover, m/s) [UPDATED: 0.25 → 0.35]
-        "hover_reward_jh": 1.0,                     # J_h (potential quality threshold for hover)
+        "hover_reward_jh": 2.0,                     # J_h (potential quality threshold for hover) [UPDATED] 1.0 -> 2.0
+        "hover_reward_alpha_j": 3.0,                # alpha_J (Scaling factor for J gating), scaling sensitivity of quality check
         
         # Collision penalty
-        "collision_penalty": -80.0,
+        "collision_penalty": -20.0,  # [UPDATED] Reduced from -80.0 to -20.0
     }
 
     class vae_config:

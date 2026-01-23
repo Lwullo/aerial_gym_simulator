@@ -47,6 +47,10 @@ class ExtractObsWrapper(gym.Wrapper):
             infos,
         )
 
+    def set_train_info(self, *args, **kwargs):
+        if hasattr(self.env, "set_train_info"):
+            self.env.set_train_info(*args, **kwargs)
+
 
 class AERIALRLGPUEnv(vecenv.IVecEnv):
     def __init__(self, config_name, num_actors, **kwargs):
@@ -77,6 +81,10 @@ class AERIALRLGPUEnv(vecenv.IVecEnv):
         )
         print(info["action_space"], info["observation_space"])
         return info
+
+    def set_train_info(self, *args, **kwargs):
+        if hasattr(self.env, "set_train_info"):
+            self.env.set_train_info(*args, **kwargs)
 
 
 env_configurations.register(

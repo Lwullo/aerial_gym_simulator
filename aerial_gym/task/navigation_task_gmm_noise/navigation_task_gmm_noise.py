@@ -217,6 +217,8 @@ class NavigationTaskGmmNoise(BaseTask):
         # Buffer for tracking Final J values of terminated episodes (NEW)
         self.final_J_buffer = deque(maxlen=1000)
         self.final_arrival_buffer = deque(maxlen=100)  # [NEW] Track arrival at episode end only
+        # Sliding window for recent arrival rate (last N episodes)
+        self.recent_arrival_buffer = deque(maxlen=100)
         
         # Initialize episode statistics buffers
         self.episode_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
@@ -780,11 +782,22 @@ class NavigationTaskGmmNoise(BaseTask):
         # Update episode minimum J (track best performance in this episode)
         self.episode_min_J = torch.min(self.episode_min_J, J_t.detach())
         
+        # Store current J for later use (arrival rate calculation)
+        self.current_J = J_t.detach().clone()
+        
         # Reward = k_J * tanh( (J_prev - J_t) / s_J )
         k_J = self.reward_params["potential_kj"]
         s_J = self.reward_params["potential_sj"]
         
         potential_diff = self.previous_potential - J_t
+        
+        # Periodic logging of ΔJ statistics (every 1000 steps)
+        if hasattr(self, 'num_task_steps') and self.num_task_steps % 1000 == 0:
+            logger.info(
+                f"[ΔJ Stats] mean={potential_diff.mean():.4f}, "
+                f"std={potential_diff.std():.4f}, "
+                f"range=[{potential_diff.min():.4f}, {potential_diff.max():.4f}]"
+            )
         
         # Calculate raw signal (before tanh) for diagnostic logging
         # signal = delta_J / s_J
@@ -869,13 +882,15 @@ class NavigationTaskGmmNoise(BaseTask):
         # Encourage stable hovering at "near target + low noise + low velocity" positions
         # r_hover = k_h * g_d(d) * g_J(J) * g_v(||v||)
         
-        # 1. Distance Gating: g_d(d) = exp(-(d/d_h)^2)
-        d_h = self.reward_params["hover_reward_dh"]
-        g_d = torch.exp(-(dist_to_target / d_h).pow(2))
+        # 1. Distance Gating: DISABLED as requested
+        # d_h = self.reward_params["hover_reward_dh"]
+        # g_d = torch.exp(-(dist_to_target / d_h).pow(2))
+        g_d = 1.0  # [UPDATED] Distance gating removed
         
-        # 2. Quality Gating: g_J(J) = exp(-J/J_h)
+        # 2. Quality Gating: g_J(J) = exp(-alpha_J * J/J_h)
         J_h = self.reward_params["hover_reward_jh"]
-        g_J = torch.exp(-J_t / J_h)
+        alpha_J = self.reward_params.get("hover_reward_alpha_j", 1.0) # Default to 1.0 if not present
+        g_J = torch.exp(-alpha_J * (J_t / J_h))
         
         # 3. Velocity Gating: g_v(||v||) = exp(-(||v||/v_h)^2)
         v_h = self.reward_params["hover_reward_vh"]
@@ -883,7 +898,8 @@ class NavigationTaskGmmNoise(BaseTask):
         
         # Combined Hover Reward
         k_h = self.reward_params["hover_reward_kh"]
-        hover_reward = k_h * g_d * g_J * g_v
+        # hover_reward = k_h * g_d * g_J * g_v
+        hover_reward = k_h * g_J * g_v  # [UPDATED] Removed g_d
         
         # ==== Collision Penalty ====
         collision_penalty = self.reward_params["collision_penalty"]
@@ -1080,6 +1096,16 @@ class NavigationTaskGmmNoise(BaseTask):
              self._init_tensorboard_writer()
              self._writer_initialized = True
              
+        # Compute arrival rate from recent episodes buffer
+        if len(self.recent_arrival_buffer) > 0:
+            arrival_rate = float(np.mean(self.recent_arrival_buffer))
+            arrived_count = int(np.sum(self.recent_arrival_buffer))
+            total_count = len(self.recent_arrival_buffer)
+        else:
+            arrival_rate = 0.0
+            arrived_count = 0
+            total_count = 0
+
         if self.writer:
             self.writer.add_scalar("Performance/success_rate", success_rate, self.num_task_steps)
             self.writer.add_scalar("Performance/crash_rate_episodes", crash_rate_episodes, self.num_task_steps)
@@ -1089,11 +1115,6 @@ class NavigationTaskGmmNoise(BaseTask):
             # arrival_rate = self.has_arrived.float().mean().item()  # [OLD] "Ever arrived"
             
             # [NEW] Log Final Arrival Rate (from buffer of completed episodes)
-            if len(self.final_arrival_buffer) > 0:
-                arrival_rate = float(np.mean(self.final_arrival_buffer))
-            else:
-                arrival_rate = 0.0
-                
             self.writer.add_scalar("Performance/arrival_rate", arrival_rate, self.num_task_steps)
             
             # Also log current batch stats
@@ -1123,6 +1144,33 @@ class NavigationTaskGmmNoise(BaseTask):
         # Log to logging system (console)
         # Periodic terminal logging (every 1000 steps) - YELLOW COLOR with hover and noise monitoring
         if self.num_task_steps % 1000 == 0:
+            position = self.obs_dict["robot_position"]
+            dist_to_target = torch.norm(self.target_position - position, dim=1)
+            dist_mean = dist_to_target.mean().item()
+            dist_min = dist_to_target.min().item()
+            dist_max = dist_to_target.max().item()
+
+            final_J_mean = float(np.mean(self.final_J_buffer)) if len(self.final_J_buffer) > 0 else 0.0
+            if len(self.min_J_buffer) > 0:
+                min_J_min = float(np.min(self.min_J_buffer))
+                min_J_max = float(np.max(self.min_J_buffer))
+            else:
+                min_J_min = 0.0
+                min_J_max = 0.0
+
+            logger.blue(
+                f"[Step {self.num_task_steps}] dist_to_target mean={dist_mean:.3f}, "
+                f"min={dist_min:.3f}, max={dist_max:.3f}"
+            )
+            logger.green(
+                f"[Step {self.num_task_steps}] arrival_rate={arrival_rate:.1%} "
+                f"(arrived/total={arrived_count}/{total_count})"
+            )
+            logger.orange(
+                f"[Step {self.num_task_steps}] final_J_mean={final_J_mean:.3f}, "
+                f"min_J_min={min_J_min:.3f}, min_J_max={min_J_max:.3f}"
+            )
+
             # Calculate attitude angles
             euler = self.obs_dict["robot_euler_angles"]
             avg_tilt_deg = torch.norm(euler[:, :2], dim=1).mean().item() * 57.2958
@@ -1642,48 +1690,34 @@ class NavigationTaskGmmNoise(BaseTask):
         if dones.any():
             done_indices = dones.nonzero(as_tuple=False).flatten()
 
-            # --- Capture Final J for Terminated Environments (Stats) ---
-            # Recompute J for these specific envs to log what J they ended up with.
-            # (Ideally we'd use the J computed in this step, but to be robust we re-calc efficiently)
+            # --- Capture Final J and Arrival Status ---
+            # Reuse already-computed J values (avoid dimension mismatch)
             try:
-                # 1. Get current state for done envs
-                d_pos = self.obs_dict["robot_position"][done_indices]
-                current_noise = self.obs_dict["noise_at_robot_position"][done_indices]
-                
-                # 2. Normalize noise
-                if hasattr(self, "estimated_n_min"):
-                    n_range = self.estimated_n_max - self.estimated_n_min + 1e-6
-                    n_hat = (current_noise - self.estimated_n_min) / n_range
-                    n_hat = torch.clamp(n_hat, 0.0, 1.0)
-                else:
-                    n_hat = torch.zeros_like(current_noise)
-                    
-                # 3. Calculate Distance cost
-                dist_to_tgt = torch.norm(self.target_position - d_pos, dim=1)
-                
-                # 4. Compute J = w_d * (d/d0)^2 + w_n * n_hat
-                # Retrieve current weights
-                w_d = self.reward_params["potential_w_d"]
-                w_n = self.reward_params["potential_w_n"]
-                d0 = self.reward_params["potential_d0"]
-                
-                final_J = w_d * (dist_to_tgt / d0).pow(2) + w_n * n_hat
-                
-                # 5. Add to buffer (CPU side)
+                final_J = self.current_J[done_indices]
                 final_J_vals = final_J.detach().cpu().numpy()
                 self.final_J_buffer.extend(final_J_vals)
                 
-                # --- Capture Final Arrival Status (Distance <= 2m at end) ---
-                # Check if distance <= 2.0 (hardcoded metric standard)
-                final_arrived = (dist_to_tgt <= 2.0).float()
+                # Calculate distance for arrival check
+                d_pos = self.obs_dict["robot_position"][done_indices]
+                dist_to_tgt = torch.norm(self.target_position[done_indices] - d_pos, dim=1)
+                
+                # Check if distance <= 2.0 (3D Euclidean distance)
+                final_arrived = (dist_to_tgt <= 2.0)
                 final_arrived_vals = final_arrived.detach().cpu().numpy()
-                self.final_arrival_buffer.extend(final_arrived_vals)
+                
+                # Legacy buffer for compatibility
+                self.final_arrival_buffer.extend(final_arrived_vals.astype(float))
+                
+                # New sliding window buffer for recent arrival rate
+                self.recent_arrival_buffer.extend(final_arrived_vals)
                 
 
                 
             except Exception as e:
-                # Fallback if calculation fails (e.g. at very start)
-                pass
+                # Log error for debugging
+                logger.error(f"Failed to compute final J and arrival stats: {e}")
+                import traceback
+                traceback.print_exc()
 
             
             # Log episode rewards and lengths for rl_games
