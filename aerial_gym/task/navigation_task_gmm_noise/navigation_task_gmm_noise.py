@@ -223,6 +223,11 @@ class NavigationTaskGmmNoise(BaseTask):
         # Initialize episode statistics buffers
         self.episode_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
         self.episode_lengths = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.int)
+        self.episode_pot_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
+        self.episode_safe_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
+        self.episode_smooth_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
+        self.episode_hover_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
+        self._episode_component_mean_cache = None
         
         # Track minimum J value (closest approach/best state) per episode (NEW)
         self.episode_min_J = torch.full((self.sim_env.num_envs,), 1000.0, device=self.device)
@@ -451,8 +456,8 @@ class NavigationTaskGmmNoise(BaseTask):
         #   - Spawned within 1.0m to 3.0m radius of the target
         #   - Create complex turbulence near the goal to test fine control
         
-        # --- Group 1: Global Sources (First 3) ---
-        num_global = 3
+        # --- Group 1: Global Sources (First 4) ---
+        num_global = 4
         bounds_min_global = self.env_bounds_min.view(1, 1, 3).expand(num_envs, num_global, 3)
         bounds_max_global = self.env_bounds_max.view(1, 1, 3).expand(num_envs, num_global, 3)
         centers_global = torch_rand_float_tensor(bounds_min_global, bounds_max_global)
@@ -863,20 +868,20 @@ class NavigationTaskGmmNoise(BaseTask):
         # Assumes sensor config has normalize_range=True (default)
         distances = depth_pixels.view(self.sim_env.num_envs, -1) * max_range
         
-        # 2. Penalty Log-Barrier: R = k * min(log(d) - log(threshold), 0)
-        # Only penalize if distance < threshold. Reward is 0 if safe.
+        # 2. Penalty Log-Barrier: R = k * min(log(d_min) - log(threshold), 0)
+        # Closest obstacle dominates (use minimum distance).
         threshold = self.reward_params.get("safety_dist_threshold", torch.tensor(1.0, device=self.device))
         
         # Clamp minimal distance for stability in log calculation
-        safe_distances = torch.clamp(distances, min=self.reward_params["min_safe_distance_clamp"])
+        d_min = distances.min(dim=1).values
+        d_min = torch.clamp(d_min, min=self.reward_params["min_safe_distance_clamp"])
         
-        log_dist = torch.log(safe_distances)
+        log_dist = torch.log(d_min)
         log_threshold = torch.log(threshold)
         
-        # Calculate penalty for each pixel (ray)
-        # Using mean over pixels as before
-        pixel_penalties = torch.clamp(log_dist - log_threshold, max=0.0)
-        safety_reward = self.reward_params["safety_reward_magnitude"] * pixel_penalties.mean(dim=1)
+        # Penalize only when closest distance is below threshold
+        penalty = torch.clamp(log_dist - log_threshold, max=0.0)
+        safety_reward = self.reward_params["safety_reward_magnitude"] * penalty
         
         # ==== Hover Reward (Continuous Gating Functions) ⭐ ====
         # Encourage stable hovering at "near target + low noise + low velocity" positions
@@ -926,7 +931,16 @@ class NavigationTaskGmmNoise(BaseTask):
         # For logging purposes
         noise_intensity = current_noise
         
-        return reward, improvement_reward, direction_reward, noise_reduction_reward, noise_intensity
+        return (
+            reward,
+            improvement_reward,
+            direction_reward,
+            noise_reduction_reward,
+            noise_intensity,
+            safety_reward,
+            action_smoothness_penalty,
+            hover_reward,
+        )
 
     def _update_best_point(self, total_score):
         if self.log_step_scores:
@@ -1130,12 +1144,31 @@ class NavigationTaskGmmNoise(BaseTask):
             # Manually log Min J (Best during episode)
             min_J_val = float(np.mean(self.min_J_buffer)) if len(self.min_J_buffer) > 0 else 0.0
             self.writer.add_scalar("Performance/J_min_near", min_J_val, self.num_task_steps)
+
+            if self._episode_component_mean_cache is not None:
+                self.writer.add_scalar(
+                    "EpisodeMean/R_pot",
+                    self._episode_component_mean_cache["pot"],
+                    self.num_task_steps,
+                )
+                self.writer.add_scalar(
+                    "EpisodeMean/R_safe",
+                    self._episode_component_mean_cache["safe"],
+                    self.num_task_steps,
+                )
+                self.writer.add_scalar(
+                    "EpisodeMean/R_smooth",
+                    self._episode_component_mean_cache["smooth"],
+                    self.num_task_steps,
+                )
+                self.writer.add_scalar(
+                    "EpisodeMean/R_hover",
+                    self._episode_component_mean_cache["hover"],
+                    self.num_task_steps,
+                )
+                self._episode_component_mean_cache = None
             
-            # --- Signal Distribution Analysis ---
-            # --- Signal Distribution Analysis ---
             if hasattr(self, "current_raw_signal"):
-                # Histogram of (delta_J / s_J)
-                self.writer.add_histogram("Performance/delta_J_over_sj", self.current_raw_signal, self.num_task_steps)
                 # Mean Magnitude (Scalar summary)
                 mean_signal = self.current_raw_signal.abs().mean().item()
                 self.writer.add_scalar("Performance/mean_abs_signal", mean_signal, self.num_task_steps)
@@ -1323,6 +1356,7 @@ class NavigationTaskGmmNoise(BaseTask):
             
             # Scheme B Buffers
             self.J_best_in_goal = torch.full((self.sim_env.num_envs,), float('inf'), device=self.device)
+            self.J_ema = torch.zeros(self.sim_env.num_envs, device=self.device)
             self.hold_counter = torch.zeros(self.sim_env.num_envs, device=self.device)
             self.max_hold_counter = torch.zeros(self.sim_env.num_envs, device=self.device)
             self.failure_log_path = os.path.join(self.task_config.log_dir if hasattr(self.task_config, "log_dir") else ".", "failure_log.txt")
@@ -1384,6 +1418,8 @@ class NavigationTaskGmmNoise(BaseTask):
         # J = w_d * (d/d0)^2 + w_n * n_hat
         J_0 = w_d * (d / d0).pow(2) + w_n * n_hat
         self.previous_potential[env_ids] = J_0
+        if hasattr(self, "J_ema"):
+            self.J_ema[env_ids] = J_0
         
         self.infos = {
             "successes": torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.bool),
@@ -1601,6 +1637,9 @@ class NavigationTaskGmmNoise(BaseTask):
             direction_reward,
             noise_reduction_reward,
             noise_intensity,
+            safety_reward,
+            action_smoothness_penalty,
+            hover_reward,
         ) = self._compute_reward_and_scores()
 
         if self.task_config.return_state_before_reset is True:
@@ -1623,10 +1662,15 @@ class NavigationTaskGmmNoise(BaseTask):
         
         # J_t is stored in self.previous_potential (updated in _compute_reward_and_scores)
         J_t = self.previous_potential
+        if not hasattr(self, "J_ema"):
+            self.J_ema = J_t.clone()
+        ema_alpha = getattr(self.success_config, "stability_potential_ema_alpha", 0.9)
+        self.J_ema = ema_alpha * self.J_ema + (1.0 - ema_alpha) * J_t
+        J_for_success = self.J_ema
         
         # Update J_best_in_goal where in_goal_mask is True
         current_best = self.J_best_in_goal
-        new_best = torch.min(current_best, J_t)
+        new_best = torch.min(current_best, J_for_success)
         self.J_best_in_goal = torch.where(in_goal_mask, new_best, current_best)
         
         # 2. Check Stability Conditions
@@ -1638,7 +1682,7 @@ class NavigationTaskGmmNoise(BaseTask):
         cond_vel = linvel_magnitude <= self.success_config.stability_velocity_threshold
         
         # Cond 3: Potential Quality (J_t <= J_best + delta)
-        cond_pot = J_t <= (self.J_best_in_goal + self.success_config.stability_potential_delta)
+        cond_pot = J_for_success <= (self.J_best_in_goal + self.success_config.stability_potential_delta)
         
         # Stable?
         is_stable = in_goal_mask & cond_vel & cond_pot
@@ -1684,6 +1728,10 @@ class NavigationTaskGmmNoise(BaseTask):
         # Accumulate episode statistics
         self.episode_sums += self.rewards
         self.episode_lengths += 1
+        self.episode_pot_sums += improvement_reward.detach()
+        self.episode_safe_sums += safety_reward.detach()
+        self.episode_smooth_sums += action_smoothness_penalty.detach()
+        self.episode_hover_sums += hover_reward.detach()
         
         # Check for done envs (terminations or truncations)
         dones = (self.terminations > 0) | (self.truncations > 0)
@@ -1702,8 +1750,19 @@ class NavigationTaskGmmNoise(BaseTask):
                 dist_to_tgt = torch.norm(self.target_position[done_indices] - d_pos, dim=1)
                 
                 # Check if distance <= 2.0 (3D Euclidean distance)
-                final_arrived = (dist_to_tgt <= 2.0)
+                arrival_threshold = 2.0
+                final_arrived = (dist_to_tgt <= arrival_threshold)
                 final_arrived_vals = final_arrived.detach().cpu().numpy()
+                
+                # --- Apply Terminal Reward (NEW) ⭐ ---
+                # Retrieve terminal reward config (default to 0.0 if not set yet)
+                term_reward_val = self.reward_params.get("terminal_reward", 0.0)
+                
+                if term_reward_val > 0.0:
+                    # Create bonus tensor: +term_reward where arrived, 0 otherwise
+                    # CAUTION: 'rewards' tensor is (num_envs,), so we update specific indices
+                    arrival_bonus = final_arrived.float() * term_reward_val
+                    self.rewards[done_indices] += arrival_bonus
                 
                 # Legacy buffer for compatibility
                 self.final_arrival_buffer.extend(final_arrived_vals.astype(float))
@@ -1723,10 +1782,27 @@ class NavigationTaskGmmNoise(BaseTask):
             # Log episode rewards and lengths for rl_games
             self.extras["episode_rewards"] = self.episode_sums[done_indices].cpu().numpy().tolist()
             self.extras["episode_lengths"] = self.episode_lengths[done_indices].cpu().numpy().tolist()
+
+            # Episode mean reward components (per env), aggregated as mean for logging
+            lengths = torch.clamp(self.episode_lengths[done_indices].float(), min=1.0)
+            pot_means = (self.episode_pot_sums[done_indices] / lengths).detach()
+            safe_means = (self.episode_safe_sums[done_indices] / lengths).detach()
+            smooth_means = (self.episode_smooth_sums[done_indices] / lengths).detach()
+            hover_means = (self.episode_hover_sums[done_indices] / lengths).detach()
+            self._episode_component_mean_cache = {
+                "pot": float(pot_means.mean().item()),
+                "safe": float(safe_means.mean().item()),
+                "smooth": float(smooth_means.mean().item()),
+                "hover": float(hover_means.mean().item()),
+            }
             
             # Reset buffers for done envs
             self.episode_sums[done_indices] = 0
             self.episode_lengths[done_indices] = 0
+            self.episode_pot_sums[done_indices] = 0
+            self.episode_safe_sums[done_indices] = 0
+            self.episode_smooth_sums[done_indices] = 0
+            self.episode_hover_sums[done_indices] = 0
 
         # Populate infos for sanity check and external access
         self.infos["successes"] = self.success_buf

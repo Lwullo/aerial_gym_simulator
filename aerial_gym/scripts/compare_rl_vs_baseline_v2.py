@@ -42,11 +42,12 @@ os.environ["AERIAL_GYM_EVAL_MODE"] = "1"
 # ============================================================================
 
 # Model path
-PPO_CHECKPOINT = "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/gmm_noise_run_20-20-49-25/nn/last_gmm_noise_run_ep_3230_rew_20.445738.pth"
+# Model path
+PPO_CHECKPOINT = "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/gmm_noise_run_23-21-09-32/nn/last_gmm_noise_run_ep_5000_rew__-5.3149767_.pth"
 
 # Experiment parameters
 NUM_ENVS = 100
-EPISODE_LENGTH = 450
+EPISODE_LENGTH = 500
 RANDOM_SEED = 10
 
 # J(p) parameters (from config)
@@ -57,6 +58,7 @@ D_0 = task_config.reward_parameters["potential_d0"]
 
 # EMA smoothing
 EMA_ALPHA = 0.99
+RAD2DEG = 180.0 / np.pi
 
 # Output paths
 OUTPUT_DIR = "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/scripts/comparison_results"
@@ -438,10 +440,13 @@ def run_phase(env, agent, episode_length, phase_name, running_mean_std=None):
     
     Returns:
         j_curve: (episode_length, num_envs) numpy array of J values
+        attitude_data: dict with mean_abs/std arrays in degrees (shape: [episode_length, 3])
     """
     logger.info(f"Starting {phase_name} phase for {episode_length} steps...")
     
     j_curve = np.zeros((episode_length, NUM_ENVS))
+    attitude_mean_abs = np.zeros((episode_length, 3))
+    attitude_std = np.zeros((episode_length, 3))
     
     # Track crashes (only first crash per environment)
     has_crashed = np.zeros(NUM_ENVS, dtype=bool)
@@ -479,6 +484,14 @@ def run_phase(env, agent, episode_length, phase_name, running_mean_std=None):
         # Compute J(p)
         J_values = compute_J_potential(env)
         j_curve[step, :] = J_values.cpu().numpy()
+
+        # Attitude stability (roll/pitch/yaw) in degrees
+        euler = env.obs_dict["robot_euler_angles"]
+        euler_deg = euler * RAD2DEG
+        mean_abs = euler_deg.abs().mean(dim=0)
+        std = euler_deg.std(dim=0, unbiased=False)
+        attitude_mean_abs[step, :] = mean_abs.cpu().numpy()
+        attitude_std[step, :] = std.cpu().numpy()
         
         # Track crashes
         crashes = env.obs_dict["crashes"].cpu().numpy()
@@ -532,7 +545,124 @@ def run_phase(env, agent, episode_length, phase_name, running_mean_std=None):
         'distances': final_distances,
     }
     
-    return j_curve, crash_data, survival_data, arrival_data
+    attitude_data = {
+        'mean_abs': attitude_mean_abs,
+        'std': attitude_std,
+    }
+    
+    return j_curve, crash_data, survival_data, arrival_data, attitude_data
+
+
+def plot_attitude_stability(rl_attitude, baseline_attitude, metric, filename_prefix, y_label):
+    """Plot attitude stability comparison for roll/pitch/yaw."""
+    logger.info(f"Generating attitude {metric} comparison plot...")
+    
+    rl_data = rl_attitude[metric]
+    baseline_data = baseline_attitude[metric]
+    
+    def compute_ema(data, alpha=EMA_ALPHA):
+        ema = np.zeros_like(data)
+        ema[0] = data[0]
+        for t in range(1, len(data)):
+            ema[t] = alpha * ema[t-1] + (1 - alpha) * data[t]
+        return ema
+    
+    rl_ema = np.stack([compute_ema(rl_data[:, i]) for i in range(3)], axis=1)
+    baseline_ema = np.stack([compute_ema(baseline_data[:, i]) for i in range(3)], axis=1)
+    
+    # Configure matplotlib
+    rcParams['font.family'] = 'serif'
+    rcParams['font.serif'] = ['Times New Roman']
+    rcParams['font.size'] = 10
+    rcParams['axes.labelsize'] = 10
+    rcParams['axes.titlesize'] = 10
+    rcParams['xtick.labelsize'] = 8
+    rcParams['ytick.labelsize'] = 8
+    rcParams['legend.fontsize'] = 9
+    
+    fig_width_cm = 18.0
+    fig_height_cm = 6.5
+    fig, axes = plt.subplots(
+        1, 3, figsize=(fig_width_cm / 2.54, fig_height_cm / 2.54), sharex=True
+    )
+    
+    timesteps = np.arange(EPISODE_LENGTH)
+    rl_color = '#1f77b4'
+    baseline_color = '#d62728'
+    angle_names = ["Roll", "Pitch", "Yaw"]
+    
+    for i, ax in enumerate(axes):
+        ax.plot(
+            timesteps,
+            rl_data[:, i],
+            color=rl_color,
+            linewidth=0.8,
+            alpha=0.25,
+            label="RL raw" if i == 0 else None,
+        )
+        ax.plot(
+            timesteps,
+            baseline_data[:, i],
+            color=baseline_color,
+            linewidth=0.8,
+            alpha=0.25,
+            label="Baseline raw" if i == 0 else None,
+        )
+        ax.plot(
+            timesteps,
+            rl_ema[:, i],
+            color=rl_color,
+            linewidth=1.6,
+            linestyle='-',
+            label="RL EMA" if i == 0 else None,
+        )
+        ax.plot(
+            timesteps,
+            baseline_ema[:, i],
+            color=baseline_color,
+            linewidth=1.6,
+            linestyle='--',
+            label="Baseline EMA" if i == 0 else None,
+        )
+        ax.set_title(angle_names[i])
+        ax.set_xlabel('Time Steps')
+        ax.grid(True, linestyle='--', alpha=0.3, color='gray')
+        ax.set_xlim([0, EPISODE_LENGTH])
+        if i == 0:
+            ax.set_ylabel(y_label)
+            ax.legend(loc='best', frameon=True, fancybox=False)
+    
+    plt.tight_layout()
+    
+    png_path = os.path.join(OUTPUT_DIR, f"{filename_prefix}_600dpi.png")
+    plt.savefig(png_path, dpi=600, bbox_inches='tight')
+    logger.info(f"Saved attitude PNG to: {png_path}")
+    
+    pdf_path = os.path.join(OUTPUT_DIR, f"{filename_prefix}.pdf")
+    plt.savefig(pdf_path, format='pdf', bbox_inches='tight')
+    logger.info(f"Saved attitude PDF to: {pdf_path}")
+    
+    plt.close()
+    
+    csv_path = os.path.join(OUTPUT_DIR, f"{filename_prefix}.csv")
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'step',
+            'rl_roll_raw', 'rl_pitch_raw', 'rl_yaw_raw',
+            'baseline_roll_raw', 'baseline_pitch_raw', 'baseline_yaw_raw',
+            'rl_roll_ema', 'rl_pitch_ema', 'rl_yaw_ema',
+            'baseline_roll_ema', 'baseline_pitch_ema', 'baseline_yaw_ema',
+        ])
+        for t in range(EPISODE_LENGTH):
+            writer.writerow([
+                t,
+                rl_data[t, 0], rl_data[t, 1], rl_data[t, 2],
+                baseline_data[t, 0], baseline_data[t, 1], baseline_data[t, 2],
+                rl_ema[t, 0], rl_ema[t, 1], rl_ema[t, 2],
+                baseline_ema[t, 0], baseline_ema[t, 1], baseline_ema[t, 2],
+            ])
+    logger.info(f"Saved attitude stats to: {csv_path}")
 
 
 def aggregate_and_plot(rl_curve, baseline_curve):
@@ -829,7 +959,9 @@ def main():
         restore_state_snapshot(env, temp_snapshot)
         logger.info("✅ Normalization statistics computed and environment state restored")
     
-    rl_j_curve, rl_crash_data, rl_survival_data, rl_arrival_data = run_phase(env, ppo_model, EPISODE_LENGTH, "RL", running_mean_std)
+    rl_j_curve, rl_crash_data, rl_survival_data, rl_arrival_data, rl_attitude_data = run_phase(
+        env, ppo_model, EPISODE_LENGTH, "RL", running_mean_std
+    )
     
     # Save RL raw data
     rl_csv = os.path.join(OUTPUT_DIR, "rl_j_curve_raw.csv")
@@ -850,7 +982,9 @@ def main():
     restore_state_snapshot(env, initial_snapshot)
     
     baseline_agent = LocalAPFAgent(env, w_dist=W_D, w_noise=W_N, w_obs=2.0, d_obs=1.5)
-    baseline_j_curve, baseline_crash_data, baseline_survival_data, baseline_arrival_data = run_phase(env, baseline_agent, EPISODE_LENGTH, "Baseline")
+    baseline_j_curve, baseline_crash_data, baseline_survival_data, baseline_arrival_data, baseline_attitude_data = run_phase(
+        env, baseline_agent, EPISODE_LENGTH, "Baseline"
+    )
     
     # Save Baseline raw data
     baseline_csv = os.path.join(OUTPUT_DIR, "baseline_j_curve_raw.csv")
@@ -868,6 +1002,20 @@ def main():
     aggregate_and_plot(rl_j_curve, baseline_j_curve)
     plot_crash_rate(rl_crash_data, baseline_crash_data)
     plot_survival_time(rl_survival_data, baseline_survival_data, rl_arrival_data, baseline_arrival_data, rl_crash_data, baseline_crash_data, rl_j_curve, baseline_j_curve)
+    plot_attitude_stability(
+        rl_attitude_data,
+        baseline_attitude_data,
+        metric="mean_abs",
+        filename_prefix="attitude_mean_abs_comparison",
+        y_label="Mean Abs Angle (deg)",
+    )
+    plot_attitude_stability(
+        rl_attitude_data,
+        baseline_attitude_data,
+        metric="std",
+        filename_prefix="attitude_std_comparison",
+        y_label="Angle Std (deg)",
+    )
     
     logger.info("\n" + "=" * 70)
     logger.info("Experiment completed successfully!")
