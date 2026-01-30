@@ -227,11 +227,25 @@ class NavigationTaskGmmNoise(BaseTask):
         self.episode_safe_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
         self.episode_smooth_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
         self.episode_hover_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
+        self.episode_threshold_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
+        self.episode_anchor_sums = torch.zeros(self.sim_env.num_envs, device=self.device, dtype=torch.float)
         self._episode_component_mean_cache = None
+        self.hover_good_min = torch.full(
+            (self.sim_env.num_envs,), float("inf"), device=self.device
+        )
+        self.hover_good_max = torch.full(
+            (self.sim_env.num_envs,), -float("inf"), device=self.device
+        )
         
         # Track minimum J value (closest approach/best state) per episode (NEW)
         self.episode_min_J = torch.full((self.sim_env.num_envs,), 1000.0, device=self.device)
         self.min_J_buffer = deque(maxlen=1000)
+
+        # Rolling window stats for end-of-episode logging (per 1000 steps)
+        self.window_done_total = 0
+        self.window_done_non_crash = 0
+        self.window_done_speed_sum = 0.0
+        self.window_done_hover_reward_count = 0
         
         
         self.reset_idx(torch.arange(self.sim_env.num_envs, device=self.device))
@@ -447,23 +461,30 @@ class NavigationTaskGmmNoise(BaseTask):
         num_envs = env_ids.shape[0]
         num_sources = self.num_noise_sources
 
-        # Stratified Noise Sampling Strategy ⭐
+        # Stratified Noise Sampling Strategy ⭐ (UPDATED)
         # Total sources: 5 (defined in config)
         # Group 1: Global Roaming (Indices 0, 1, 2)
         #   - Randomly distributed across the entire environment
         #   - Provide general wind/disturbance throughout the flight
-        # Group 2: Target Guardians (Indices 3, 4)
+        # Group 2: Target Anchor (Index 3)
+        #   - **EXACTLY at the target position**
+        #   - Creates a noise peak at the optimal location
+        # Group 3: Target Guardian (Index 4)
         #   - Spawned within 1.0m to 3.0m radius of the target
-        #   - Create complex turbulence near the goal to test fine control
+        #   - Creates complex turbulence near the goal to test fine control
         
-        # --- Group 1: Global Sources (First 4) ---
-        num_global = 4
+        # --- Group 1: Global Sources (First 3) ---
+        num_global = 3
         bounds_min_global = self.env_bounds_min.view(1, 1, 3).expand(num_envs, num_global, 3)
         bounds_max_global = self.env_bounds_max.view(1, 1, 3).expand(num_envs, num_global, 3)
         centers_global = torch_rand_float_tensor(bounds_min_global, bounds_max_global)
 
-        # --- Group 2: Local Target Sources (Last 2) ---
-        num_local = num_sources - num_global
+        # --- Group 2: Target Anchor Source (Index 3) ---
+        # Place exactly at target position
+        target_center = self.target_position[env_ids].unsqueeze(1)  # Shape: (num_envs, 1, 3)
+        
+        # --- Group 3: Local Target Guardian (Index 4) ---
+        num_local = num_sources - num_global - 1  # Minus 1 for the target anchor
         if num_local > 0:
             # Generate random directions
             random_dirs = torch.randn((num_envs, num_local, 3), device=self.device)
@@ -487,10 +508,11 @@ class NavigationTaskGmmNoise(BaseTask):
             centers_local = torch.max(centers_local, self.env_bounds_min.view(1, 1, 3))
             centers_local = torch.min(centers_local, self.env_bounds_max.view(1, 1, 3))
             
-            # Concatenate global and local centers
-            centers = torch.cat([centers_global, centers_local], dim=1)
+            # Concatenate all groups: global + target_anchor + local
+            centers = torch.cat([centers_global, target_center, centers_local], dim=1)
         else:
-            centers = centers_global
+            # Only global + target_anchor
+            centers = torch.cat([centers_global, target_center], dim=1)
 
         sigma_min = self.noise_sigma_min.view(1, 1, 3).expand(num_envs, num_sources, 3)
         sigma_max = self.noise_sigma_max.view(1, 1, 3).expand(num_envs, num_sources, 3)
@@ -771,10 +793,12 @@ class NavigationTaskGmmNoise(BaseTask):
              # Fallback if uninitialized (should imply first step or error)
              n_hat = torch.zeros_like(current_noise)
         else:
-            n_hat = (current_noise - self.estimated_n_min) / (
-                self.estimated_n_max - self.estimated_n_min + 1e-6
-            )
-            n_hat = torch.clamp(n_hat, 0.0, 1.0)
+            # [UPDATED] Use raw noise intensity directly (removed normalization)
+            n_hat = current_noise
+            # n_hat = (current_noise - self.estimated_n_min) / (
+            #     self.estimated_n_max - self.estimated_n_min + 1e-6
+            # )
+            # n_hat = torch.clamp(n_hat, 0.0, 1.0)
             
         d0 = self.reward_params["potential_d0"]
         w_d = self.reward_params["potential_w_d"]
@@ -819,25 +843,18 @@ class NavigationTaskGmmNoise(BaseTask):
         improvement_reward = potential_improvement_reward # Borrow this variable slot for logging
         noise_reduction_reward = torch.zeros_like(potential_improvement_reward)
         
-        # 3. Direction Alignment Reward (auxiliary navigation guidance)
+        # 3. Direction Alignment Reward (Heading Alignment) ⭐
+        # Encourages the drone to face the target (Yaw alignment)
+        # r_h = k * cos(theta_target - theta_robot)
         vec_to_target = self.target_position - position
-        distance_safe = torch.clamp(dist_to_target, min=0.01)
-        direction_to_target = vec_to_target / distance_safe.unsqueeze(1)
+        target_yaw = torch.atan2(vec_to_target[:, 1], vec_to_target[:, 0])
+        robot_yaw = self.obs_dict["robot_euler_angles"][:, 2] # Roll, Pitch, Yaw
         
-        velocity = self.obs_dict["robot_linvel"]
-        speed = torch.norm(velocity, dim=1, keepdim=True)
-        speed_safe = torch.clamp(speed, min=0.01)
+        yaw_error = target_yaw - robot_yaw
+        # Wrap to [-pi, pi] for numerical stability (though cos is periodic, so strictly not needed for cos, but good for debugging)
+        yaw_error = torch.atan2(torch.sin(yaw_error), torch.cos(yaw_error))
         
-        velocity_direction = velocity / speed_safe
-        alignment = (direction_to_target * velocity_direction).sum(dim=1)
-        
-        direction_reward = self.reward_params["direction_alignment_reward_magnitude"] * torch.clamp(
-            alignment, min=0.0
-        )
-        
-        # Set to zero if speed is very low (stationary)
-        moving_mask = (speed.squeeze(1) > 0.05).float()
-        direction_reward = direction_reward * moving_mask
+        direction_reward = self.reward_params["direction_alignment_reward_magnitude"] * torch.cos(yaw_error)
         
         
         # ==== Action Smoothness Penalties (Action-based) ⭐ ====
@@ -883,43 +900,62 @@ class NavigationTaskGmmNoise(BaseTask):
         penalty = torch.clamp(log_dist - log_threshold, max=0.0)
         safety_reward = self.reward_params["safety_reward_magnitude"] * penalty
         
-        # ==== Hover Reward (Continuous Gating Functions) ⭐ ====
-        # Encourage stable hovering at "near target + low noise + low velocity" positions
-        # r_hover = k_h * g_d(d) * g_J(J) * g_v(||v||)
-        
-        # 1. Distance Gating: DISABLED as requested
-        # d_h = self.reward_params["hover_reward_dh"]
-        # g_d = torch.exp(-(dist_to_target / d_h).pow(2))
-        g_d = 1.0  # [UPDATED] Distance gating removed
-        
-        # 2. Quality Gating: g_J(J) = exp(-alpha_J * J/J_h)
-        J_h = self.reward_params["hover_reward_jh"]
-        alpha_J = self.reward_params.get("hover_reward_alpha_j", 1.0) # Default to 1.0 if not present
-        g_J = torch.exp(-alpha_J * (J_t / J_h))
-        
-        # 3. Velocity Gating: g_v(||v||) = exp(-(||v||/v_h)^2)
-        v_h = self.reward_params["hover_reward_vh"]
-        g_v = torch.exp(-(linvel_magnitude / v_h).pow(2))
-        
-        # Combined Hover Reward
+        # ==== Hover Reward (g_J * g_v, no distance gate) ====
+        # g_J(J) = exp(-(J/J_h)^2), g_v(v) = exp(-(v/v_h)^2)
+        # R_hover = k_h * g_J * g_v
+        J_h = torch.clamp(self.reward_params["hover_reward_jh"], min=1e-6)
+        v_h = torch.clamp(self.reward_params["hover_reward_vh"], min=1e-6)
         k_h = self.reward_params["hover_reward_kh"]
-        # hover_reward = k_h * g_d * g_J * g_v
-        hover_reward = k_h * g_J * g_v  # [UPDATED] Removed g_d
+
+        # Terminal hover tracking (keep for terminal bonus)
+        rho_good = torch.minimum(J_h - J_t, v_h - linvel_magnitude)
+        if not hasattr(self, "hover_good_min"):
+            self.hover_good_min = torch.full(
+                (self.sim_env.num_envs,), float("inf"), device=self.device
+            )
+            self.hover_good_max = torch.full(
+                (self.sim_env.num_envs,), -float("inf"), device=self.device
+            )
+        self.hover_good_min = torch.minimum(self.hover_good_min, rho_good)
+        self.hover_good_max = torch.maximum(self.hover_good_max, self.hover_good_min)
+
+        g_J = torch.exp(-torch.pow(J_t / J_h, 2))
+        g_v = torch.exp(-torch.pow(linvel_magnitude / v_h, 2))
+        hover_reward = k_h * g_J * g_v
         
         # ==== Collision Penalty ====
         collision_penalty = self.reward_params["collision_penalty"]
         collision_mask = (self.obs_dict["crashes"] > 0).float()
         collision_reward = collision_penalty * collision_mask
+
+        # ==== Threshold Bonus: DISABLED ====
+        # sigma = 2.0
+        # w_r = 1.0
+        # threshold_reward = w_r * torch.exp(-(J_t ** 2) / (sigma ** 2))
+        threshold_reward = torch.zeros_like(J_t)  # DISABLED
+
+        # ==== Anchoring Reward: DISABLED ====
+        # anchor_k = self.reward_params["anchor_reward_k"]
+        # anchor_sigma = torch.clamp(self.reward_params["anchor_reward_sigma"], min=1e-6)
+        # anchor_threshold = self.reward_params["anchor_quality_threshold"]
+        # J_best_so_far = self.episode_min_J
+        # anchor_active = J_best_so_far < anchor_threshold
+        # anchor_diff = J_t - J_best_so_far
+        # anchor_reward = anchor_k * torch.exp(-torch.pow(anchor_diff / anchor_sigma, 2))
+        # anchor_reward = torch.where(anchor_active, anchor_reward, torch.zeros_like(anchor_reward))
+        anchor_reward = torch.zeros_like(J_t)  # DISABLED
         
-        # ==== Total Unified Reward (no explicit stage switching) ====
+        # ==== Total Unified Reward (Simplified) ====
         reward = (
-            improvement_reward           # Now carries the Unified Potential Reward
+            improvement_reward           # Unified Potential Reward (J-based)
             # + noise_reduction_reward    # Removed (is 0.0)
-            + direction_reward            # 2.0 × alignment (navigation guidance)
+            + direction_reward          # Heading Alignment Reward (New)
             + action_smoothness_penalty   # Action-based smoothness (-k_a, -k_da)
-            + safety_reward               # 2.0 × mean(log(distances)) (obstacle avoidance)
-            + hover_reward                # Continuous hover reward (NEW)
-            + collision_reward            # -100
+            + safety_reward               # Log-barrier penalty (obstacle avoidance)
+            + hover_reward                # Continuous hover reward
+            # + threshold_reward          # DISABLED
+            # + anchor_reward             # DISABLED
+            + collision_reward            # -30.0
         )
         
         # ==== Update Previous State ====
@@ -940,6 +976,8 @@ class NavigationTaskGmmNoise(BaseTask):
             safety_reward,
             action_smoothness_penalty,
             hover_reward,
+            threshold_reward,
+            anchor_reward,
         )
 
     def _update_best_point(self, total_score):
@@ -1166,6 +1204,16 @@ class NavigationTaskGmmNoise(BaseTask):
                     self._episode_component_mean_cache["hover"],
                     self.num_task_steps,
                 )
+                self.writer.add_scalar(
+                    "EpisodeMean/R_threshold",
+                    self._episode_component_mean_cache["threshold"],
+                    self.num_task_steps,
+                )
+                self.writer.add_scalar(
+                    "EpisodeMean/R_anchor",
+                    self._episode_component_mean_cache["anchor"],
+                    self.num_task_steps,
+                )
                 self._episode_component_mean_cache = None
             
             if hasattr(self, "current_raw_signal"):
@@ -1199,6 +1247,21 @@ class NavigationTaskGmmNoise(BaseTask):
                 f"[Step {self.num_task_steps}] arrival_rate={arrival_rate:.1%} "
                 f"(arrived/total={arrived_count}/{total_count})"
             )
+
+            if self.window_done_total > 0:
+                avg_end_speed = self.window_done_speed_sum / max(1, self.window_done_non_crash)
+                end_speed_summary = (
+                    f"{avg_end_speed:.3f}m/s({self.window_done_non_crash}/{self.window_done_total})"
+                )
+                terminal_hover_rate = self.window_done_hover_reward_count / self.window_done_total
+            else:
+                end_speed_summary = "0.000m/s(0/0)"
+                terminal_hover_rate = 0.0
+
+            logger.purple(
+                f"[Step {self.num_task_steps}] end_speed_avg={end_speed_summary}, "
+                f"terminal_hover_rate={terminal_hover_rate:.1%}"
+            )
             logger.orange(
                 f"[Step {self.num_task_steps}] final_J_mean={final_J_mean:.3f}, "
                 f"min_J_min={min_J_min:.3f}, min_J_max={min_J_max:.3f}"
@@ -1214,6 +1277,11 @@ class NavigationTaskGmmNoise(BaseTask):
                 f"noise={noise_intensity.mean().item():.3f}, tilt={avg_tilt_deg:.1f}°, "
                 f"reward={self.rewards.mean().item():.2f}"
             )
+
+            self.window_done_total = 0
+            self.window_done_non_crash = 0
+            self.window_done_speed_sum = 0.0
+            self.window_done_hover_reward_count = 0
 
         
         self.infos["extras"] = extras
@@ -1397,6 +1465,9 @@ class NavigationTaskGmmNoise(BaseTask):
         self.J_best_in_goal[env_ids] = float('inf')
         self.hold_counter[env_ids] = 0.0
         self.max_hold_counter[env_ids] = 0.0
+        if hasattr(self, "hover_good_min"):
+            self.hover_good_min[env_ids] = float("inf")
+            self.hover_good_max[env_ids] = -float("inf")
             
         self._estimate_noise_range(env_ids)
         
@@ -1640,6 +1711,8 @@ class NavigationTaskGmmNoise(BaseTask):
             safety_reward,
             action_smoothness_penalty,
             hover_reward,
+            threshold_reward,
+            anchor_reward,
         ) = self._compute_reward_and_scores()
 
         if self.task_config.return_state_before_reset is True:
@@ -1732,11 +1805,22 @@ class NavigationTaskGmmNoise(BaseTask):
         self.episode_safe_sums += safety_reward.detach()
         self.episode_smooth_sums += action_smoothness_penalty.detach()
         self.episode_hover_sums += hover_reward.detach()
+        self.episode_threshold_sums += threshold_reward.detach()
+        self.episode_anchor_sums += anchor_reward.detach()
         
         # Check for done envs (terminations or truncations)
         dones = (self.terminations > 0) | (self.truncations > 0)
         if dones.any():
             done_indices = dones.nonzero(as_tuple=False).flatten()
+
+            done_count = int(done_indices.numel())
+            self.window_done_total += done_count
+            crash_mask = (self.obs_dict["crashes"][done_indices] > 0)
+            non_crash_mask = ~crash_mask
+            if non_crash_mask.any():
+                end_speeds = torch.norm(self.obs_dict["robot_linvel"][done_indices], dim=1)
+                self.window_done_speed_sum += float(end_speeds[non_crash_mask].sum().item())
+                self.window_done_non_crash += int(non_crash_mask.sum().item())
 
             # --- Capture Final J and Arrival Status ---
             # Reuse already-computed J values (avoid dimension mismatch)
@@ -1780,6 +1864,14 @@ class NavigationTaskGmmNoise(BaseTask):
 
             
             # Log episode rewards and lengths for rl_games
+            # [REMOVED] Buggy terminal hover reward that was causing negative sums
+            # if hasattr(self, "hover_good_max"):
+            #     terminal_hover_reward = 10.0 * self.hover_good_max[done_indices]
+            #     self.rewards[done_indices] += terminal_hover_reward
+            #     self.episode_sums[done_indices] += terminal_hover_reward
+            #     self.episode_hover_sums[done_indices] += terminal_hover_reward
+            #     self.window_done_hover_reward_count += int((terminal_hover_reward > 0).sum().item())
+
             self.extras["episode_rewards"] = self.episode_sums[done_indices].cpu().numpy().tolist()
             self.extras["episode_lengths"] = self.episode_lengths[done_indices].cpu().numpy().tolist()
 
@@ -1789,11 +1881,15 @@ class NavigationTaskGmmNoise(BaseTask):
             safe_means = (self.episode_safe_sums[done_indices] / lengths).detach()
             smooth_means = (self.episode_smooth_sums[done_indices] / lengths).detach()
             hover_means = (self.episode_hover_sums[done_indices] / lengths).detach()
+            threshold_means = (self.episode_threshold_sums[done_indices] / lengths).detach()
+            anchor_means = (self.episode_anchor_sums[done_indices] / lengths).detach()
             self._episode_component_mean_cache = {
                 "pot": float(pot_means.mean().item()),
                 "safe": float(safe_means.mean().item()),
                 "smooth": float(smooth_means.mean().item()),
                 "hover": float(hover_means.mean().item()),
+                "threshold": float(threshold_means.mean().item()),
+                "anchor": float(anchor_means.mean().item()),
             }
             
             # Reset buffers for done envs
@@ -1803,6 +1899,8 @@ class NavigationTaskGmmNoise(BaseTask):
             self.episode_safe_sums[done_indices] = 0
             self.episode_smooth_sums[done_indices] = 0
             self.episode_hover_sums[done_indices] = 0
+            self.episode_threshold_sums[done_indices] = 0
+            self.episode_anchor_sums[done_indices] = 0
 
         # Populate infos for sanity check and external access
         self.infos["successes"] = self.success_buf

@@ -4,9 +4,11 @@ from logging import Logger
 BLUE_LEVEL = 25
 GREEN_LEVEL = 26
 ORANGE_LEVEL = 27
+PURPLE_LEVEL = 28
 logging.addLevelName(BLUE_LEVEL, "BLUE")
 logging.addLevelName(GREEN_LEVEL, "GREEN")
 logging.addLevelName(ORANGE_LEVEL, "ORANGE")
+logging.addLevelName(PURPLE_LEVEL, "PURPLE")
 
 
 class CustomFormatter(logging.Formatter):
@@ -32,6 +34,7 @@ class CustomFormatter(logging.Formatter):
         BLUE_LEVEL: blue + format + reset,
         GREEN_LEVEL: green + format + reset,
         ORANGE_LEVEL: orange + format + reset,
+        PURPLE_LEVEL: magenta + format + reset,
         logging.WARNING: yellow + format + reset,
         logging.ERROR: red + format + reset,
         logging.CRITICAL: bold_red + format + reset,
@@ -63,6 +66,7 @@ class CustomLogger(Logger):
         self.blue("A Blue message will look like this")
         self.green("A Green message will look like this")
         self.orange("An Orange message will look like this")
+        self.purple("A Purple message will look like this")
         self.warning("A Warning message will look like this")
         self.error("An Error message will look like this")
         self.critical("A Critical message will look like this")
@@ -78,3 +82,7 @@ class CustomLogger(Logger):
     def orange(self, message, *args, **kwargs):
         if self.isEnabledFor(ORANGE_LEVEL):
             self._log(ORANGE_LEVEL, message, args, **kwargs)
+
+    def purple(self, message, *args, **kwargs):
+        if self.isEnabledFor(PURPLE_LEVEL):
+            self._log(PURPLE_LEVEL, message, args, **kwargs)

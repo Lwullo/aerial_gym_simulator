@@ -66,7 +66,7 @@ params:
     critic_coef: 2
     normalize_input: True  # [ENABLED] Normalize observations for stable training
     bounds_loss_coef: 0.0001
-    max_epochs: 5000
+    max_epochs: 9000
     normalize_value: True
     use_diagnostics: True
     value_bootstrap: True

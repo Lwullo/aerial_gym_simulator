@@ -1,3 +1,4 @@
 Method,Arrival Count,Arrival Rate (%),Mean Final Distance (m)
-RL,10,10.00,4.620
-Baseline,73,73.00,1.861
+RL,3,3.00,4.671
+Baseline,52,52.00,2.938
+Pure PID,42,42.00,2.818

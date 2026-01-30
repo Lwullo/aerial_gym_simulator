@@ -77,28 +77,28 @@ class task_config:
     env_bounds_max = [10.0, 10.0, 10.0]
 
     # fixed number of obstacles to keep in the environment (excluding keep_in_env assets)
-    num_obstacles_in_env = 11
+    num_obstacles_in_env = 30
     target_min_ratio = [0.2, 0.2, 0.3]  # Z updated to 3.0m (0.3)
     target_max_ratio = [0.8, 0.8, 0.7]  # Z updated to 7.0m (0.7)
 
     reward_parameters = {
         # Unified Cost Function Reward (J_prev - J_t) with Tanh Smoothing ⭐
-        "potential_kj": 1.0,  # [UPDATED] Reset per request
-        "potential_sj": 0.12,               # Sensitivity scale (s_J), small change normalization
-        "potential_w_d": 1.0,              # Weight for distance cost (w_d) [UPDATED] 0.6 -> 1.0
-        "potential_w_n": 1.0,              # Weight for noise cost (w_n) [UPDATED] 2.0 -> 1.0
-        "potential_d0": 2.0,               # Reference distance (d0) for normalization
+        "potential_kj": 1.0,  # [UPDATED] 3.0 -> 1.0
+        "potential_sj": 0.1,               # Sensitivity scale (s_J), small change normalization
+        "potential_w_d": 1.0,              # Weight for distance cost (w_d)
+        "potential_w_n": 1.0,              # Weight for noise cost (w_n) - matches training
+        "potential_d0": 2.5,               # Reference distance (d0) for normalization [UPDATED] 2.0 -> 2.5
         "n_min_max_sample_size": 1000,     # Number of samples to estimate noise range on reset
         
         # Terminal Mission Reward (NEW) ⭐
         "terminal_reward": 0.0,            # Reward for arriving within 2.0m at end of episode (disabled)
         
-        # Direction alignment reward (velocity direction alignment with goal) ⭐
-        "direction_alignment_reward_magnitude": 0.0,  # 速度导向，暂时禁用 (2.0 -> 0.0)
+        # Direction alignment reward (DISABLED) ⭐
+        "direction_alignment_reward_magnitude": 0.1,  # ENABLED (0.5)
         
         # Safety reward (based on depth map for obstacle avoidance) (NEW) ⭐
-        "safety_reward_magnitude": 0.3,  # Weight for safety reward (Penalty only)
-        "safety_dist_threshold": 1.0,               # Distance threshold for safety penalty (meters)
+        "safety_reward_magnitude": 1.0,  # Weight for safety reward (Penalty only)
+        "safety_dist_threshold": 0.6,               # Distance threshold for safety penalty (meters) [UPDATED] 0.5 -> 1.0
         "min_safe_distance_clamp": 0.1,             # Min distance clamp to prevent log(0) (meters)
         
         # Action Smoothness Penalties (Action-based) ⭐
@@ -106,14 +106,19 @@ class task_config:
         "action_change_penalty_weight": 0.1,        # k_Delta_a (smoothness/jitter penalty)
         
         # Hover Reward (Continuous Gating Functions) ⭐
-        "hover_reward_kh": 0.3,                     # k_h (hover reward weight coefficient)
+        "hover_reward_kh": 1.0,                     # k_h (hover reward weight coefficient) [UPDATED] 10.0 -> 3.0
         "hover_reward_dh": 2.0,                     # d_h (distance threshold for hover, meters)
-        "hover_reward_vh": 0.35,                    # v_h (velocity threshold for hover, m/s) [UPDATED: 0.25 → 0.35]
-        "hover_reward_jh": 2.0,                     # J_h (potential quality threshold for hover) [UPDATED] 1.0 -> 2.0
-        "hover_reward_alpha_j": 3.0,                # alpha_J (Scaling factor for J gating), scaling sensitivity of quality check
+        "hover_reward_vh": 0.2,                     # v_h (velocity threshold for hover, m/s)
+        "hover_reward_jh": 1.0,                     # J_h (potential quality threshold for hover) [UPDATED] 1.0 -> 2.0
+        "hover_reward_alpha_j": 1.5,                # alpha_J (Scaling factor for J gating), scaling sensitivity of quality check
+
+        # Anchoring Reward (DISABLED)
+        "anchor_reward_k": 0.0,                     # k_anchor [DISABLED]
+        "anchor_reward_sigma": 0.5,                 # sigma
+        "anchor_quality_threshold": 2.0,            # only anchor when J_best_so_far < threshold
         
         # Collision penalty
-        "collision_penalty": -20.0,  # [UPDATED] Reduced from -80.0 to -20.0
+        "collision_penalty": -50.0,  # [UPDATED] Reduced from -80.0 to -30.0
     }
 
     class vae_config:
