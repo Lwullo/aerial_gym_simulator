@@ -303,7 +303,7 @@ class tree_asset_params(asset_state_params):
 
 
 class object_asset_params(asset_state_params):
-    num_assets = 10  # Reduced from 15 for easier navigation
+    num_assets = 26  # Increased to achieve ~30 total obstacles (with panels and trees)
 
     asset_folder = f"{AERIAL_GYM_DIRECTORY}/resources/models/environment_assets/objects"
     file = "small_cube.urdf"  # 默认使用 small_cube.urdf (尺寸: 0.4×0.4×0.4m)

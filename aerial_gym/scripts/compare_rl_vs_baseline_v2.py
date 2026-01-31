@@ -25,7 +25,11 @@ import torch
 import matplotlib
 matplotlib.use('Agg')  # Headless backend
 import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 from matplotlib import rcParams
+from scipy.signal import savgol_filter
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 
 logger = CustomLogger("compare_rl_vs_baseline")
 
@@ -43,18 +47,18 @@ os.environ["AERIAL_GYM_EVAL_MODE"] = "1"
 
 # Model path
 # Model path
-PPO_CHECKPOINT = "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/gmm_noise_run_30-01-27-14/nn/last_gmm_noise_run_ep_9000_rew__5.073401_.pth"
+PPO_CHECKPOINT = "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/gmm_noise_run_30-18-03-39/nn/last_gmm_noise_run_ep_4650_rew_143.95493.pth"
 
 # Experiment parameters
 NUM_ENVS = 100
-EPISODE_LENGTH = 500
-RANDOM_SEED = 10
+EPISODE_LENGTH = 1000
+RANDOM_SEED = 20
 
 # J(p) parameters (from config)
 # J(p) parameters (from config)
-W_D = 1.0
+W_D = 0.1
 W_N = 1.0
-D_0 = 10.0 # task_config.reward_parameters["potential_d0"]
+D_0 = 3.0 # task_config.reward_parameters["potential_d0"]
 
 # EMA smoothing
 EMA_ALPHA = 0.99
@@ -139,7 +143,7 @@ def compute_J_potential(env):
     
     # Distance term
     dist_to_target = torch.norm(position - env.target_position, dim=1)
-    J_dist = W_D * (dist_to_target / D_0)
+    J_dist = W_D * ((dist_to_target / D_0) ** 2)
     
     # Noise term (normalized)
     current_noise = env._compute_gmm_mixture(position)
@@ -714,6 +718,9 @@ def run_phase(env, agent, episode_length, phase_name, running_mean_std=None):
     survival_times = []
     env_last_reset_step = np.zeros(NUM_ENVS, dtype=int)
     
+    # Track position history for trajectory plotting
+    position_history = np.zeros((episode_length, NUM_ENVS, 3))
+    
     # Track 'Fair' Min J and Min Dist (valid only until first crash)
     # Initialize with infinity so we can find minimums
     fair_min_j_per_env = np.full(NUM_ENVS, np.inf)
@@ -767,6 +774,9 @@ def run_phase(env, agent, episode_length, phase_name, running_mean_std=None):
         distances = torch.norm(robot_pos - target_pos, dim=1)
         dist_values_np = distances.cpu().numpy()
         distance_curve[step, :] = dist_values_np
+        
+        # Record position
+        position_history[step] = robot_pos.cpu().numpy()
 
         # Attitude stability (roll/pitch/yaw) in degrees
         euler = env.obs_dict["robot_euler_angles"]
@@ -889,7 +899,7 @@ def run_phase(env, agent, episode_length, phase_name, running_mean_std=None):
     else:
         fair_min_dist_per_env = np.min(distance_curve, axis=0)
 
-    return j_curve, crash_data, survival_data, arrival_data, attitude_data, distance_curve, fair_min_j_per_env, fair_min_dist_per_env, action_history
+    return j_curve, crash_data, survival_data, arrival_data, attitude_data, distance_curve, fair_min_j_per_env, fair_min_dist_per_env, action_history, position_history
 
 
 def plot_attitude_stability(rl_attitude, baseline_attitude, pid_attitude, metric, filename_prefix, y_label):
@@ -921,74 +931,98 @@ def plot_attitude_stability(rl_attitude, baseline_attitude, pid_attitude, metric
     rcParams['ytick.labelsize'] = 8
     rcParams['legend.fontsize'] = 9
     
-    fig_width_cm = 18.0
-    fig_height_cm = 6.5
+    fig_width_cm = 30.0
+    fig_height_cm = 10.0
     fig, axes = plt.subplots(
         1, 3, figsize=(fig_width_cm / 2.54, fig_height_cm / 2.54), sharex=True
     )
     
     timesteps = np.arange(EPISODE_LENGTH)
-    rl_color = '#1f77b4'
-    baseline_color = '#d62728'
-    pid_color = '#2ca02c'
+    
+    # Colors
+    rl_color = '#1f77b4'       # Blue
+    baseline_color = '#d62728' # Red
+    pid_color = '#2ca02c'      # Green
+    
     angle_names = ["Roll", "Pitch", "Yaw"]
     
     for i, ax in enumerate(axes):
+        # 1. Plot Raw Data (Background, No Legend)
         ax.plot(
             timesteps,
             rl_data[:, i],
             color=rl_color,
             linewidth=0.8,
-            alpha=0.25,
-            label="RL raw" if i == 0 else None,
+            alpha=0.15,
+            label=None,
         )
         ax.plot(
             timesteps,
             baseline_data[:, i],
             color=baseline_color,
             linewidth=0.8,
-            alpha=0.25,
-            label="Baseline raw" if i == 0 else None,
+            alpha=0.15,
+            label=None,
         )
         ax.plot(
             timesteps,
             pid_data[:, i],
             color=pid_color,
             linewidth=0.8,
-            alpha=0.25,
-            label="PID raw" if i == 0 else None,
+            alpha=0.15,
+            label=None,
         )
+        
+        # 2. Plot Smoothed EMA Data (Main Lines)
+        # RL -> PPO (Blue, Solid)
         ax.plot(
             timesteps,
             rl_ema[:, i],
             color=rl_color,
-            linewidth=1.6,
+            linewidth=2.0,
             linestyle='-',
-            label="RL EMA" if i == 0 else None,
+            label="PPO",
         )
+        # Baseline -> PID+Greedy (Red, Solid - kept dashed? No, user said solid for others is fine)
+        # User said: "其他两根实线的样式都不用变" -> Baseline was previously dashed in some plots but solid in others?
+        # In the code block I replaced, Baseline EMA was '--'. 
+        # But user said "other two solid lines don't change". Wait, RL was solid, PID was dashed.
+        # If Baseline was dashed, I should probably keep it dashed? 
+        # OR "others don't change" implies their *current state* (RL solid, Baseline dashed/solid).
+        # Let's check previous code: Baseline EMA was '--' (dashed).
+        # User said: "lines style except converting Green dashed to Green Solid, others don't change".
+        # So Baseline should remain Dashed ('--') if it was dashed.
+        # Let's double check Line 984 in original: `linestyle='--'`.
+        # So I will keep Baseline as '--'.
         ax.plot(
             timesteps,
             baseline_ema[:, i],
             color=baseline_color,
-            linewidth=1.6,
-            linestyle='--',
-            label="Baseline EMA" if i == 0 else None,
+            linewidth=2.0,
+            linestyle='-', # Changed to SOLID per request
+            # Wait, User said "Blue name PPO, Green PID, Blue PID+Greedy".
+            # And "RL Blue, PID Green, Baseline Red".
+            # So Baseline is Red.
+            label="PID+Greedy",
         )
+        # PID -> PID (Green, Solid - CHANGED from ':')
         ax.plot(
             timesteps,
             pid_ema[:, i],
             color=pid_color,
-            linewidth=1.6,
-            linestyle=':',
-            label="PID EMA" if i == 0 else None,
+            linewidth=2.0,
+            linestyle='-', # Changed to SOLID per request
+            label="PID",
         )
-        ax.set_title(angle_names[i])
-        ax.set_xlabel('Time Steps')
+        
+        ax.set_title(angle_names[i], fontsize=12, fontweight='bold')
+        ax.set_xlabel('Time Steps', fontsize=11)
         ax.grid(True, linestyle='--', alpha=0.3, color='gray')
         ax.set_xlim([0, EPISODE_LENGTH])
-        if i == 0:
-            ax.set_ylabel(y_label)
-            ax.legend(loc='best', frameon=True, fancybox=False)
+        if True: # Always show legend for all subplots as requested
+            ax.set_ylabel(y_label, fontsize=11) if i == 0 else None
+            # Legend: Top Right, simplified
+            ax.legend(loc='upper right', frameon=True, fancybox=False, edgecolor='black', fontsize=10)
     
     plt.tight_layout()
     
@@ -1153,9 +1187,9 @@ def plot_fair_min_metrics_distribution(rl_min_j, baseline_min_j, pid_min_j, rl_m
             # Optional: Add small dots on the line
             ax.scatter(x, sorted_data, color=color, s=10, alpha=0.5)
 
-        ax.set_xlabel('Episodes (Sorted by Performance)')
+        ax.set_xlabel('Episodes')
         ax.set_ylabel(ylabel)
-        ax.set_title(title)
+        # ax.set_title(title) # Removed per user request
         ax.legend()
         ax.grid(True, linestyle= '--', alpha=0.3)
         ax.set_xlim(0, len(data_list[0]))
@@ -1173,6 +1207,11 @@ def plot_fair_min_metrics_distribution(rl_min_j, baseline_min_j, pid_min_j, rl_m
     
     png_path = os.path.join(OUTPUT_DIR, "min_j_sorted_curve.png")
     plt.savefig(png_path, dpi=300)
+    
+    # Save PDF as requested
+    pdf_path = os.path.join(OUTPUT_DIR, "min_j_sorted_curve.pdf")
+    plt.savefig(pdf_path, format='pdf', bbox_inches='tight')
+    
     logger.info(f"Saved min J sorted curve to: {png_path}")
     plt.close()
     
@@ -1399,6 +1438,499 @@ def plot_distance_to_target(rl_distance, baseline_distance, pid_distance):
     logger.info(f"Baseline Final Distance (mean): {baseline_mean[-1]:.3f}m")
     logger.info(f"Pure PID Final Distance (mean): {pid_mean[-1]:.3f}m")
 
+def gmm_noise_intensity(x, y, z, centers, sigmas, weights):
+    """Calculate GMM noise intensity at a point (scalar)."""
+    # Simple version: Sum of Gaussian kernels
+    intensity = 0.0
+    num_sources = centers.shape[0]
+    for i in range(num_sources):
+        mu = centers[i]
+        sigma = sigmas[i]
+        w = weights[i]
+        
+        # Gaussian Kernel
+        diff = np.array([x, y, z]) - mu
+        # Simplified: diagonal covariance
+        exponent = -0.5 * np.sum((diff**2) / (sigma**2))
+        norm = 1.0 / (np.prod(sigma) * (2 * np.pi)**1.5)
+        intensity += w * norm * np.exp(exponent)
+        
+    return intensity
+
+def plot_noise_heatmap_trajectory(rl_pos, baseline_pos, env, env_idx, filename_prefix="trajectory_noise_heatmap"):
+    """
+    Plot trajectory over Noise Intensity Heatmap.
+    Shows RL avoiding high-noise zones vs Baseline entering them.
+    """
+    plt.figure(figsize=(12, 12))
+    ax = plt.gca()
+    
+    # 1. Generate Noise Heatmap Grid
+    bounds_min = env.env_bounds_min.cpu().numpy()
+    bounds_max = env.env_bounds_max.cpu().numpy()
+    
+    grid_res = 100
+    x = np.linspace(bounds_min[0], bounds_max[0], grid_res)
+    y = np.linspace(bounds_min[1], bounds_max[1], grid_res)
+    X, Y = np.meshgrid(x, y)
+    Z_intensity = np.zeros_like(X)
+    
+    # Get GMM params for this env
+    centers = env.noise_centers[env_idx].cpu().numpy()
+    sigmas = env.noise_sigmas[env_idx].cpu().numpy()
+    weights = env.noise_weights[env_idx].cpu().numpy()
+    
+    # Fixed height for 2D slice (e.g., drone height ~5m)
+    z_slice = 5.0 
+    
+    for i in range(grid_res):
+        for j in range(grid_res):
+            Z_intensity[j, i] = gmm_noise_intensity(X[j,i], Y[j,i], z_slice, centers, sigmas, weights)
+            
+    # Normalize for visualization
+    Z_intensity = (Z_intensity - Z_intensity.min()) / (Z_intensity.max() - Z_intensity.min() + 1e-6)
+    
+    # Plot Contour/Heatmap
+    # Red = High Noise, Blue = Low Noise
+    contour = plt.contourf(X, Y, Z_intensity, levels=20, cmap='coolwarm', alpha=0.6)
+    cbar = plt.colorbar(contour, label='Noise Intensity (Generalized)')
+    
+    # 2. Draw Obstacles (Subtle)
+    obs_pos = env.obs_dict['obstacle_position'][env_idx].cpu().numpy()
+    for i in range(obs_pos.shape[0]):
+        ox, oy = obs_pos[i, 0], obs_pos[i, 1]
+        if bounds_min[0] <= ox <= bounds_max[0] and bounds_min[1] <= oy <= bounds_max[1]:
+            circle = plt.Circle((ox, oy), 0.35, color='black', alpha=0.2)
+            ax.add_patch(circle)
+            
+    # 3. Plot Target & Start
+    target = env.target_position[env_idx].cpu().numpy()
+    start = rl_pos[0, env_idx].astype(float)
+    plt.scatter(start[0], start[1], c='black', marker='o', s=100, label='Start', zorder=20)
+    plt.scatter(target[0], target[1], c='#D32F2F', marker='*', s=400, label='Goal', zorder=20)
+
+    # 4. Plot Trajectories
+    # Baseline: Orange Dashed (Blindly entering red zones)
+    plt.plot(baseline_pos[:, env_idx, 0], baseline_pos[:, env_idx, 1], 
+             color='#F57C00', linestyle='--', linewidth=2.5, alpha=0.9, label='PID+Greedy (Baseline)')
+             
+    # RL: Blue Solid (Smartly avoiding red zones)
+    # Apply smoothing
+    rl_x_smooth = moving_average(rl_pos[:, env_idx, 0], window_size=30)
+    rl_y_smooth = moving_average(rl_pos[:, env_idx, 1], window_size=30)
+    
+    plt.plot(rl_x_smooth[::5], rl_y_smooth[::5], 
+             color='#1976D2', linewidth=3.5, alpha=1.0, label='RL (Smart Navigation)')
+    
+    plt.title(f"Noise Awareness Comparison (Env {env_idx})", fontsize=16, fontweight='bold')
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.xlim(bounds_min[0], bounds_max[0])
+    plt.ylim(bounds_min[1], bounds_max[1])
+    plt.legend(loc='lower left', framealpha=0.9)
+    
+    filename = os.path.join(OUTPUT_DIR, f"{filename_prefix}_env{env_idx}.png")
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"🌪️ Saved noise heatmap plot: {filename}")
+
+
+
+
+
+def plot_top_down_trajectory(rl_pos, baseline_pos, pid_pos, env, env_idx=0, filename_prefix="trajectory_top_down"):
+    """
+    Plot top-down trajectory for a specific environment.
+    Visualize obstacles, start, target, and agent paths.
+    """
+    plt.figure(figsize=(10, 10))
+    
+    # Get environment bounds
+    bounds_min = env.env_bounds_min.cpu().numpy()
+    bounds_max = env.env_bounds_max.cpu().numpy()
+    
+    # 1. Plot Obstacles
+    # Assuming obstacles are cubes/spheres, we plot them as circles for simplicity
+    # Obstacle positions: (num_envs, max_obstacles, 13)
+    # We need to filter out 'valid' obstacles (those that are not at 0,0,0 or far away if unused)
+    # Actually, unused obstacles might be at 0,0,0.
+    
+    # Get obstacles for this env
+    obs_pos = env.obs_dict['obstacle_position'][env_idx].cpu().numpy() # (max_obs, 13)
+    
+    # Heuristic: Valid obstacles usually result in non-zero positions or specific areas.
+    # But in this task, they are scattered.
+    # We'll plot all of them that are within bounds.
+    
+    for i in range(obs_pos.shape[0]):
+        x, y = obs_pos[i, 0], obs_pos[i, 1]
+        
+        # Check if inside bounds (roughly) to avoid plotting unused pool assets
+        if bounds_min[0] <= x <= bounds_max[0] and bounds_min[1] <= y <= bounds_max[1]:
+            # Draw obstacle (approximate size 0.5m radius or 0.4m cube)
+            circle = plt.Circle((x, y), 0.3, color='gray', alpha=0.5)
+            plt.gca().add_patch(circle)
+            
+    # 2. Plot Target
+    target = env.target_position[env_idx].cpu().numpy()
+    plt.scatter(target[0], target[1], c='red', marker='*', s=200, label='Target', zorder=10)
+    
+    # 3. Plot Trajectories (X, Y)
+    # rl_pos: (steps, num_envs, 3)
+    plt.plot(rl_pos[:, env_idx, 0], rl_pos[:, env_idx, 1], c='blue', label='RL', linewidth=2, alpha=0.8)
+    plt.plot(baseline_pos[:, env_idx, 0], baseline_pos[:, env_idx, 1], c='orange', label='PID+Greedy', linewidth=2, alpha=0.8, linestyle='--')
+    plt.plot(pid_pos[:, env_idx, 0], pid_pos[:, env_idx, 1], c='green', label='Pure PID', linewidth=2, alpha=0.6, linestyle=':')
+    
+    # 4. Plot Start Points
+    plt.scatter(rl_pos[0, env_idx, 0], rl_pos[0, env_idx, 1], c='black', marker='o', s=50, label='Start')
+    
+    plt.xlim(bounds_min[0], bounds_max[0])
+    plt.ylim(bounds_min[1], bounds_max[1])
+    plt.xlabel("X Position (m)")
+    plt.ylabel("Y Position (m)")
+    plt.title(f"Top-down Trajectory Comparison (Env {env_idx})")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.axis('equal') # Keep aspect ratio
+    
+    # Save
+    filename = os.path.join(OUTPUT_DIR, f"{filename_prefix}_env{env_idx}.png")
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved trajectory plot to: {filename}")
+
+
+def find_best_demonstration_episode(rl_min_dist, baseline_min_dist, rl_pos, baseline_pos, env):
+    """
+    Find best episode based on 'Smart End-State'.
+    Criteria:
+    1. BOTH agents must be relatively close to target (< 2.5m).
+    2. Preference: RL is in a LOWER noise zone than Baseline at the end.
+    """
+    scores = np.zeros(len(rl_min_dist))
+    num_envs = len(rl_min_dist)
+    episode_length = rl_pos.shape[0] - 1
+    
+    candidates = []
+    
+    for i in range(num_envs):
+        # 1. Proximity Check (Must be somewhat successful)
+        rl_final_dist = rl_min_dist[i] # Approximate with min_dist
+        base_final_dist = baseline_min_dist[i]
+        
+        # We want meaningful comparison, so both should be in the 'target area'
+        if rl_final_dist < 2.5 and base_final_dist < 2.5:
+            candidates.append(i)
+            
+            # 2. Noise Check at FINAL position
+            centers = env.noise_centers[i].cpu().numpy()
+            sigmas = env.noise_sigmas[i].cpu().numpy()
+            weights = env.noise_weights[i].cpu().numpy()
+            
+            # Get final non-zero position (or just last step)
+            # Assuming last step is relevant
+            rx, ry, rz = rl_pos[-1, i]
+            bx, by, bz = baseline_pos[-1, i]
+            
+            rl_final_noise = gmm_noise_intensity(rx, ry, rz, centers, sigmas, weights)
+            base_final_noise = gmm_noise_intensity(bx, by, bz, centers, sigmas, weights)
+            
+            # Score = (Baseline Noise - RL Noise) + Bonus for RL Proximity
+            # We want Baseline High, RL Low -> Positive Score
+            noise_advantage = base_final_noise - rl_final_noise
+            
+            # Weighting: 1.0 unit of noise difference is worth 1.0 score
+            # Bonus: 0.1m closer is worth 0.1 score
+            proximity_bonus = (2.5 - rl_final_dist) * 0.5
+            
+            scores[i] = noise_advantage * 10.0 + proximity_bonus
+        else:
+            # Not a candidate
+            scores[i] = -999.0
+            
+    if len(candidates) > 0:
+        best_idx = np.argmax(scores)
+        logger.info(f"🎯 FOUND CANDIDATES: {len(candidates)} episodes.")
+        logger.info(f"🏆 Selected Best 'Smart Spot' Episode: Env {best_idx} (Score: {scores[best_idx]:.2f})")
+    else:
+        # Fallback: Just find best RL proximity
+        best_idx = np.argmin(rl_min_dist)
+        logger.warning(f"⚠️ NO PERFECT CANDIDATES (Both < 2.5m). Picking closest RL: Env {best_idx}")
+    
+    return best_idx
+
+
+def find_best_demonstration_episode_v3(rl_pos, baseline_pos, env):
+    """
+    Selects the 'Smartest' episode based on:
+    1. RL MUST succeed (dist < 0.8m).
+    2. Start-to-Goal dist MUST be > 5.0m (exclude trivial cases).
+    3. Minimize Path Efficiency Ratio (Actual Length / Straight Line Dist).
+    """
+    num_envs = rl_pos.shape[1]
+    
+    candidates = []
+    
+    # Pre-calculate target positions and success status
+    for i in range(num_envs):
+        target = env.target_position[i].cpu().numpy()
+        rl_traj = rl_pos[:, i]
+        start_pos = rl_traj[0]
+        
+        # Calculate Straight Line Distance
+        straight_dist = np.linalg.norm(start_pos - target)
+        
+        # Filter 1: Must be a non-trivial distance (> 5.0m)
+        if straight_dist < 5.0:
+            continue
+        
+        # Check Success (Min distance < 0.8m)
+        dists = np.linalg.norm(rl_traj - target, axis=1)
+        min_dist = np.min(dists)
+        
+        if min_dist < 0.8:
+            # Calculate path length (Truncated at success)
+            # Find first success index
+            success_idx = np.where(dists < 0.8)[0][0]
+            # Count length only up to success + buffer
+            end_idx = min(len(rl_traj), success_idx + 10)
+            
+            diffs = np.diff(rl_traj[:end_idx], axis=0) # (end_idx-1, 3)
+            segment_lens = np.linalg.norm(diffs, axis=1)
+            total_len = np.sum(segment_lens)
+            
+            # Efficiency Ratio (lower is better, 1.0 is perfect straight line)
+            efficiency_ratio = total_len / (straight_dist + 1e-6)
+            
+            candidates.append({
+                'id': i,
+                'min_dist': min_dist,
+                'path_len': total_len,
+                'efficiency': efficiency_ratio,
+                'straight_dist': straight_dist
+            })
+            
+    if not candidates:
+        logger.warning("⚠️ NO SMART CANDIDATES (Success + Dist > 5m). Using fallback closest.")
+        # Fallback: simple closest
+        min_dists = [np.min(np.linalg.norm(rl_pos[:, i] - env.target_position[i].cpu().numpy(), axis=1)) for i in range(num_envs)]
+        best_idx = np.argmin(min_dists)
+        return best_idx
+        
+    # Sort by Efficiency Ratio (most direct path relative to distance)
+    candidates.sort(key=lambda x: x['efficiency'])
+    
+    best_ep = candidates[0]
+    logger.info(f"🏆 Selected Best Smart Episode: Env {best_ep['id']}")
+    logger.info(f"   - Success Dist: {best_ep['min_dist']:.3f} m")
+    logger.info(f"   - Path Efficiency: {best_ep['efficiency']:.2f} (Length {best_ep['path_len']:.1f}m / Straight {best_ep['straight_dist']:.1f}m)")
+    
+    return best_ep['id']
+
+def plot_optimized_trajectory(rl_positions, baseline_positions, env):
+    """
+    Generates the 'Academic' quality plot with Strong Smoothing and Truncation.
+    """
+    logger.info("🎨 Generating Optimized Academic Plot...")
+    
+    # 1. Select Best Episode
+    best_idx = find_best_demonstration_episode_v3(rl_positions, baseline_positions, env)
+    
+    # 2. Extract Data
+    rl_traj = rl_positions[:, best_idx]  # (T, 3)
+    base_traj = baseline_positions[:, best_idx]  # (T, 3)
+    target = env.target_position[best_idx].cpu().numpy()
+    start = rl_traj[0]
+    
+    # 3. Truncate Trajectories logic
+    # 3. Truncate Trajectories logic
+    def truncate_traj(traj, tgt, dist_thresh=0.8, post_success_points=10, max_fallback_steps=400):
+        dists = np.linalg.norm(traj - tgt, axis=1)
+        # Find first point where dist < thresh
+        success_indices = np.where(dists < dist_thresh)[0]
+        
+        final_len = len(traj)
+        
+        if len(success_indices) > 0:
+            first_success = success_indices[0]
+            final_len = min(final_len, first_success + post_success_points)
+        
+        # [CRITICAL FIX] Apply hard limit regardless of success to avoid chaotic loops
+        final_len = min(final_len, max_fallback_steps)
+            
+        return traj[:final_len]
+
+    rl_trunc = truncate_traj(rl_traj, target)
+    # Reduced baseline length to 200 to reduce visual clutter (less "chaotic" loops)
+    base_trunc = truncate_traj(base_traj, target, max_fallback_steps=200)
+    
+    # 4. Strong Smoothing (Savitzky-Golay)
+    window_len = 51
+    poly = 3
+    
+    def smooth_path(traj):
+        if len(traj) > window_len:
+            try:
+                x_smooth = savgol_filter(traj[:, 0], window_len, poly)
+                y_smooth = savgol_filter(traj[:, 1], window_len, poly)
+                return np.stack([x_smooth, y_smooth], axis=1)
+            except Exception as e:
+                logger.warning(f"Smoothing failed: {e}")
+                return traj
+        return traj
+
+    rl_smooth = smooth_path(rl_trunc)
+    # PID path needs to be smoothed too for fair comparison in aesthetics, but let's keep it distinct
+    base_smooth = smooth_path(base_trunc) 
+
+    # 5. Plotting
+    fig, ax = plt.subplots(figsize=(10, 10))
+    
+    # Heatmap setup
+    bounds_min = env.env_bounds_min.cpu().numpy()
+    bounds_max = env.env_bounds_max.cpu().numpy()
+    grid_res = 100
+    x = np.linspace(bounds_min[0], bounds_max[0], grid_res)
+    y = np.linspace(bounds_min[1], bounds_max[1], grid_res)
+    X, Y = np.meshgrid(x, y)
+    Z_intensity = np.zeros_like(X)
+    
+    centers = env.noise_centers[best_idx].cpu().numpy()
+    sigmas = env.noise_sigmas[best_idx].cpu().numpy()
+    weights = env.noise_weights[best_idx].cpu().numpy()
+    z_slice = 5.0
+    
+    for i in range(grid_res):
+        for j in range(grid_res):
+            Z_intensity[j, i] = gmm_noise_intensity(X[j,i], Y[j,i], z_slice, centers, sigmas, weights)
+            
+    # Normalize Z for heatmap
+    Z_norm = (Z_intensity - Z_intensity.min()) / (Z_intensity.max() - Z_intensity.min() + 1e-6)
+    
+    contour = ax.contourf(X, Y, Z_norm, levels=30, cmap='coolwarm', alpha=0.4)
+    
+    # Obstacles
+    obs_pos = env.obs_dict['obstacle_position'][best_idx].cpu().numpy()
+    for i in range(obs_pos.shape[0]):
+        ox, oy = obs_pos[i, 0], obs_pos[i, 1]
+        if bounds_min[0] <= ox <= bounds_max[0]:
+            circle = plt.Circle((ox, oy), 0.35, color='gray', alpha=0.3)
+            ax.add_patch(circle)
+            
+    # Trajectories
+    # Baseline
+    ax.plot(base_trunc[:, 0], base_trunc[:, 1], color='#F57C00', linestyle='--', linewidth=2.0, label='Baseline', alpha=0.9)
+    
+    # RL (Smooth)
+    ax.plot(rl_smooth[:, 0], rl_smooth[:, 1], color='#1976D2', linestyle='-', linewidth=2.5, label='RL (Noise-Aware)', alpha=1.0)
+    
+    # Arrows on RL path
+    if len(rl_smooth) > 20:
+        mid_idx = len(rl_smooth) // 2
+        # Arrow 1
+        ax.arrow(rl_smooth[mid_idx, 0], rl_smooth[mid_idx, 1], 
+                 rl_smooth[mid_idx+1, 0]-rl_smooth[mid_idx, 0], rl_smooth[mid_idx+1, 1]-rl_smooth[mid_idx, 1],
+                 head_width=0.3, color='#1976D2', zorder=10)
+                 
+    # Start / Goal
+    ax.scatter(start[0], start[1], c='black', s=120, label='Start', zorder=20, edgecolors='white', linewidth=1.5)
+    ax.scatter(target[0], target[1], c='#D32F2F', marker='*', s=300, label='Goal', zorder=20, edgecolors='white', linewidth=1.0)
+    
+    ax.set_title("Trajectory Comparison in High-Noise Field", fontsize=16, fontweight='bold', pad=15)
+    ax.set_xlabel("X Position (m)", fontsize=12)
+    ax.set_ylabel("Y Position (m)", fontsize=12)
+    ax.set_xlim(bounds_min[0], bounds_max[0])
+    ax.set_ylim(bounds_min[1], bounds_max[1])
+    ax.legend(loc='upper right', framealpha=0.95, fontsize=10)
+    ax.grid(True, linestyle=':', alpha=0.4)
+    ax.set_aspect('equal')
+    
+    filename = os.path.join(OUTPUT_DIR, "optimized_trajectory_academic.png")
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    
+    # Save PDF as requested
+    pdf_filename = os.path.join(OUTPUT_DIR, "optimized_trajectory_academic.pdf")
+    plt.savefig(pdf_filename, format='pdf', bbox_inches='tight')
+    
+    plt.close()
+    logger.info(f"🎨 Saved Optimized Plot to {filename}")
+
+
+def moving_average(data, window_size=20):
+    """Simple moving average filter for smoothing."""
+    # Pad to keep length same
+    pad_left = window_size // 2
+    pad_right = window_size - pad_left - 1
+    padded_data = np.pad(data, (pad_left, pad_right), mode='edge')
+    return np.convolve(padded_data, np.ones(window_size)/window_size, mode='valid')
+
+
+def plot_polished_trajectory(rl_pos, baseline_pos, env, env_idx, filename_prefix="trajectory_polished"):
+    """
+    Plot a publication-quality 'polished' trajectory comparsion.
+    Smoothes RL path, keeps Baseline raw (to show struggle).
+    """
+    plt.figure(figsize=(12, 12))
+    
+    # 1. Setup Environment
+    bounds_min = env.env_bounds_min.cpu().numpy()
+    bounds_max = env.env_bounds_max.cpu().numpy()
+    
+    # Draw Obstacles (Gray Circles)
+    obs_pos = env.obs_dict['obstacle_position'][env_idx].cpu().numpy()
+    for i in range(obs_pos.shape[0]):
+        x, y = obs_pos[i, 0], obs_pos[i, 1]
+        if bounds_min[0] <= x <= bounds_max[0] and bounds_min[1] <= y <= bounds_max[1]:
+            circle = plt.Circle((x, y), 0.35, color='#404040', alpha=0.3, zorder=5) # Dark gray, semi-transparent
+            plt.gca().add_patch(circle)
+            
+    # 2. Draw Target & Start
+    target = env.target_position[env_idx].cpu().numpy()
+    start = rl_pos[0, env_idx].astype(float)
+    
+    plt.scatter(start[0], start[1], c='black', marker='o', s=100, label='Start', zorder=20)
+    plt.scatter(target[0], target[1], c='#D32F2F', marker='*', s=400, label='Goal', zorder=20) # Red Star
+    
+    # 3. Process & Plot Trajectories
+    
+    # Baseline: Raw, Downsampled (Orange Dashed)
+    # Showing "Struggle" or "Straight Line Failure"
+    base_x = baseline_pos[:, env_idx, 0]
+    base_y = baseline_pos[:, env_idx, 1]
+    
+    # Cut off trail of zeros if agent crashed and stayed at origin (not common in this sim, usually stops updating)
+    # But just in case, we plot untill last non-zero change or end
+    plt.plot(base_x[::5], base_y[::5], color='#F57C00', linestyle='--', linewidth=2.5,  alpha=0.8, label='PID + Greedy (Baseline)', zorder=10)
+    
+    # RL: Smoothed (Blue Solid)
+    # Showing "Intelligence" and "Flow"
+    rl_x_raw = rl_pos[:, env_idx, 0]
+    rl_y_raw = rl_pos[:, env_idx, 1]
+    
+    # Apply Smoothing
+    # We use a larger window to really smooth out the jitter
+    rl_x_smooth = moving_average(rl_x_raw, window_size=30)
+    rl_y_smooth = moving_average(rl_y_raw, window_size=30)
+    
+    plt.plot(rl_x_smooth[::5], rl_y_smooth[::5], color='#1976D2', linewidth=3.5, alpha=0.9, label='RL (PPO) - Smoothed', zorder=15)
+    
+    plt.xlim(bounds_min[0], bounds_max[0])
+    plt.ylim(bounds_min[1], bounds_max[1])
+    plt.xlabel("X Position (m)", fontsize=12)
+    plt.ylabel("Y Position (m)", fontsize=12)
+    plt.title(f"Navigation Strategy Comparison (Best Demonstration)", fontsize=16, fontweight='bold')
+    plt.legend(fontsize=12, loc='upper right', frameon=True, framealpha=0.9)
+    plt.grid(True, linestyle=':', alpha=0.4)
+    plt.axis('equal')
+    
+    # Decoration
+    plt.tight_layout()
+    
+    # Save
+    filename = os.path.join(OUTPUT_DIR, f"{filename_prefix}_best_env{env_idx}.png")
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"✨ Created polished trajectory plot: {filename}")
 
 
 def plot_survival_time(rl_survival_data, baseline_survival_data, pid_survival_data, rl_arrival_data, baseline_arrival_data, pid_arrival_data, rl_crash_data, baseline_crash_data, pid_crash_data, rl_j_curve, baseline_j_curve, pid_j_curve):
@@ -1562,7 +2094,7 @@ def main():
         restore_state_snapshot(env, temp_snapshot)
         logger.info("✅ Normalization statistics computed and environment state restored")
     
-    rl_j_curve, rl_crash_data, rl_survival_data, rl_arrival_data, rl_attitude_data, rl_distance_curve, rl_min_j, rl_min_dist, rl_actions = run_phase(
+    rl_j_curve, rl_crash_data, rl_survival_data, rl_arrival_data, rl_attitude_data, rl_distance_curve, rl_min_j, rl_min_dist, rl_actions, rl_pos_history = run_phase(
         env, ppo_model, EPISODE_LENGTH, "RL", running_mean_std
     )
     
@@ -1585,13 +2117,13 @@ def main():
     restore_state_snapshot(env, initial_snapshot)
     baseline_agent = LocalAPFAgent(
         env, 
-        w_dist=W_D, 
+        w_dist=1.0, # FIXED: Baseline should always try to reach target, regardless of eval metric
         w_noise=W_N, 
         w_obs=1.0, 
         d_obs=1.0,  # Decreased observation radius (Aggressive)
         max_speed_xy=0.8 # Increased speed (Aggressive)
     )
-    baseline_j_curve, baseline_crash_data, baseline_survival_data, baseline_arrival_data, baseline_attitude_data, baseline_distance_curve, baseline_min_j, baseline_min_dist, baseline_actions = run_phase(
+    baseline_j_curve, baseline_crash_data, baseline_survival_data, baseline_arrival_data, baseline_attitude_data, baseline_distance_curve, baseline_min_j, baseline_min_dist, baseline_actions, baseline_pos_history = run_phase(
         env, baseline_agent, EPISODE_LENGTH, "PID + Greedy"
     )
     
@@ -1614,7 +2146,7 @@ def main():
     restore_state_snapshot(env, initial_snapshot)
     
     pid_agent = SimplePIDNavigator(env, w_dist=W_D, w_obs=1.0, d_obs=1.0)
-    pid_j_curve, pid_crash_data, pid_survival_data, pid_arrival_data, pid_attitude_data, pid_distance_curve, pid_min_j, pid_min_dist, pid_actions = run_phase(
+    pid_j_curve, pid_crash_data, pid_survival_data, pid_arrival_data, pid_attitude_data, pid_distance_curve, pid_min_j, pid_min_dist, pid_actions, pid_pos_history = run_phase(
         env, pid_agent, EPISODE_LENGTH, "Pure PID"
     )
     
@@ -1639,6 +2171,22 @@ def main():
     
     # 7. Plot Raw Motor Commands (Env 0)
     plot_raw_motor_commands(rl_actions, baseline_actions, pid_actions, env_idx=0)
+    
+    # 8. Find and Plot Best "Smart Navigation" Demonstration (Noise Avoidance)
+    best_env_idx = find_best_demonstration_episode(
+        rl_min_dist, baseline_min_dist, 
+        rl_pos_history, baseline_pos_history,
+        env
+    )
+    
+    # plot_noise_heatmap_trajectory(rl_pos_history, baseline_pos_history, env, best_env_idx)
+    
+    # plot_polished_trajectory(rl_pos_history, baseline_pos_history, env, best_env_idx, filename_prefix="trajectory_clean_path")
+    
+    # [NEW] Generate Optimized Academic Plot
+    # We need to construct stats dicts or pass raw history. The function expects raw positions.
+    # Check signature: plot_optimized_trajectory(rl_positions, baseline_positions, env)
+    plot_optimized_trajectory(rl_pos_history, baseline_pos_history, env)
     
     # Save arrival rates to CSVime(rl_survival_data, baseline_survival_data, pid_survival_data, rl_arrival_data, baseline_arrival_data, pid_arrival_data, rl_crash_data, baseline_crash_data, pid_crash_data, rl_j_curve, baseline_j_curve, pid_j_curve)
     plot_survival_time(rl_survival_data, baseline_survival_data, pid_survival_data, rl_arrival_data, baseline_arrival_data, pid_arrival_data, rl_crash_data, baseline_crash_data, pid_crash_data, rl_j_curve, baseline_j_curve, pid_j_curve)

@@ -77,7 +77,7 @@ class task_config:
     env_bounds_max = [10.0, 10.0, 10.0]
 
     # fixed number of obstacles to keep in the environment (excluding keep_in_env assets)
-    num_obstacles_in_env = 30
+    num_obstacles_in_env = 15
     target_min_ratio = [0.2, 0.2, 0.3]  # Z updated to 3.0m (0.3)
     target_max_ratio = [0.8, 0.8, 0.7]  # Z updated to 7.0m (0.7)
 
@@ -85,13 +85,13 @@ class task_config:
         # Unified Cost Function Reward (J_prev - J_t) with Tanh Smoothing ⭐
         "potential_kj": 1.0,  # [UPDATED] 3.0 -> 1.0
         "potential_sj": 0.1,               # Sensitivity scale (s_J), small change normalization
-        "potential_w_d": 1.0,              # Weight for distance cost (w_d)
+        "potential_w_d": 0.1,              # Weight for distance cost (w_d)
         "potential_w_n": 1.0,              # Weight for noise cost (w_n) - matches training
-        "potential_d0": 2.5,               # Reference distance (d0) for normalization [UPDATED] 2.0 -> 2.5
+        "potential_d0": 3.0,               # Reference distance (d0) for normalization [UPDATED] 2.0 -> 2.5
         "n_min_max_sample_size": 1000,     # Number of samples to estimate noise range on reset
         
         # Terminal Mission Reward (NEW) ⭐
-        "terminal_reward": 0.0,            # Reward for arriving within 2.0m at end of episode (disabled)
+        "terminal_reward": 50.0,           # Added terminal success reward            # Reward for arriving within 2.0m at end of episode (disabled)
         
         # Direction alignment reward (DISABLED) ⭐
         "direction_alignment_reward_magnitude": 0.1,  # ENABLED (0.5)
@@ -107,9 +107,9 @@ class task_config:
         
         # Hover Reward (Continuous Gating Functions) ⭐
         "hover_reward_kh": 1.0,                     # k_h (hover reward weight coefficient) [UPDATED] 10.0 -> 3.0
-        "hover_reward_dh": 2.0,                     # d_h (distance threshold for hover, meters)
+        "hover_reward_dh": 3.0,                     # d_h (distance threshold for hover, meters)
         "hover_reward_vh": 0.2,                     # v_h (velocity threshold for hover, m/s)
-        "hover_reward_jh": 1.0,                     # J_h (potential quality threshold for hover) [UPDATED] 1.0 -> 2.0
+        "hover_reward_jh": 0.8,                     # J_h (potential quality threshold for hover) [UPDATED] 1.0 -> 2.0
         "hover_reward_alpha_j": 1.5,                # alpha_J (Scaling factor for J gating), scaling sensitivity of quality check
 
         # Anchoring Reward (DISABLED)
@@ -174,8 +174,8 @@ class task_config:
 
     class success_config:
         """Success condition configuration (Scheme B)"""
-        success_reward = 0.0         # Terminal Reward when Scheme B success triggers (disabled)
-        success_radius = 2.0          # Target zone radius (m)
+        success_reward = 50.0         # Terminal Reward when Scheme B success triggers (disabled)
+        success_radius = 3.0          # Target zone radius (m)
         
         # Stability criteria
         stability_velocity_threshold = 0.35  # v_hold (m/s)

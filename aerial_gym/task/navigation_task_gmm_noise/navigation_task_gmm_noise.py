@@ -1996,7 +1996,7 @@ class NavigationTaskGmmNoise(BaseTask):
                     reason = "crash" if is_crash else "timeout"
                     logger.info(f"EVAL mode: {reason} detected, exiting.")
                     print("done")
-                    sys.exit(0)
+                    # sys.exit(0)  <-- DISABLED to allow comparison script to continue
         
         if len(reset_envs) > 0:
             self.reset_idx(reset_envs)
