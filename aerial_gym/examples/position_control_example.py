@@ -11,10 +11,10 @@ if __name__ == "__main__":
     env_manager = SimBuilder().build_env(
         sim_name="base_sim",
         env_name="empty_env",
-        # robot_name="lmf1",
-        # controller_name="lee_position_control",
+        # robot_name="base_quadrotor",
         robot_name="lmf2",
-        controller_name="lmf2_position_control",
+        # controller_name="lee_attitude_control",
+        controller_name = "lmf2_velocity_control",  # 使用速度控制器来模拟RL训练环境
         args=None,
         device="cuda:0",
         num_envs=args.num_envs,
@@ -23,10 +23,17 @@ if __name__ == "__main__":
     )
     actions = torch.zeros((env_manager.num_envs, 4)).to("cuda:0")
     env_manager.reset()
+    # RL action_transformation_function 的实际输出范围:
+    # vx, vy: max ±0.8 m/s, vz: max ±0.5 m/s, yaw_rate: max ±π/6 rad/s
+    max_speed_xy = 0.8
+    max_speed_z = 0.5
+    max_yaw_rate = torch.pi / 6
     for i in range(10000):
         if i % 1000 == 0:
             logger.info(f"Step {i}, changing target setpoint.")
-            # actions[:, 0:3] = 2.0 * (torch.rand_like(actions[:, 0:3]) * 2 - 1)
-            # actions[:, 3] = torch.pi * (torch.rand_like(actions[:, 3]) * 2 - 1)
+            # 只在RL实际使用的速度范围内随机给定速度指令
+            actions[:, 0:2] = max_speed_xy * (torch.rand_like(actions[:, 0:2]) * 2 - 1)
+            actions[:, 2] = max_speed_z * (torch.rand_like(actions[:, 2]) * 2 - 1)
+            actions[:, 3] = max_yaw_rate * (torch.rand_like(actions[:, 3]) * 2 - 1)
             env_manager.reset()
         env_manager.step(actions=actions)

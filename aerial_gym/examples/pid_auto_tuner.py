@@ -19,9 +19,6 @@ import time
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
-import torch
-import numpy as np
-
 try:
     import optuna
     from optuna.samplers import TPESampler
@@ -34,6 +31,9 @@ except ImportError:
 
 from aerial_gym.registry.task_registry import task_registry
 from aerial_gym.utils.logging import CustomLogger
+
+import torch
+import numpy as np
 
 logger = CustomLogger("pid_auto_tuner")
 

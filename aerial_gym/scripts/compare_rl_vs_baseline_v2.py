@@ -981,7 +981,7 @@ def plot_attitude_stability(rl_attitude, baseline_attitude, pid_attitude, metric
             color=rl_color,
             linewidth=2.0,
             linestyle='-',
-            label="PPO",
+            label="PPO", # Unconditional label
         )
         # Baseline -> PID+Greedy (Red, Solid - kept dashed? No, user said solid for others is fine)
         # User said: "其他两根实线的样式都不用变" -> Baseline was previously dashed in some plots but solid in others?
@@ -1172,7 +1172,7 @@ def plot_fair_min_metrics_distribution(rl_min_j, baseline_min_j, pid_min_j, rl_m
     
     # Define colors
     colors = ['blue', 'orange', 'green']
-    labels = ['RL', 'PID+Greedy', 'Pure PID']
+    labels = ['PPO', 'PID+Greedy', 'Pure PID']
     
     def plot_sorted_performance_curve(ax, data_list, colors, labels, title, ylabel):
         """Plots sorted performance curves (Cactus Plots)"""
@@ -1822,7 +1822,7 @@ def plot_optimized_trajectory(rl_positions, baseline_positions, env):
     ax.plot(base_trunc[:, 0], base_trunc[:, 1], color='#F57C00', linestyle='--', linewidth=2.0, label='Baseline', alpha=0.9)
     
     # RL (Smooth)
-    ax.plot(rl_smooth[:, 0], rl_smooth[:, 1], color='#1976D2', linestyle='-', linewidth=2.5, label='RL (Noise-Aware)', alpha=1.0)
+    ax.plot(rl_smooth[:, 0], rl_smooth[:, 1], color='#1976D2', linestyle='-', linewidth=2.5, label='DRL', alpha=1.0)
     
     # Arrows on RL path
     if len(rl_smooth) > 20:

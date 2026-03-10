@@ -859,7 +859,6 @@ class NavigationTaskGmmNoise(BaseTask):
         
         # ==== Action Smoothness Penalties (Action-based) ⭐ ====
         # 1. Action Magnitude Penalty (Energy/Effort): -k_a * ||u_t||^2
-        # self.actions are already normalized (usually -1 to 1)
         k_a = self.reward_params["action_magnitude_penalty_weight"]
         action_norm_sq = torch.sum(self.actions.pow(2), dim=1)
         action_magnitude_penalty = -k_a * action_norm_sq
@@ -872,90 +871,11 @@ class NavigationTaskGmmNoise(BaseTask):
         # Combined smoothness penalty
         action_smoothness_penalty = action_magnitude_penalty + action_change_penalty
         
-        # ==== Safety Reward (Penalty Log-Barrier) (NEW) ⭐⭐ ====
-        # Based on depth map for obstacle avoidance
-        depth_pixels = self.obs_dict["depth_range_pixels"].squeeze(1)  # (num_envs, H, W)
-        
-        # 1. Handle Invalid/Zero Depth -> Max Range
-        # Assumption: 0 means invalid/too far. Using 10.0m as default max range for this env.
-        max_range = 10.0
-        depth_pixels = torch.where(depth_pixels <= 0.0, torch.tensor(max_range, device=self.device), depth_pixels)
-        
-        # Denormalize depth (pixels are 0-1, need meters)
-        # Assumes sensor config has normalize_range=True (default)
-        distances = depth_pixels.view(self.sim_env.num_envs, -1) * max_range
-        
-        # 2. Penalty Log-Barrier: R = k * min(log(d_min) - log(threshold), 0)
-        # Closest obstacle dominates (use minimum distance).
-        threshold = self.reward_params.get("safety_dist_threshold", torch.tensor(1.0, device=self.device))
-        
-        # Clamp minimal distance for stability in log calculation
-        d_min = distances.min(dim=1).values
-        d_min = torch.clamp(d_min, min=self.reward_params["min_safe_distance_clamp"])
-        
-        log_dist = torch.log(d_min)
-        log_threshold = torch.log(threshold)
-        
-        # Penalize only when closest distance is below threshold
-        penalty = torch.clamp(log_dist - log_threshold, max=0.0)
-        safety_reward = self.reward_params["safety_reward_magnitude"] * penalty
-        
-        # ==== Hover Reward (g_J * g_v, no distance gate) ====
-        # g_J(J) = exp(-(J/J_h)^2), g_v(v) = exp(-(v/v_h)^2)
-        # R_hover = k_h * g_J * g_v
-        J_h = torch.clamp(self.reward_params["hover_reward_jh"], min=1e-6)
-        v_h = torch.clamp(self.reward_params["hover_reward_vh"], min=1e-6)
-        k_h = self.reward_params["hover_reward_kh"]
-
-        # Terminal hover tracking (keep for terminal bonus)
-        rho_good = torch.minimum(J_h - J_t, v_h - linvel_magnitude)
-        if not hasattr(self, "hover_good_min"):
-            self.hover_good_min = torch.full(
-                (self.sim_env.num_envs,), float("inf"), device=self.device
-            )
-            self.hover_good_max = torch.full(
-                (self.sim_env.num_envs,), -float("inf"), device=self.device
-            )
-        self.hover_good_min = torch.minimum(self.hover_good_min, rho_good)
-        self.hover_good_max = torch.maximum(self.hover_good_max, self.hover_good_min)
-
-        g_J = torch.exp(-torch.pow(J_t / J_h, 2))
-        g_v = torch.exp(-torch.pow(linvel_magnitude / v_h, 2))
-        hover_reward = k_h * g_J * g_v
-        
-        # ==== Collision Penalty ====
-        collision_penalty = self.reward_params["collision_penalty"]
-        collision_mask = (self.obs_dict["crashes"] > 0).float()
-        collision_reward = collision_penalty * collision_mask
-
-        # ==== Threshold Bonus: DISABLED ====
-        # sigma = 2.0
-        # w_r = 1.0
-        # threshold_reward = w_r * torch.exp(-(J_t ** 2) / (sigma ** 2))
-        threshold_reward = torch.zeros_like(J_t)  # DISABLED
-
-        # ==== Anchoring Reward: DISABLED ====
-        # anchor_k = self.reward_params["anchor_reward_k"]
-        # anchor_sigma = torch.clamp(self.reward_params["anchor_reward_sigma"], min=1e-6)
-        # anchor_threshold = self.reward_params["anchor_quality_threshold"]
-        # J_best_so_far = self.episode_min_J
-        # anchor_active = J_best_so_far < anchor_threshold
-        # anchor_diff = J_t - J_best_so_far
-        # anchor_reward = anchor_k * torch.exp(-torch.pow(anchor_diff / anchor_sigma, 2))
-        # anchor_reward = torch.where(anchor_active, anchor_reward, torch.zeros_like(anchor_reward))
-        anchor_reward = torch.zeros_like(J_t)  # DISABLED
-        
-        # ==== Total Unified Reward (Simplified) ====
+        # ==== Total Reward (Simplified: 4 components only) ====
         reward = (
             improvement_reward           # Unified Potential Reward (J-based)
-            # + noise_reduction_reward    # Removed (is 0.0)
-            + direction_reward          # Heading Alignment Reward (New)
-            + action_smoothness_penalty   # Action-based smoothness (-k_a, -k_da)
-            + safety_reward               # Log-barrier penalty (obstacle avoidance)
-            + hover_reward                # Continuous hover reward
-            # + threshold_reward          # DISABLED
-            # + anchor_reward             # DISABLED
-            + collision_reward            # -30.0
+            + direction_reward           # Heading Alignment Reward
+            + action_smoothness_penalty  # Action-based smoothness (-k_a, -k_da)
         )
         
         # ==== Update Previous State ====
@@ -966,6 +886,10 @@ class NavigationTaskGmmNoise(BaseTask):
         
         # For logging purposes
         noise_intensity = current_noise
+        safety_reward = torch.zeros_like(reward)
+        hover_reward = torch.zeros_like(reward)
+        threshold_reward = torch.zeros_like(reward)
+        anchor_reward = torch.zeros_like(reward)
         
         return (
             reward,

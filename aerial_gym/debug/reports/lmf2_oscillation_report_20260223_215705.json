@@ -1,0 +1,79 @@
+{
+  "timestamp": "2026-02-23T21:57:05",
+  "config": {
+    "num_envs": 8,
+    "device": "cuda:0",
+    "headless": true,
+    "hover_steps": 700,
+    "step_steps": 900
+  },
+  "results": {
+    "isolated_controller": {
+      "hover": {
+        "metrics": {
+          "dt": 0.01,
+          "samples": 15,
+          "early_termination_step": 14,
+          "vel_err_rms_mps": 0.12051081146386439,
+          "vel_err_steady_mean_mps": 0.0,
+          "vel_err_steady_p95_p05_mps": 0.0,
+          "angvel_rms_rps": 0.1275221969449861,
+          "angvel_steady_rms_rps": 0.0,
+          "roll_pitch_rms_deg": 1.1524081103387296,
+          "roll_pitch_steady_rms_deg": 0.0,
+          "roll_pitch_peak_deg": 1.673562633729245,
+          "action_delta_rms": 0.0,
+          "action_saturation_rate": 0.0,
+          "angvel_hf_ratio": 0.0,
+          "angvel_dom_hz": 0.0,
+          "thrust_hf_ratio_mean": 0.0,
+          "thrust_dom_hz_mean": 0.0,
+          "thrust_cv_mean": 0.0
+        },
+        "risk": {
+          "verdict": "WARN",
+          "risk_level": "medium",
+          "failed_checks": [
+            "early_termination"
+          ]
+        }
+      },
+      "step_vx": {
+        "metrics": {
+          "dt": 0.01,
+          "samples": 260,
+          "early_termination_step": 259,
+          "vel_err_rms_mps": 0.08074534011358159,
+          "vel_err_steady_mean_mps": 0.48000001907348633,
+          "vel_err_steady_p95_p05_mps": 0.0,
+          "angvel_rms_rps": 0.06886304563630391,
+          "angvel_steady_rms_rps": 0.0,
+          "roll_pitch_rms_deg": 1.131826729853025,
+          "roll_pitch_steady_rms_deg": 0.0,
+          "roll_pitch_peak_deg": 6.064384511432161,
+          "action_delta_rms": 0.03728218744153297,
+          "action_saturation_rate": 0.0,
+          "angvel_hf_ratio": 0.0,
+          "angvel_dom_hz": 0.0,
+          "thrust_hf_ratio_mean": 0.0,
+          "thrust_dom_hz_mean": 0.0,
+          "thrust_cv_mean": 0.0
+        },
+        "risk": {
+          "verdict": "WARN",
+          "risk_level": "medium",
+          "failed_checks": [
+            "vel_err_steady_mean_mps",
+            "early_termination"
+          ]
+        }
+      }
+    }
+  },
+  "final_judgment": "controller_oscillation_status: caution",
+  "overall_failed_checks": [
+    "isolated_controller.hover.early_termination",
+    "isolated_controller.step_vx.vel_err_steady_mean_mps",
+    "isolated_controller.step_vx.early_termination"
+  ]
+}

@@ -55,6 +55,8 @@ class task_config:
     seed = -1
     sim_name = "base_sim"
     env_name = "env_with_obstacles"
+    # robot_name = "base_quadrotor"
+    # controller_name = "lee_attitude_control"
     robot_name = "lmf2"
     controller_name = "lmf2_velocity_control"
     args = {}
@@ -77,48 +79,25 @@ class task_config:
     env_bounds_max = [10.0, 10.0, 10.0]
 
     # fixed number of obstacles to keep in the environment (excluding keep_in_env assets)
-    num_obstacles_in_env = 15
+    num_obstacles_in_env = 0
     target_min_ratio = [0.2, 0.2, 0.3]  # Z updated to 3.0m (0.3)
     target_max_ratio = [0.8, 0.8, 0.7]  # Z updated to 7.0m (0.7)
 
     reward_parameters = {
         # Unified Cost Function Reward (J_prev - J_t) with Tanh Smoothing ⭐
-        "potential_kj": 1.0,  # [UPDATED] 3.0 -> 1.0
-        "potential_sj": 0.1,               # Sensitivity scale (s_J), small change normalization
+        "potential_kj": 1.0,
+        "potential_sj": 0.1,               # Sensitivity scale (s_J)
         "potential_w_d": 0.1,              # Weight for distance cost (w_d)
-        "potential_w_n": 1.0,              # Weight for noise cost (w_n) - matches training
-        "potential_d0": 3.0,               # Reference distance (d0) for normalization [UPDATED] 2.0 -> 2.5
+        "potential_w_n": 1.0,              # Weight for noise cost (w_n)
+        "potential_d0": 3.0,               # Reference distance (d0) for normalization
         "n_min_max_sample_size": 1000,     # Number of samples to estimate noise range on reset
         
-        # Terminal Mission Reward (NEW) ⭐
-        "terminal_reward": 50.0,           # Added terminal success reward            # Reward for arriving within 2.0m at end of episode (disabled)
-        
-        # Direction alignment reward (DISABLED) ⭐
-        "direction_alignment_reward_magnitude": 0.1,  # ENABLED (0.5)
-        
-        # Safety reward (based on depth map for obstacle avoidance) (NEW) ⭐
-        "safety_reward_magnitude": 1.0,  # Weight for safety reward (Penalty only)
-        "safety_dist_threshold": 0.6,               # Distance threshold for safety penalty (meters) [UPDATED] 0.5 -> 1.0
-        "min_safe_distance_clamp": 0.1,             # Min distance clamp to prevent log(0) (meters)
+        # Direction alignment reward ⭐
+        "direction_alignment_reward_magnitude": 0.1,
         
         # Action Smoothness Penalties (Action-based) ⭐
         "action_magnitude_penalty_weight": 0.05,    # k_a (energy/effort penalty)
         "action_change_penalty_weight": 0.1,        # k_Delta_a (smoothness/jitter penalty)
-        
-        # Hover Reward (Continuous Gating Functions) ⭐
-        "hover_reward_kh": 1.0,                     # k_h (hover reward weight coefficient) [UPDATED] 10.0 -> 3.0
-        "hover_reward_dh": 3.0,                     # d_h (distance threshold for hover, meters)
-        "hover_reward_vh": 0.2,                     # v_h (velocity threshold for hover, m/s)
-        "hover_reward_jh": 0.8,                     # J_h (potential quality threshold for hover) [UPDATED] 1.0 -> 2.0
-        "hover_reward_alpha_j": 1.5,                # alpha_J (Scaling factor for J gating), scaling sensitivity of quality check
-
-        # Anchoring Reward (DISABLED)
-        "anchor_reward_k": 0.0,                     # k_anchor [DISABLED]
-        "anchor_reward_sigma": 0.5,                 # sigma
-        "anchor_quality_threshold": 2.0,            # only anchor when J_best_so_far < threshold
-        
-        # Collision penalty
-        "collision_penalty": -50.0,  # [UPDATED] Reduced from -80.0 to -30.0
     }
 
     class vae_config:

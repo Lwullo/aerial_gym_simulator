@@ -1,14 +1,42 @@
 <?xml version="1.0"?>
 <robot name="quadrotor">
+  <!-- ============================================================
+       LMF2 母机 URDF (修正挂载点位置版)
+       母机: 8kg, X型四臂, 电机位置 ±0.13m (距中心 0.1838m)
+       子机: ×4, 1kg each, 挂载位置距中心 0.13m (计算得 X,Y ≈ ±0.0919)
+  ================================================================ -->
+
+  <!-- 全局材质定义 -->
+  <material name="OliveGreen">
+    <color rgba="0.486 0.604 0.302 1.0"/>
+  </material>
+  <material name="Orange">
+    <color rgba="1.0 0.423 0.03921568627 1.0"/>
+  </material>
+  <material name="Blue">
+    <color rgba="0.0 0.0 1.0 1.0"/>
+  </material>
+  <material name="Purple1">
+    <color rgba="0.4 0.0 0.6 1.0"/>
+  </material>
+  <material name="Purple2">
+    <color rgba="0.6 0.0 0.4 1.0"/>
+  </material>
+  <material name="Gray">
+    <color rgba="0.5 0.5 0.5 1.0"/>
+  </material>
+  <material name="White">
+    <color rgba="1.0 1.0 1.0 1.0"/>
+  </material>
+
+  <!-- ==================== 母机主体 ==================== -->
   <link name="base_link">
     <visual>
       <origin xyz="0 0 0.0"/>
       <geometry>
-        <box size="0.4 0.4 0.025"/>
+        <sphere radius="0.05"/>
       </geometry>
-      <material name="White">
-        <color rgba="1 1 1 1.0"/>
-      </material>
+      <material name="OliveGreen"/>
     </visual>
     <collision>
       <origin xyz="0 0 0"/>
@@ -17,92 +45,335 @@
       </geometry>
     </collision>
     <inertial>
-      <mass value="12.0"/>
+      <mass value="8.0"/>
       <inertia ixx="0.34" ixy="0.0" ixz="0.0" iyy="0.34" iyz="0.0" izz="0.75"/>
     </inertial>
   </link>
+
+  <!-- ==================== 母机机臂 + 电机 ==================== -->
   <link name="front_left_prop">
     <visual>
-      <origin xyz="0 0 0"/>
+      <origin xyz="-0.065 -0.065 0" rpy="0 1.5708 -2.3562"/>
       <geometry>
-        <cylinder radius="0.05" length="0.07"/>
-        <!-- <box size="0.1 0.1 0.07"/> -->
+        <cylinder radius="0.01" length="0.18385"/>
       </geometry>
-      <material name="Orange">
-        <color rgba="1 0.423 0.03921568627 1.0"/>
-      </material>
+      <material name="Orange"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.015" length="0.05"/>
+      </geometry>
+      <material name="Purple1"/>
     </visual>
     <inertial>
       <mass value="0.01"/>
       <inertia ixx="0.000001" ixy="0.0" ixz="0.0" iyy="0.000001" iyz="0.0" izz="0.000001"/>
     </inertial>
   </link>
+
   <link name="front_right_prop">
     <visual>
-      <origin xyz="0 0 0"/>
+      <origin xyz="-0.065 0.065 0" rpy="0 1.5708 2.3562"/>
       <geometry>
-      <!-- <box size="0.1 0.1 0.07"/> -->
-        <cylinder radius="0.05" length="0.07"/>
+        <cylinder radius="0.01" length="0.18385"/>
       </geometry>
-      <material name="Orange">
-        <color rgba="1.0 0.423 0.03921568627 1.0"/>
-      </material>
+      <material name="Orange"/>
     </visual>
-    <inertial>
-      <mass value="0.01"/>
-      <inertia ixx="0.000001" ixy="0.0" ixz="0.0" iyy="0.000001" iyz="0.0" izz="0.000001"/>
-    </inertial>
-  </link>
-  <link name="back_left_prop">
     <visual>
-      <origin xyz="0 0 0"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-      <!-- <box size="0.1 0.1 0.07"/> -->
-        <cylinder radius="0.05" length="0.07"/>
+        <cylinder radius="0.015" length="0.05"/>
       </geometry>
-      <material name="Blue">
-        <color rgba="0 0 1 1.0"/>
-      </material>
+      <material name="Purple2"/>
     </visual>
     <inertial>
       <mass value="0.01"/>
       <inertia ixx="0.000001" ixy="0.0" ixz="0.0" iyy="0.000001" iyz="0.0" izz="0.000001"/>
     </inertial>
   </link>
+
   <link name="back_right_prop">
     <visual>
-      <origin xyz="0 0 0"/>
+      <origin xyz="0.065 0.065 0" rpy="0 1.5708 0.7854"/>
       <geometry>
-      <!-- <box size="0.1 0.1 0.07"/> -->
-        <cylinder radius="0.05" length="0.07"/>
+        <cylinder radius="0.01" length="0.18385"/>
       </geometry>
-      <material name="Blue">
-        <color rgba="0 0 1 1.0"/>
-      </material>
+      <material name="Orange"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.015" length="0.05"/>
+      </geometry>
+      <material name="Purple1"/>
     </visual>
     <inertial>
       <mass value="0.01"/>
       <inertia ixx="0.000001" ixy="0.0" ixz="0.0" iyy="0.000001" iyz="0.0" izz="0.000001"/>
     </inertial>
   </link>
-  <joint name="base_link_to_front_left_prop" type="fixed" dont_collapse="true">    
-    <parent link="base_link"/>    
-    <child link="front_left_prop"/>    
-    <origin xyz="0.100 0.100 0"/>  
+
+  <link name="back_left_prop">
+    <visual>
+      <origin xyz="0.065 -0.065 0" rpy="0 1.5708 -0.7854"/>
+      <geometry>
+        <cylinder radius="0.01" length="0.18385"/>
+      </geometry>
+      <material name="Orange"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.015" length="0.05"/>
+      </geometry>
+      <material name="Purple2"/>
+    </visual>
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="0.000001" ixy="0.0" ixz="0.0" iyy="0.000001" iyz="0.0" izz="0.000001"/>
+    </inertial>
+  </link>
+
+  <joint name="base_link_to_front_left_prop" type="fixed" dont_collapse="true">
+    <parent link="base_link"/>
+    <child link="front_left_prop"/>
+    <origin xyz="0.13 0.13 0"/>
   </joint>
-  <joint name="base_link_to_front_right_prop" type="fixed" dont_collapse="true">    
-    <parent link="base_link"/>    
-    <child link="front_right_prop"/>    
-    <origin xyz="0.100 -0.100 0"/>
+  <joint name="base_link_to_front_right_prop" type="fixed" dont_collapse="true">
+    <parent link="base_link"/>
+    <child link="front_right_prop"/>
+    <origin xyz="0.13 -0.13 0"/>
   </joint>
-  <joint name="base_link_to_back_right_prop" type="fixed" dont_collapse="true">    
-    <parent link="base_link"/>    
-    <child link="back_right_prop"/>    
-    <origin xyz="-0.100 -0.100 0"/> 
+  <joint name="base_link_to_back_right_prop" type="fixed" dont_collapse="true">
+    <parent link="base_link"/>
+    <child link="back_right_prop"/>
+    <origin xyz="-0.13 -0.13 0"/>
   </joint>
-  <joint name="base_link_to_back_left_prop" type="fixed" dont_collapse="true">    
-    <parent link="base_link"/>    
-    <child link="back_left_prop"/>    
-    <origin xyz="-0.100 0.100 0"/> 
+  <joint name="base_link_to_back_left_prop" type="fixed" dont_collapse="true">
+    <parent link="base_link"/>
+    <child link="back_left_prop"/>
+    <origin xyz="-0.13 0.13 0"/>
   </joint>
+
+  <!-- ==================== 子机 1 (Payload 1) ==================== -->
+  <link name="payload_1_base">
+    <visual>
+      <origin xyz="0 0 0.065" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.003" length="0.13"/>
+      </geometry>
+      <material name="Gray"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.065 0.065 0.004"/>
+      </geometry>
+      <material name="White"/>
+    </visual>
+    <visual>
+      <origin xyz="0.02 0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Orange"/>
+    </visual>
+    <visual>
+      <origin xyz="0.02 -0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Orange"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.02 0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Blue"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.02 -0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Blue"/>
+    </visual>
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.01" iyz="0.0" izz="0.02"/>
+    </inertial>
+  </link>
+  <joint name="base_link_to_payload_1" type="fixed" dont_collapse="true">
+    <parent link="base_link"/>
+    <child link="payload_1_base"/>
+    <origin xyz="0.0919 0.0919 -0.13"/>
+  </joint>
+
+  <!-- ==================== 子机 2 (Payload 2) ==================== -->
+  <link name="payload_2_base">
+    <visual>
+      <origin xyz="0 0 0.065" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.003" length="0.13"/>
+      </geometry>
+      <material name="Gray"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.065 0.065 0.004"/>
+      </geometry>
+      <material name="White"/>
+    </visual>
+    <visual>
+      <origin xyz="0.02 0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Orange"/>
+    </visual>
+    <visual>
+      <origin xyz="0.02 -0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Orange"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.02 0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Blue"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.02 -0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Blue"/>
+    </visual>
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.01" iyz="0.0" izz="0.02"/>
+    </inertial>
+  </link>
+  <joint name="base_link_to_payload_2" type="fixed" dont_collapse="true">
+    <parent link="base_link"/>
+    <child link="payload_2_base"/>
+    <origin xyz="0.0919 -0.0919 -0.13"/>
+  </joint>
+
+  <!-- ==================== 子机 3 (Payload 3) ==================== -->
+  <link name="payload_3_base">
+    <visual>
+      <origin xyz="0 0 0.065" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.003" length="0.13"/>
+      </geometry>
+      <material name="Gray"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.065 0.065 0.004"/>
+      </geometry>
+      <material name="White"/>
+    </visual>
+    <visual>
+      <origin xyz="0.02 0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Orange"/>
+    </visual>
+    <visual>
+      <origin xyz="0.02 -0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Orange"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.02 0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Blue"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.02 -0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Blue"/>
+    </visual>
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.01" iyz="0.0" izz="0.02"/>
+    </inertial>
+  </link>
+  <joint name="base_link_to_payload_3" type="fixed" dont_collapse="true">
+    <parent link="base_link"/>
+    <child link="payload_3_base"/>
+    <origin xyz="-0.0919 -0.0919 -0.13"/>
+  </joint>
+
+  <!-- ==================== 子机 4 (Payload 4) ==================== -->
+  <link name="payload_4_base">
+    <visual>
+      <origin xyz="0 0 0.065" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.003" length="0.13"/>
+      </geometry>
+      <material name="Gray"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.065 0.065 0.004"/>
+      </geometry>
+      <material name="White"/>
+    </visual>
+    <visual>
+      <origin xyz="0.02 0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Orange"/>
+    </visual>
+    <visual>
+      <origin xyz="0.02 -0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Orange"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.02 0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Blue"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.02 -0.02 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.008" length="0.012"/>
+      </geometry>
+      <material name="Blue"/>
+    </visual>
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.01" iyz="0.0" izz="0.02"/>
+    </inertial>
+  </link>
+  <joint name="base_link_to_payload_4" type="fixed" dont_collapse="true">
+    <parent link="base_link"/>
+    <child link="payload_4_base"/>
+    <origin xyz="-0.0919 0.0919 -0.13"/>
+  </joint>
+
 </robot>

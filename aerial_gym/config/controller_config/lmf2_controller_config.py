@@ -25,14 +25,22 @@ class control:
     K_pos_tensor_max = torch.tensor([0.7, 0.7, 1.0]) * scale_pos  # "当前位置"和"目标位置"之间的误差，输出一个期望的速度指令给K_vel
     K_pos_tensor_min = torch.tensor([0.7, 0.7, 1.0]) * scale_pos  # used for lee_position_control only
 
-    # Reference gains for faster velocity tracking
-    K_vel_tensor_max = torch.tensor([4.8, 4.8, 4.8])  # 从5.2降低
-    K_vel_tensor_min = torch.tensor([4.8, 4.8, 4.8])
+    # # Reference gains for faster velocity tracking
+    # K_vel_tensor_max = torch.tensor([4.8, 4.8, 4.8])  # 从5.2降低
+    # K_vel_tensor_min = torch.tensor([4.8, 4.8, 4.8])
 
-    K_rot_tensor_max = torch.tensor([6.5, 6.5, 1.5])  # 从7.0降低
-    K_rot_tensor_min = torch.tensor([6.5, 6.5, 1.5])
+    # K_rot_tensor_max = torch.tensor([6.5, 6.5, 1.5])  # 从7.0降低
+    # K_rot_tensor_min = torch.tensor([6.5, 6.5, 1.5])
 
-    K_angvel_tensor_max = torch.tensor([4.5, 4.5, 0.5])
-    K_angvel_tensor_min = torch.tensor([4.5, 4.5, 0.5])
+    # K_angvel_tensor_max = torch.tensor([4.5, 4.5, 0.5])
+    # K_angvel_tensor_min = torch.tensor([4.5, 4.5, 0.5])
+    K_vel_tensor_max = torch.tensor([1.9172, 1.9172, 0.7233])
+    K_vel_tensor_min = torch.tensor([1.9172, 1.9172, 0.7233])
+
+    K_rot_tensor_max = torch.tensor([1.7822, 1.7822, 0.4297])
+    K_rot_tensor_min = torch.tensor([1.7822, 1.7822, 0.4297])
+
+    K_angvel_tensor_max = torch.tensor([1.7354, 1.7354, 0.1018])
+    K_angvel_tensor_min = torch.tensor([1.7354, 1.7354, 0.1018])
 
     randomize_params = False

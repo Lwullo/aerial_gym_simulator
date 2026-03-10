@@ -7,8 +7,8 @@ class OSDome_64_Config(BaseLidarConfig):
     width = 512
     horizontal_fov_deg_min = -180
     horizontal_fov_deg_max = 180
-    vertical_fov_deg_min = 0
-    vertical_fov_deg_max = 90
+    vertical_fov_deg_min = -90  # 修改：向下看（地面方向）
+    vertical_fov_deg_max = 0    # 修改：不再看上方，水平线为最高处
     max_range = 20.0
     min_range = 0.5
 
