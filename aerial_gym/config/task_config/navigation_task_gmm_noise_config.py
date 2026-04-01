@@ -41,6 +41,34 @@ def apply_preset_overrides():
 apply_preset_overrides()
 
 
+def disable_non_wall_assets():
+    """Disable non-wall assets except one instantiated drop-obstacle cylinder."""
+    from aerial_gym.config.asset_config.env_object_config import (
+        panel_asset_params,
+        thin_asset_params,
+        tree_asset_params,
+        object_asset_params,
+        tile_asset_params,
+    )
+
+    panel_asset_params.num_assets = 0
+    thin_asset_params.num_assets = 0
+    tree_asset_params.num_assets = 0
+    # Keep exactly one physical object actor so DROP obstacle can be instantiated in sim.
+    object_asset_params.num_assets = 1
+    object_asset_params.file = "short_cylinder.urdf"
+    tile_asset_params.num_assets = 0
+
+    panel_asset_params.keep_in_env = False
+    thin_asset_params.keep_in_env = False
+    tree_asset_params.keep_in_env = False
+    object_asset_params.keep_in_env = True
+    tile_asset_params.keep_in_env = False
+
+
+disable_non_wall_assets()
+
+
 def _read_env_int(name, default):
     value = os.environ.get(name)
     if value is None:
@@ -64,22 +92,56 @@ class task_config:
     use_warp = True
     headless = True
     device = "cuda:0"
-    observation_space_dim = 13 + 4 + 64  # root_state + action_dim + latent_dims
+    observation_space_dim = 12
     privileged_observation_space_dim = 0
-    action_space_dim = 4
-    episode_len_steps = 900  # [UPDATED] 450 -> 900  # real physics time for simulation is this value multiplied by sim.dt
+    action_space_dim = 5  # [vx_cmd, vy_cmd, vz_cmd, yawrate_cmd, drop_switch]
+    # Optional observation augmentation for wind-estimation without privileged wind inputs.
+    # When enabled, task builds:
+    # obs_dim = 12 base dims + 4 prev command + 3 delta_v + 3 * obs_linvel_history_frames.
+    # Default with 4-frame linear-velocity stack: 12 + 4 + 3 + 12 = 31 dims.
+    use_wind_estimation_features = False
+    obs_linvel_history_frames = 4
+    episode_len_steps = 1000  # real physics time for simulation is this value multiplied by sim.dt
 
     return_state_before_reset = (
         False  # False as usually state is returned for next episode after reset
     )
     # user can set the above to true if they so desire
 
-    # fixed bounds for the rectangular space
-    env_bounds_min = [0.0, 0.0, 0.0]
-    env_bounds_max = [10.0, 10.0, 10.0]
+    # fixed bounds for the rectangular space (centered at world origin)
+    env_bounds_min = [-25.0, -25.0, 0.0]
+    env_bounds_max = [25.0, 25.0, 15.0]
 
     # fixed number of obstacles to keep in the environment (excluding keep_in_env assets)
     num_obstacles_in_env = 0
+
+    # Target sampling: XY in [-20, 20], fixed ground Z=0
+    target_xy_min = -20.0
+    target_xy_max = 20.0
+    target_fixed_z = 0.0
+    # Fixed-target training switch (if True, target is not randomized at reset).
+    # When target_fixed_use_env_center=True, target_fixed_position is interpreted
+    # as an offset from each environment center (recommended for parallel envs).
+    target_use_fixed = True
+    target_fixed_use_env_center = True
+    target_fixed_position = [0.0, 0.0, 0.0]
+
+    # Mother-ship spawn: only enforce altitude
+    spawn_fixed_z = 10.0
+    # Fixed spawn XY (fallback mode).
+    spawn_use_fixed_xy = False
+    spawn_fixed_use_env_center = True
+    spawn_fixed_xy = [-12.0, 0.0]
+    # Randomized spawn X with fixed Y:
+    # x ~ U(spawn_random_x_min, spawn_random_x_max), y = spawn_random_fixed_y
+    # If spawn_random_use_env_center=True, values are offsets to each env center.
+    spawn_use_random_x = True
+    spawn_random_use_env_center = True
+    spawn_random_x_min = -24.0
+    spawn_random_x_max = -12.0
+    spawn_random_fixed_y = 0.0
+
+    # Legacy ratio-based target sampling params (kept for compatibility).
     target_min_ratio = [0.2, 0.2, 0.3]  # Z updated to 3.0m (0.3)
     target_max_ratio = [0.8, 0.8, 0.7]  # Z updated to 7.0m (0.7)
 
@@ -101,7 +163,7 @@ class task_config:
     }
 
     class vae_config:
-        use_vae = True
+        use_vae = False
         latent_dims = 64
         model_file = (
             AERIAL_GYM_DIRECTORY
@@ -113,8 +175,8 @@ class task_config:
         return_sampled_latent = True
 
     class noise_config:
-        enable_noise = True
-        num_sources = 5
+        enable_noise = False
+        num_sources = 0  # Disable spatial GMM sources (keep main wind + time-varying gust)
         sigma_min = [5.0, 5.0, 2.5]
         sigma_max = [15.0, 15.0, 7.5]
         weight_min = 0.1
@@ -123,12 +185,155 @@ class task_config:
         resample_on_reset = True
 
     class gmm_force_config:
-        """GMM-based physical force disturbance (NOW ENABLED for realistic training)"""
-        enable_physical_force = True  # Re-enabled for realistic disturbance
-        disturbance_coefficient = 0.05  # k = 0.05 (reduced for stability)
-        force_update_steps = 5  # Update random direction every N steps
-        drone_mass = 12.04  # kg (CORRECTED to match actual robot mass from URDF)
-        gravity = 9.81  # m/s²
+        """Two-layer wind field:
+        w_total = w_main + w_local
+        - w_main: per-env constant over an episode
+        - w_local: small GMM disturbance
+        """
+        enable_physical_force = True
+        # Layer 1: main wind (sampled per environment at reset, fixed within episode)
+        main_wind_speed_min = 1.0  # m/s
+        main_wind_speed_max = 3.0  # m/s
+        main_wind_horizontal_only = False  # allow 3D wind direction (z component enabled)
+        # Layer 2: local GMM disturbance
+        force_update_steps = 5  # update local disturbance direction every N steps
+        local_wind_max_speed_min = 0.2  # m/s, per-env sampled lower bound of |w_local|
+        local_wind_max_speed_max = 0.3  # m/s, per-env sampled upper bound of |w_local|
+        local_wind_max_speed = 0.3  # legacy fallback alias
+        local_wind_horizontal_only = True
+        # Legacy alias kept for backward compatibility (fallback only).
+        max_wind_speed = 4.0
+        drag_coefficient = 4.0  # N/(m/s), c_drag in F_drag = c_drag * (v_w - v_uav)
+        normalize_intensity = True  # Normalize GMM intensity to [0, 1]
+        # Legacy parameters kept for compatibility with older debug scripts.
+        disturbance_coefficient = 0.05
+        drone_mass = 12.04
+        gravity = 9.81
+
+    class dryden_config:
+        # Simplified Dryden turbulence (three independent first-order filters / OU-like):
+        # w_dryden[k+1] = a * w_dryden[k] + b * xi, xi~N(0, I)
+        # a = exp(-dt / tau), b = sigma * sqrt(1 - a^2)
+        enable_dryden = True
+        # Per-axis turbulence std (m/s), sampled once per env per episode.
+        sigma_min = [0.2, 0.2, 0.15]
+        sigma_max = [0.3, 0.3, 0.25]
+        # Per-axis time constants tau (s), sampled once per env per episode.
+        tau_min = [0.8, 0.8, 0.8]
+        tau_max = [2.0, 2.0, 2.0]
+        # If True, force vertical turbulence component to zero.
+        horizontal_only = False
+        # Optional clamp to avoid extreme gust tails (in units of sigma).
+        clip_sigma = 3.0
+
+    class drop_model_config:
+        enable_drop_model = True
+        drop_threshold = 0.7  # drop_switch > threshold triggers drop
+        allow_multiple_drops = False
+        child_gravity = 9.81
+        # Child free-fall wind model:
+        # a = g + (c_child / m_child) * (v_w - v_child)
+        child_drag_coefficient = 1.0  # c_child, unit: N/(m/s)
+        child_mass = 1.0  # m_child, unit: kg
+        child_wind_scale = 1.0  # legacy fallback alias for (c_child / m_child)
+        max_child_sim_steps = 5000
+
+    class drop_impact_config:
+        enable_impact = True
+        # Child initial velocity at release:
+        # v_child0 = v_mother + R_WB * v_eject_body
+        add_child_eject_velocity = True
+        # Recoil implementation mode:
+        # True  -> apply one-step recoil force/torque (no direct velocity impulse).
+        # False -> legacy direct delta-v / delta-omega impulse injection.
+        use_force_recoil = True
+        child_mass = 1.0
+        mother_mass = 11.04
+        eject_speed = 0.5  # m/s
+        eject_direction_body = [0.0, 0.0, -1.0]  # release direction: downward
+        # Fixed release mount for recoil torque: choose one mount once and keep fixed for the run.
+        random_fixed_payload_mount = False
+        fixed_payload_mount_index = 0
+        payload_mount_points_body = [
+            [0.0919, 0.0919, -0.13],
+            [0.0919, -0.0919, -0.13],
+            [-0.0919, -0.0919, -0.13],
+            [-0.0919, 0.0919, -0.13],
+        ]
+        # Legacy fallback offset when mount points are not provided.
+        payload_offset_body = [0.0, 0.0, 0.0]
+        # Random angular kick (legacy stochastic term) can be disabled.
+        enable_random_angular_kick = False
+        angular_sigma_base = 0.1  # rad/s
+        angular_sigma_scale = 0.2  # sigma = base * (1 + scale * |omega|)
+        max_delta_omega = 0.5  # rad/s clamp for one drop event
+
+    class drop_reward_config:
+        # WAIT step reward
+        time_penalty = 0.0
+        # Mother altitude soft constraint:
+        # Penalize only when z < (altitude_target_z - altitude_tolerance).
+        # penalty = -altitude_low_penalty_weight * ((altitude_target_z - altitude_tolerance) - z)
+        altitude_target_z = 10.0
+        altitude_tolerance = 0.5
+        altitude_low_penalty_weight = 1.0
+        # Distance-progress shaping before DROP:
+        # R_dir = direction_reward_weight * (d_prev_xy - d_curr_xy)
+        # Positive when moving closer to target, negative when moving away.
+        # Active only when child has not dropped yet.
+        direction_reward_weight = 5.0
+        direction_min_speed = 0.05
+        direction_min_target_dist = 0.1
+        # DROP accuracy reward (continuous):
+        # R_score = score_reward_weight * score_max * exp(- (landing_error_xy / score_d0)^score_p)
+        score_max = 20.0
+        score_d0 = 3.6
+        score_p = 1.0
+        # Keep outer region threshold for hard override penalty (outside -> -outside_region_penalty).
+        piecewise_r = 2.0
+        piecewise_thresholds = [0.2, 0.4, 0.8, 1.2, 2.2, 4.0, 6.2, 12.2]
+        # If landing_error_xy is outside the outermost scored region (d > max threshold),
+        # the DROP reward is overridden to -outside_region_penalty.
+        outside_region_penalty = 20.0
+        # If episode ends without any DROP event, apply this terminal penalty.
+        # Default is aligned with outside_region_penalty.
+        no_drop_penalty = 20.0
+        # Optional single obstacle around target for drop-risk training:
+        # - each env samples whether obstacle exists with drop_obstacle_spawn_prob
+        # - if exists, center is sampled in annulus [center_radius_min, center_radius_max]
+        #   around target in XY
+        # - obstacle is represented by a ground disk for hit check
+        drop_obstacle_enable = True
+        drop_obstacle_spawn_prob = 0.5
+        drop_obstacle_center_radius_min = 1.0
+        drop_obstacle_center_radius_max = 2.0
+        drop_obstacle_radius_min = 0.1
+        drop_obstacle_radius_max = 0.1
+        drop_obstacle_height = 0.6
+        drop_obstacle_absent_obs_value = -1e3
+        # Unified score weight for continuous score:
+        # R_score = score_reward_weight * score_max * exp(-(d_xy/score_d0)^score_p)
+        score_reward_weight = 1.0
+        # Impulse metric: alpha * Delta_v + beta * Delta_omega
+        impulse_alpha = 1.0
+        impulse_beta = 0.8
+        impulse_penalty_weight = 0.5
+        # EMA for drop-only landing_error_xy diagnostics
+        landing_error_ema_alpha = 0.9
+        # EMA for drop-only attitude-total diagnostics (deg)
+        attitude_total_ema_alpha = 0.9
+        # Drop-attitude reward (only on DROP step):
+        # R_att now contains two terms evaluated at DROP pre-impact instant:
+        # 1) posture term: w_posture * exp(-(theta_drop / attitude_theta0)^2)
+        #    where theta_drop = sqrt(roll_drop^2 + pitch_drop^2)
+        # 2) angle term:   w_angle * exp(-(phi_drop / drop_angle_theta0)^2)
+        #    where phi_drop is the XY angle between mother velocity direction
+        #    and target direction at release.
+        attitude_theta0 = 0.12
+        attitude_reward_weight = 0.5
+        drop_angle_theta0 = 0.35
+        drop_angle_reward_weight = 0.5
+        drop_angle_min_speed = 0.05
         
     # Score config removed - formulas integrated into reward function
     # Distance reward uses s_dist formula: 1 - dist/d_max
@@ -190,8 +395,8 @@ class task_config:
 
     def action_transformation_function(action):
         clamped_action = torch.clamp(action, -1.0, 1.0)
-        # Reduced XY speed for safety and stability
-        max_speed = torch.tensor([0.8, 0.8, 0.5], device=clamped_action.device)  # X/Y: 0.8, Z: 0.5 (reduced from 1.0)
+        # Mother velocity-command limits [vx, vy, vz] in m/s
+        max_speed = torch.tensor([1.2, 1.2, 1.2], device=clamped_action.device)
         max_yawrate = torch.pi / 6  # 30°/s (0.524 rad/s) - Reduced from 45°/s for stability
         processed_action = clamped_action.clone()
         processed_action[:, 0:3] = max_speed * processed_action[:, 0:3]

@@ -54,6 +54,8 @@ class BaseMultirotor(BaseRobot):
         self.control_allocator = None
         self.output_forces = None
         self.output_torques = None
+        self.task_external_force_tensor = None
+        self.task_external_torque_tensor = None
 
         logger.debug("[DONE] Initializing BaseQuadrotor")
 
@@ -170,6 +172,19 @@ class BaseMultirotor(BaseRobot):
         self.output_torques = torch.zeros_like(
             global_tensor_dict["robot_torque_tensor"], device=self.device
         )
+
+        # Task-level additive force (world frame) applied on base link.
+        if "task_external_force_tensor" not in global_tensor_dict:
+            global_tensor_dict["task_external_force_tensor"] = torch.zeros(
+                (self.num_envs, 3), device=self.device, requires_grad=False
+            )
+        self.task_external_force_tensor = global_tensor_dict["task_external_force_tensor"]
+        # Task-level additive torque (world frame) applied on base link.
+        if "task_external_torque_tensor" not in global_tensor_dict:
+            global_tensor_dict["task_external_torque_tensor"] = torch.zeros(
+                (self.num_envs, 3), device=self.device, requires_grad=False
+            )
+        self.task_external_torque_tensor = global_tensor_dict["task_external_torque_tensor"]
 
     def reset(self):
         self.reset_idx(torch.arange(self.num_envs))
@@ -318,3 +333,5 @@ class BaseMultirotor(BaseRobot):
         self.call_controller()
         self.simulate_drag()
         self.apply_disturbance()
+        self.robot_force_tensors[:, 0, 0:3] += self.task_external_force_tensor
+        self.robot_torque_tensors[:, 0, 0:3] += self.task_external_torque_tensor

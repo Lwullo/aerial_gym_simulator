@@ -22,25 +22,25 @@ class LMF2Cfg:
         min_init_state = [
             0.1,
             0.15,
-            0.15,
+            0.5,  # Z ratio: 0.5 * 20m = 10m (Centered in new bounds)
             0,  # roll = 0° (fixed)
             0,  # pitch = 0° (fixed)
-            -np.pi / 6,  # yaw random [-30°, +30°]
+            0,  # yaw = 0° (fixed)
             1.0,
-            0.0,  # vx = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
-            0.0,  # vy = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
-            0.0,  # vz = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
-            0.0,  # wx = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
-            0.0,  # wy = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
-            0.0,  # wz = 0 (MODIFIED: was -0.2 for training, now 0 for stability test)
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
         ]
         max_init_state = [
             0.2,
             0.85,
-            0.85,
+            0.5,  # Z ratio: 0.5 * 20m = 10m (Centered in new bounds)
             0,  # roll = 0° (fixed)
             0,  # pitch = 0° (fixed)
-            np.pi / 6,  # yaw random [-30°, +30°]
+            0,  # yaw = 0° (fixed)
             1.0,
             0.0,  # vx = 0 (MODIFIED: was 0.2 for training, now 0 for stability test)
             0.0,  # vy = 0 (MODIFIED: was 0.2 for training, now 0 for stability test)
@@ -167,10 +167,10 @@ class LMF2Cfg:
 
         class motor_model_config:
             use_rps = True
-            motor_thrust_constant_min = 0.00000926312
+            motor_thrust_constant_min = 0.00001826312
             motor_thrust_constant_max = 0.00001826312
             motor_time_constant_increasing_min = 0.05
-            motor_time_constant_increasing_max = 0.08
+            motor_time_constant_increasing_max = 0.05
             motor_time_constant_decreasing_min = 0.005
             motor_time_constant_decreasing_max = 0.005
             max_thrust = 50.0

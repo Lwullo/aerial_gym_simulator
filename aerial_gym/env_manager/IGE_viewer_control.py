@@ -3,12 +3,24 @@ import numpy as np
 
 from aerial_gym.utils.math import quat_from_euler_xyz
 
+import os
 import sys
-import torch
 import time
+from datetime import datetime
+from pathlib import Path
+
+import torch
 
 from aerial_gym.utils.logging import CustomLogger
 from aerial_gym.utils.math import quat_rotate_inverse, quat_rotate
+
+try:
+    from PIL import Image, ImageEnhance
+    _PIL_AVAILABLE = True
+except Exception:
+    Image = None
+    ImageEnhance = None
+    _PIL_AVAILABLE = False
 
 logger = CustomLogger("IGE_viewer_control")
 
@@ -39,8 +51,14 @@ class IGEViewerControl:
         # Set Camera Properties
         camera_props = gymapi.CameraProperties()
         camera_props.enable_tensors = True
-        camera_props.width = self.config.width
-        camera_props.height = self.config.height
+        self.viewer_width = int(
+            os.environ.get("AERIAL_GYM_VIEWER_WIDTH", str(self.config.width))
+        )
+        self.viewer_height = int(
+            os.environ.get("AERIAL_GYM_VIEWER_HEIGHT", str(self.config.height))
+        )
+        camera_props.width = max(1, self.viewer_width)
+        camera_props.height = max(1, self.viewer_height)
         camera_props.far_plane = self.config.max_range
         camera_props.near_plane = self.config.min_range
         camera_props.horizontal_fov = self.config.horizontal_fov_deg
@@ -91,6 +109,25 @@ class IGEViewerControl:
 
         self.pause_sim = False
 
+        self.screenshot_dir = Path(
+            os.environ.get("AERIAL_GYM_SCREENSHOT_DIR", os.path.join(os.getcwd(), "screenshots"))
+        )
+        self.screenshot_brightness = float(
+            os.environ.get("AERIAL_GYM_SCREENSHOT_BRIGHTNESS", "1.35")
+        )
+        self.screenshot_contrast = float(
+            os.environ.get("AERIAL_GYM_SCREENSHOT_CONTRAST", "1.15")
+        )
+        self.screenshot_gamma = float(
+            os.environ.get("AERIAL_GYM_SCREENSHOT_GAMMA", "1.10")
+        )
+        self.screenshot_upscale = float(
+            os.environ.get("AERIAL_GYM_SCREENSHOT_UPSCALE", "1.0")
+        )
+        self.screenshot_pdf_dpi = int(
+            os.environ.get("AERIAL_GYM_SCREENSHOT_PDF_DPI", "600")
+        )
+
         self.create_viewer()
 
     def set_actor_and_env_handles(self, actor_handles, env_handles):
@@ -138,6 +175,8 @@ class IGEViewerControl:
         )
         # Pause simulation using the SPACE key.
         self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_SPACE, "pause_simulation")
+        # Save screenshot using the C key.
+        self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_C, "capture_screenshot")
         str_instructions = (
             "Instructions for using the viewer with the keyboard:\n"
             + "ESC: Quit\n"
@@ -149,6 +188,7 @@ class IGEViewerControl:
             + "UP: Switch Target Environment Up\n"
             + "DOWN: Switch Target Environment Down\n"
             + "SPACE: Pause Simulation\n"
+            + "C: Capture Screenshot (black background PDF, hi-res)\n"
         )
         logger.warning(str_instructions)
 
@@ -175,6 +215,8 @@ class IGEViewerControl:
                 self.pause_simulation()
             elif evt.action == "sync_frame_time" and evt.value > 0:
                 self.toggle_sync_frame_time()
+            elif evt.action == "capture_screenshot" and evt.value > 0:
+                self.capture_screenshot()
 
     def reset_all_envs(self):
         logger.warning("Resetting all environments.")
@@ -277,6 +319,62 @@ class IGEViewerControl:
                 self.local_transform.p,
                 self.lookat,
             )
+
+    def capture_screenshot(self):
+        if self.viewer is None:
+            return
+        raw_path = None
+        try:
+            self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            raw_path = self.screenshot_dir / f".viewer_{stamp}_raw.png"
+
+            if not hasattr(self.gym, "write_viewer_image_to_file"):
+                logger.error("Screenshot failed: gym.write_viewer_image_to_file is unavailable.")
+                return
+
+            self.gym.write_viewer_image_to_file(self.viewer, str(raw_path))
+
+            if not _PIL_AVAILABLE:
+                logger.error("Screenshot failed: Pillow is required for PDF export.")
+                return
+
+            # Keep original black background from viewer; only apply optional enhancement.
+            img = Image.open(raw_path).convert("RGB")
+
+            if self.screenshot_gamma > 0.0 and abs(self.screenshot_gamma - 1.0) > 1e-6:
+                inv_gamma = 1.0 / self.screenshot_gamma
+                lut = [int(((i / 255.0) ** inv_gamma) * 255.0) for i in range(256)]
+                img = img.point(lut * 3)
+
+            if abs(self.screenshot_brightness - 1.0) > 1e-6:
+                img = ImageEnhance.Brightness(img).enhance(self.screenshot_brightness)
+            if abs(self.screenshot_contrast - 1.0) > 1e-6:
+                img = ImageEnhance.Contrast(img).enhance(self.screenshot_contrast)
+
+            if self.screenshot_upscale > 1.0 + 1e-6:
+                new_size = (
+                    max(1, int(round(img.width * self.screenshot_upscale))),
+                    max(1, int(round(img.height * self.screenshot_upscale))),
+                )
+                img = img.resize(new_size, Image.LANCZOS)
+
+            pdf_path = self.screenshot_dir / f"viewer_{stamp}_black.pdf"
+            dpi = float(max(72, self.screenshot_pdf_dpi))
+            img.save(pdf_path, "PDF", resolution=dpi)
+            logger.warning(
+                f"Saved black-background PDF screenshot: {pdf_path} "
+                f"(size={img.width}x{img.height}, dpi={int(dpi)})"
+            )
+        except Exception as e:
+            logger.error(f"Screenshot failed: {e}")
+        finally:
+            if raw_path is not None:
+                try:
+                    if raw_path.exists():
+                        raw_path.unlink()
+                except Exception:
+                    pass
 
     def render(self):
         """

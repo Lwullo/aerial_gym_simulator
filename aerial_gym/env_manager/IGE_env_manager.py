@@ -33,6 +33,8 @@ class IsaacGymEnv(BaseManager):
         self.env_tensor_bounds_max = None
         self.asset_handles = []
         self.env_handles = []
+        self.env_origin_list = []
+        self.env_origins = None
         self.num_rigid_bodies_robot = None
         self.has_IGE_cameras = has_IGE_cameras
         self.sim_has_dof = False
@@ -162,6 +164,14 @@ class IsaacGymEnv(BaseManager):
             max_bound_vec3,
             int(np.sqrt(self.cfg.env.num_envs)),
         )
+        env_origin = self.gym.get_env_origin(env_handle)
+        self.env_origin_list.append(
+            torch.tensor(
+                [env_origin.x, env_origin.y, env_origin.z],
+                device=self.device,
+                dtype=torch.float32,
+            )
+        )
         if len(self.env_handles) <= env_id:
             self.env_handles.append(env_handle)
             self.asset_handles.append([])
@@ -274,6 +284,10 @@ class IsaacGymEnv(BaseManager):
             raise ValueError("All environments should have the same number of assets")
 
         self.num_assets_per_env = self.num_assets_per_env[0]
+        if len(self.env_origin_list) == self.num_envs:
+            self.env_origins = torch.stack(self.env_origin_list, dim=0)
+        else:
+            self.env_origins = torch.zeros((self.num_envs, 3), device=self.device)
 
         # check that all environments have the same number of rigid bodies
         self.num_rigid_bodies_per_env = [
@@ -411,6 +425,7 @@ class IsaacGymEnv(BaseManager):
 
         self.global_tensor_dict["env_bounds_max"] = self.env_upper_bound
         self.global_tensor_dict["env_bounds_min"] = self.env_lower_bound
+        self.global_tensor_dict["env_origins"] = self.env_origins
         self.global_tensor_dict["gravity"] = torch.tensor(
             self.sim_config.sim.gravity, device=self.device, requires_grad=False
         ).expand(self.num_envs, -1)

@@ -23,6 +23,209 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 # warnings.filterwarnings("error")
 
 
+def _patch_rl_games_scalar_logging():
+    """
+    Filter selected rl_games performance scalars from TensorBoard.
+    """
+    from rl_games.common import a2c_common
+
+    if getattr(a2c_common.A2CBase, "_aerial_scalar_filter_patched", False):
+        return
+
+    original_write_stats = a2c_common.A2CBase.write_stats
+    blocked_exact = {"performance/rl_update_time"}
+    blocked_prefixes = ("performance/step_inference_rl_",)
+
+    def filtered_write_stats(self, *args, **kwargs):
+        writer = getattr(self, "writer", None)
+        if writer is None or not hasattr(writer, "add_scalar"):
+            return original_write_stats(self, *args, **kwargs)
+
+        original_add_scalar = writer.add_scalar
+
+        def filtered_add_scalar(tag, *a, **kw):
+            if tag in blocked_exact:
+                return
+            for prefix in blocked_prefixes:
+                if tag.startswith(prefix):
+                    return
+            return original_add_scalar(tag, *a, **kw)
+
+        writer.add_scalar = filtered_add_scalar
+        try:
+            return original_write_stats(self, *args, **kwargs)
+        finally:
+            writer.add_scalar = original_add_scalar
+
+    a2c_common.A2CBase.write_stats = filtered_write_stats
+    a2c_common.A2CBase._aerial_scalar_filter_patched = True
+
+
+def _patch_rl_games_sac_obs_handling():
+    """
+    Patch rl_games SACAgent.play_steps for tensor/dict observation handling.
+    Some rl_games versions call `next_obs.clone()` even when `next_obs` is a dict,
+    and may keep stale `obs` tensors across rollout steps.
+    """
+    from rl_games.algos_torch import sac_agent as sac_agent_mod
+    from rl_games.algos_torch import torch_ext
+    import time
+
+    if getattr(sac_agent_mod.SACAgent, "_aerial_sac_obs_patch_applied", False):
+        return
+
+    def _as_obs_tensor(x):
+        if isinstance(x, dict):
+            return x["obs"]
+        return x
+
+    def patched_play_steps(self, random_exploration=False):
+        total_time_start = time.time()
+        total_update_time = 0
+        total_time = 0
+        step_time = 0.0
+        actor_losses = []
+        entropies = []
+        alphas = []
+        alpha_losses = []
+        critic1_losses = []
+        critic2_losses = []
+
+        obs_tensor = _as_obs_tensor(self.obs).clone()
+
+        for _ in range(self.num_steps_per_episode):
+            self.set_eval()
+            if random_exploration:
+                action = (
+                    torch.rand(
+                        (self.num_actors, *self.env_info["action_space"].shape), device=self._device
+                    )
+                    * 2.0
+                    - 1.0
+                )
+            else:
+                with torch.no_grad():
+                    action = self.act(obs_tensor.float(), self.env_info["action_space"].shape, sample=True)
+
+            step_start = time.time()
+            with torch.no_grad():
+                next_obs, rewards, dones, infos = self.env_step(action)
+            step_end = time.time()
+
+            next_obs_tensor = _as_obs_tensor(next_obs)
+
+            self.current_rewards += rewards
+            self.current_lengths += 1
+
+            total_time += step_end - step_start
+            step_time += step_end - step_start
+
+            all_done_indices = dones.nonzero(as_tuple=False)
+            done_indices = all_done_indices[:: self.num_agents]
+            self.game_rewards.update(self.current_rewards[done_indices])
+            self.game_lengths.update(self.current_lengths[done_indices])
+
+            not_dones = 1.0 - dones.float()
+            self.algo_observer.process_infos(infos, done_indices)
+
+            no_timeouts = self.current_lengths != self.max_env_steps
+            dones = dones * no_timeouts
+
+            self.current_rewards = self.current_rewards * not_dones
+            self.current_lengths = self.current_lengths * not_dones
+
+            # Keep full observation container (dict/tensor) for next step.
+            self.obs = next_obs
+
+            rewards = self.rewards_shaper(rewards)
+            self.replay_buffer.add(
+                obs_tensor,
+                action,
+                torch.unsqueeze(rewards, 1),
+                next_obs_tensor,
+                torch.unsqueeze(dones, 1),
+            )
+
+            # Advance rollout state.
+            obs_tensor = next_obs_tensor
+
+            if not random_exploration:
+                self.set_train()
+                update_time_start = time.time()
+                actor_loss_info, critic1_loss, critic2_loss = self.update(self.epoch_num)
+                update_time_end = time.time()
+                update_time = update_time_end - update_time_start
+
+                self.extract_actor_stats(actor_losses, entropies, alphas, alpha_losses, actor_loss_info)
+                critic1_losses.append(critic1_loss)
+                critic2_losses.append(critic2_loss)
+            else:
+                update_time = 0
+
+            total_update_time += update_time
+
+        total_time_end = time.time()
+        total_time = total_time_end - total_time_start
+        play_time = total_time - total_update_time
+
+        return (
+            step_time,
+            play_time,
+            total_update_time,
+            total_time,
+            actor_losses,
+            entropies,
+            alphas,
+            alpha_losses,
+            critic1_losses,
+            critic2_losses,
+        )
+
+    sac_agent_mod.SACAgent.play_steps = patched_play_steps
+    sac_agent_mod.SACAgent._aerial_sac_obs_patch_applied = True
+
+
+def _patch_rl_games_sac_epoch_scalar_logging():
+    """
+    Add SAC TensorBoard scalars with epoch as x-axis.
+    Mirrors:
+    - rewards/step -> rewards/epoch
+    - episode_lengths/step -> episode_lengths/epoch
+    """
+    from rl_games.algos_torch import sac_agent as sac_agent_mod
+
+    if getattr(sac_agent_mod.SACAgent, "_aerial_sac_epoch_scalar_patch_applied", False):
+        return
+
+    original_train = sac_agent_mod.SACAgent.train
+
+    def patched_train(self, *args, **kwargs):
+        writer = getattr(self, "writer", None)
+        if writer is None or not hasattr(writer, "add_scalar"):
+            return original_train(self, *args, **kwargs)
+
+        original_add_scalar = writer.add_scalar
+
+        def add_scalar_with_epoch(tag, scalar_value, *a, **kw):
+            out = original_add_scalar(tag, scalar_value, *a, **kw)
+
+            epoch_num = int(getattr(self, "epoch_num", 0))
+            if tag == "rewards/step":
+                original_add_scalar("rewards/epoch", scalar_value, epoch_num)
+            elif tag == "episode_lengths/step":
+                original_add_scalar("episode_lengths/epoch", scalar_value, epoch_num)
+            return out
+
+        writer.add_scalar = add_scalar_with_epoch
+        try:
+            return original_train(self, *args, **kwargs)
+        finally:
+            writer.add_scalar = original_add_scalar
+
+    sac_agent_mod.SACAgent.train = patched_train
+    sac_agent_mod.SACAgent._aerial_sac_epoch_scalar_patch_applied = True
+
+
 class ExtractObsWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -283,7 +486,7 @@ def get_args():
         },
     ]
 
-    # parse arguments
+    # parse argume                                                
     args = parse_arguments(description="RL Policy", custom_parameters=custom_parameters)
 
     # name allignment
@@ -323,6 +526,9 @@ if __name__ == "__main__":
     os.makedirs("runs", exist_ok=True)
 
     args = vars(get_args())
+    # Guardrail: training should never inherit eval-only behavior from a stale shell env.
+    if args.get("train", False):
+        os.environ["AERIAL_GYM_EVAL_MODE"] = "0"
 
     config_name = args["file"]
     if not os.path.isabs(config_name):
@@ -337,6 +543,14 @@ if __name__ == "__main__":
         if args.get("preset_id", -1) is not None:
             task_cfg = task_registry.get_task_config(args["task"])
             task_cfg.preset_id = int(args["preset_id"])
+        else:
+            task_cfg = task_registry.get_task_config(args["task"])
+
+        task_overrides = config.get("params", {}).get("config", {}).get("task_overrides", {})
+        if isinstance(task_overrides, dict) and len(task_overrides) > 0:
+            print(f"Applying task_overrides for {args['task']}: {task_overrides}")
+            for key, value in task_overrides.items():
+                setattr(task_cfg, key, value)
 
         experiment_name = config.get("params", {}).get("config", {}).get("name", "gen_ppo")
         runs_dir = os.path.join(runner_dir, "runs")
@@ -348,6 +562,9 @@ if __name__ == "__main__":
 
         from rl_games.torch_runner import Runner
 
+        _patch_rl_games_scalar_logging()
+        _patch_rl_games_sac_obs_handling()
+        _patch_rl_games_sac_epoch_scalar_logging()
         runner = Runner()
         try:
             runner.load(config)

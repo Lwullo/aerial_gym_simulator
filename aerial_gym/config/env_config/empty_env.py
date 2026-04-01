@@ -25,10 +25,10 @@ class EmptyEnvCfg:
 
         use_warp = False
         e_s = env_spacing
-        lower_bound_min = [-e_s, -e_s, -e_s]  # lower bound for the environment space
-        lower_bound_max = [-e_s, -e_s, -e_s]  # lower bound for the environment space
-        upper_bound_min = [e_s, e_s, e_s]  # upper bound for the environment space
-        upper_bound_max = [e_s, e_s, e_s]  # upper bound for the environment space
+        lower_bound_min = [-10.0, -10.0, 0.0]  # lower bound for the environment space
+        lower_bound_max = [-10.0, -10.0, 0.0]  # lower bound for the environment space
+        upper_bound_min = [10.0, 10.0, 20.0]  # upper bound for the environment space
+        upper_bound_max = [10.0, 10.0, 20.0]  # upper bound for the environment space
 
     class env_config:
         include_asset_type = {}
