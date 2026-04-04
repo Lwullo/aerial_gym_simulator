@@ -56,7 +56,7 @@ def disable_non_wall_assets():
     tree_asset_params.num_assets = 0
     # Keep exactly one physical object actor so DROP obstacle can be instantiated in sim.
     object_asset_params.num_assets = 1
-    object_asset_params.file = "short_cylinder.urdf"
+    object_asset_params.file = "drop_box_0p2_0p2_0p4.urdf"
     tile_asset_params.num_assets = 0
 
     panel_asset_params.keep_in_env = False
@@ -126,8 +126,21 @@ class task_config:
     target_fixed_use_env_center = True
     target_fixed_position = [0.0, 0.0, 0.0]
 
-    # Mother-ship spawn: only enforce altitude
+    # Mother-ship spawn altitude:
+    # If spawn_use_random_z=True, z ~ U(spawn_random_z_min, spawn_random_z_max).
+    # Otherwise use spawn_fixed_z.
     spawn_fixed_z = 10.0
+    spawn_use_random_z = True
+    spawn_random_z_min = 2.0
+    spawn_random_z_max = 13.0
+    # Optional spawn-Z curriculum (linear by training epoch):
+    # z_min(epoch) transitions from start_min -> end_min, while z_max stays spawn_random_z_max.
+    # This helps policy first learn release timing at higher altitude, then generalize downward.
+    spawn_z_curriculum_enable = True
+    spawn_z_curriculum_start_min = 8.0
+    spawn_z_curriculum_end_min = 2.0
+    spawn_z_curriculum_warmup_epochs = 0
+    spawn_z_curriculum_full_epochs = 2000
     # Fixed spawn XY (fallback mode).
     spawn_use_fixed_xy = False
     spawn_fixed_use_env_center = True
@@ -281,7 +294,7 @@ class task_config:
         # R_dir = direction_reward_weight * (d_prev_xy - d_curr_xy)
         # Positive when moving closer to target, negative when moving away.
         # Active only when child has not dropped yet.
-        direction_reward_weight = 5.0
+        direction_reward_weight = 0.75
         direction_min_speed = 0.05
         direction_min_target_dist = 0.1
         # DROP accuracy reward (continuous):
@@ -309,7 +322,8 @@ class task_config:
         drop_obstacle_center_radius_max = 2.0
         drop_obstacle_radius_min = 0.1
         drop_obstacle_radius_max = 0.1
-        drop_obstacle_height = 0.6
+        drop_obstacle_height = 0.4
+        drop_obstacle_asset_file = "drop_box_0p2_0p2_0p4.urdf"
         drop_obstacle_absent_obs_value = -1e3
         # Unified score weight for continuous score:
         # R_score = score_reward_weight * score_max * exp(-(d_xy/score_d0)^score_p)
@@ -332,7 +346,7 @@ class task_config:
         attitude_theta0 = 0.12
         attitude_reward_weight = 0.5
         drop_angle_theta0 = 0.35
-        drop_angle_reward_weight = 0.5
+        drop_angle_reward_weight = 0.8
         drop_angle_min_speed = 0.05
         
     # Score config removed - formulas integrated into reward function

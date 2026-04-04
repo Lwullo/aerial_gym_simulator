@@ -221,6 +221,10 @@ class NavigationTaskGmmNoise(BaseTask):
         self.spawn_position = torch.zeros(
             (self.sim_env.num_envs, 3), device=self.device, requires_grad=False
         )
+        # Per-episode spawn-height reference used by altitude penalty.
+        self.spawn_height_reference = torch.zeros(
+            self.sim_env.num_envs, device=self.device, requires_grad=False
+        )
         self.d_max = torch.zeros(
             self.sim_env.num_envs, device=self.device, requires_grad=False
         )
@@ -290,7 +294,7 @@ class NavigationTaskGmmNoise(BaseTask):
             getattr(self.drop_reward_config, "drop_obstacle_radius_max", 3.0)
         )
         self.drop_obstacle_height = float(
-            getattr(self.drop_reward_config, "drop_obstacle_height", 0.6)
+            getattr(self.drop_reward_config, "drop_obstacle_height", 0.4)
         )
         self.drop_obstacle_absent_obs_value = float(
             getattr(self.drop_reward_config, "drop_obstacle_absent_obs_value", -1e3)
@@ -395,7 +399,9 @@ class NavigationTaskGmmNoise(BaseTask):
             self.sim_env.num_envs, device=self.device, dtype=torch.bool, requires_grad=False
         )
         self.drop_obstacle_asset_file = str(
-            getattr(self.drop_reward_config, "drop_obstacle_asset_file", "short_cylinder.urdf")
+            getattr(
+                self.drop_reward_config, "drop_obstacle_asset_file", "drop_box_0p2_0p2_0p4.urdf"
+            )
         )
         self.drop_obstacle_asset_index = -1
         self.drop_obstacle_instance_enabled = False
@@ -457,7 +463,7 @@ class NavigationTaskGmmNoise(BaseTask):
         self._eval_mode = eval_mode_flag in ("1", "true", "yes", "y", "t")
         self._eval_init_phase_complete = False  # Track if we've passed initialization phase
 
-        # TensorBoard writer for motor thrust logging (lazily initialized on first use)
+        # TensorBoard writer for task diagnostics (lazily initialized on first use)
         self._writer_initialized = False
         self.writer = None
 
@@ -536,6 +542,10 @@ class NavigationTaskGmmNoise(BaseTask):
             getattr(self.drop_reward_config, "attitude_total_ema_alpha", 0.9)
         )
         self._train_epoch = 0
+        self.spawn_z_curriculum_min_current = float(
+            getattr(self.task_config, "spawn_random_z_min", 2.0)
+        )
+        self.spawn_z_curriculum_alpha_current = 0.0
         self._last_console_stats_epoch = -1
         self._target_marker_draw_enabled = True
         self._target_marker_warned = False
@@ -838,11 +848,12 @@ class NavigationTaskGmmNoise(BaseTask):
             out[name] = self._to_serializable(value)
         return out
 
-    def _write_reward_weight_snapshot(self):
-        """Write one-time reward-weight/config snapshot to the current run log directory."""
+    def _write_reward_weight_snapshot(self, run_dir=None):
+        """Write reward-weight/config snapshot to a run directory."""
         try:
-            self._resolve_best_point_path()
-            run_dir = os.path.dirname(self.best_point_path)
+            if run_dir is None:
+                self._resolve_best_point_path()
+                run_dir = os.path.dirname(self.best_point_path)
             os.makedirs(run_dir, exist_ok=True)
 
             reward_params_dump = {
@@ -886,6 +897,46 @@ class NavigationTaskGmmNoise(BaseTask):
             self._train_epoch = int(getattr(algo, "epoch_num", self._train_epoch))
         except Exception:
             pass
+
+    def _get_spawn_z_sampling_range(self):
+        """Get current spawn-Z sampling range, optionally with epoch-based curriculum."""
+        z_min_cfg = float(getattr(self.task_config, "spawn_random_z_min", 2.0))
+        z_max_cfg = float(getattr(self.task_config, "spawn_random_z_max", 13.0))
+        if z_max_cfg < z_min_cfg:
+            z_min_cfg, z_max_cfg = z_max_cfg, z_min_cfg
+
+        use_curriculum = bool(getattr(self.task_config, "spawn_z_curriculum_enable", False))
+        if not use_curriculum:
+            self.spawn_z_curriculum_min_current = z_min_cfg
+            self.spawn_z_curriculum_alpha_current = 1.0
+            return z_min_cfg, z_max_cfg
+
+        start_min = float(
+            getattr(self.task_config, "spawn_z_curriculum_start_min", z_max_cfg)
+        )
+        end_min = float(getattr(self.task_config, "spawn_z_curriculum_end_min", z_min_cfg))
+        warmup_epochs = int(getattr(self.task_config, "spawn_z_curriculum_warmup_epochs", 0))
+        full_epochs = int(getattr(self.task_config, "spawn_z_curriculum_full_epochs", 2000))
+        if full_epochs < warmup_epochs:
+            full_epochs = warmup_epochs
+
+        epoch = max(int(getattr(self, "_train_epoch", 0)), 0)
+        if epoch <= warmup_epochs:
+            alpha = 0.0
+        elif epoch >= full_epochs:
+            alpha = 1.0
+        else:
+            alpha = float(epoch - warmup_epochs) / float(max(full_epochs - warmup_epochs, 1))
+
+        z_min_curriculum = start_min + (end_min - start_min) * alpha
+        z_min_curriculum = float(np.clip(z_min_curriculum, z_min_cfg, z_max_cfg))
+        z_max_curriculum = z_max_cfg
+        if z_max_curriculum < z_min_curriculum:
+            z_max_curriculum = z_min_curriculum
+
+        self.spawn_z_curriculum_min_current = z_min_curriculum
+        self.spawn_z_curriculum_alpha_current = alpha
+        return z_min_curriculum, z_max_curriculum
 
     def _apply_fixed_env_bounds(self):
         env = self.sim_env.IGE_env
@@ -2082,7 +2133,6 @@ class NavigationTaskGmmNoise(BaseTask):
         where impulse_metric = alpha * Delta_v + beta * Delta_omega.
         """
         cfg = self.drop_reward_config
-        altitude_target_z = float(getattr(cfg, "altitude_target_z", 10.0))
         altitude_tolerance = float(getattr(cfg, "altitude_tolerance", 0.5))
         altitude_low_penalty_w = float(getattr(cfg, "altitude_low_penalty_weight", 1.0))
         direction_w = float(getattr(cfg, "direction_reward_weight", 0.02))
@@ -2247,8 +2297,16 @@ class NavigationTaskGmmNoise(BaseTask):
                 reward[penalty_ids] = outside_region_penalty_reward[penalty_ids]
 
         # Soft lower-bound altitude penalty (no hard state overwrite).
-        # Penalize when z < (altitude_target_z - altitude_tolerance).
-        lower_bound_z = altitude_target_z - altitude_tolerance
+        # Penalize when z < (spawn_height_reference - altitude_tolerance).
+        # Fallback to fixed target-z baseline if reference is unavailable.
+        if (
+            hasattr(self, "spawn_height_reference")
+            and self.spawn_height_reference.shape[0] == self.sim_env.num_envs
+        ):
+            lower_bound_z = self.spawn_height_reference - altitude_tolerance
+        else:
+            altitude_target_z = float(getattr(cfg, "altitude_target_z", 10.0))
+            lower_bound_z = altitude_target_z - altitude_tolerance
         altitude_penalty = torch.zeros_like(reward)
         if altitude_low_penalty_w > 0.0:
             z = self.obs_dict["robot_position"][:, 2]
@@ -2380,6 +2438,8 @@ class NavigationTaskGmmNoise(BaseTask):
             
             summary_dir = os.path.join(run_dir, "summaries")
             self.writer = SummaryWriter(summary_dir)
+            # Ensure reward-weight snapshot is present in the actual run directory.
+            self._write_reward_weight_snapshot(run_dir=run_dir)
         else:
             self.writer = None
 
@@ -2467,18 +2527,6 @@ class NavigationTaskGmmNoise(BaseTask):
             float(self.attitude_total_deg_ema) if self.attitude_total_deg_ema is not None else 0.0
         )
         
-        # Get motor thrust values from environment 0 for monitoring
-        try:
-            motor_thrusts = self.sim_env.robot_manager.robot.control_allocator.motor_model.current_motor_thrust
-            motor_thrust_env0 = motor_thrusts[0]  # Get thrusts from environment 0 (shape: [4])
-            motor_thrust_0 = float(motor_thrust_env0[0].item())
-            motor_thrust_1 = float(motor_thrust_env0[1].item())
-            motor_thrust_2 = float(motor_thrust_env0[2].item())
-            motor_thrust_3 = float(motor_thrust_env0[3].item())
-        except Exception as e:
-            # If motor thrust data is unavailable, use default values
-            motor_thrust_0 = motor_thrust_1 = motor_thrust_2 = motor_thrust_3 = 0.0
-        
         extras = {
             "improvement_reward": float(improvement_reward.mean().item()),
             "direction_reward": float(direction_reward.mean().item()),
@@ -2493,11 +2541,6 @@ class NavigationTaskGmmNoise(BaseTask):
             # Diagnostic metrics for TensorBoard
             "info/crash_rate_instant": crash_rate_instant,
             "info/avg_z_position": avg_z_pos,
-            # Motor thrust metrics from environment 0
-            "motor_thrust_0": motor_thrust_0,
-            "motor_thrust_1": motor_thrust_1,
-            "motor_thrust_2": motor_thrust_2,
-            "motor_thrust_3": motor_thrust_3,
             # Drop-quality diagnostics (window aggregated)
             "performance/landing_error_xy_mean_drop_window": landing_error_xy_mean_drop_window,
             "performance/release_to_target_xy_mean_drop_window": release_to_target_xy_mean_drop_window,
@@ -2506,6 +2549,8 @@ class NavigationTaskGmmNoise(BaseTask):
             "performance/impulse_metric_std": impulse_metric_std_window,
             "performance/attitude_total_deg_ema": attitude_total_deg_ema,
             "performance/attitude_total_deg_std_drop_window": attitude_total_deg_std_window,
+            "curriculum/spawn_z_min": float(self.spawn_z_curriculum_min_current),
+            "curriculum/spawn_z_alpha": float(self.spawn_z_curriculum_alpha_current),
         }
         if drop_count > 0:
             extras["performance/release_to_target_xy"] = release_to_target_xy_step
@@ -2513,16 +2558,12 @@ class NavigationTaskGmmNoise(BaseTask):
         if learning_rate is not None:
             extras["learning_rate"] = float(learning_rate)
         
-        # Write motor thrust data to TensorBoard (with lazy initialization)
+        # Write diagnostics to TensorBoard (with lazy initialization)
         if not self._writer_initialized:
             self._init_tensorboard_writer()
             self._writer_initialized = True
         
         if self.writer is not None:
-            self.writer.add_scalar("motor_thrust/motor_0", motor_thrust_0, self.num_task_steps)
-            self.writer.add_scalar("motor_thrust/motor_1", motor_thrust_1, self.num_task_steps)
-            self.writer.add_scalar("motor_thrust/motor_2", motor_thrust_2, self.num_task_steps)
-            self.writer.add_scalar("motor_thrust/motor_3", motor_thrust_3, self.num_task_steps)
             self.writer.add_scalar(
                 "performance/landing_error_xy_mean_drop_window",
                 landing_error_xy_mean_drop_window,
@@ -2780,15 +2821,26 @@ class NavigationTaskGmmNoise(BaseTask):
                     self.obs_dict["robot_position"][env_ids, 0] = sampled_x
                     self.obs_dict["robot_position"][env_ids, 1] = fixed_y
 
-        # Force mother-ship altitude.
-        spawn_fixed_z = float(getattr(self.task_config, "spawn_fixed_z", 15.0))
-        self.obs_dict["robot_position"][env_ids, 2] = spawn_fixed_z
+        # Spawn mother-ship altitude.
+        use_random_spawn_z = bool(getattr(self.task_config, "spawn_use_random_z", False))
+        if use_random_spawn_z:
+            z_min, z_max = self._get_spawn_z_sampling_range()
+            sampled_z = torch.empty((env_ids.shape[0],), device=self.device)
+            if abs(z_max - z_min) < 1e-9:
+                sampled_z.fill_(z_min)
+            else:
+                sampled_z.uniform_(z_min, z_max)
+            self.obs_dict["robot_position"][env_ids, 2] = sampled_z
+        else:
+            spawn_fixed_z = float(getattr(self.task_config, "spawn_fixed_z", 15.0))
+            self.obs_dict["robot_position"][env_ids, 2] = spawn_fixed_z
         self.sim_env.IGE_env.write_to_sim()
 
         # Debug marker visualization is disabled.
         
         # Record spawn position and compute d_max for distance reward
         self.spawn_position[env_ids] = self.obs_dict["robot_position"][env_ids].clone()
+        self.spawn_height_reference[env_ids] = self.spawn_position[env_ids, 2]
         dist_spawn_to_target = torch.norm(
             self.target_position[env_ids] - self.spawn_position[env_ids], dim=1
         )
