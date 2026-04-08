@@ -1,0 +1,3 @@
+method,seed,done_total,drop_done,no_drop_done,no_drop_rate
+ppo_baseline,10,2000,1965,35,0.0175
+ppo_gru,10,2000,2000,0,0.0

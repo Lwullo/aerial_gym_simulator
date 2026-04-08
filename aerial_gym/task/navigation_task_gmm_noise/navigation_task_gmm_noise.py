@@ -848,6 +848,83 @@ class NavigationTaskGmmNoise(BaseTask):
             out[name] = self._to_serializable(value)
         return out
 
+    def _get_ppo_config_snapshot(self):
+        """Get the rl_games PPO config passed by runner after CLI overrides."""
+        ppo_config_path = os.environ.get("AERIAL_GYM_PPO_CONFIG_PATH", "").strip()
+        config_json = os.environ.get("AERIAL_GYM_PPO_CONFIG_JSON", "").strip()
+        ppo_config_full = {}
+        if config_json:
+            try:
+                ppo_config_full = json.loads(config_json)
+            except json.JSONDecodeError as exc:
+                logger.warning(f"Failed to parse AERIAL_GYM_PPO_CONFIG_JSON: {exc}")
+
+        params = ppo_config_full.get("params", {}) if isinstance(ppo_config_full, dict) else {}
+        train_cfg = params.get("config", {}) if isinstance(params, dict) else {}
+        network_cfg = params.get("network", {}) if isinstance(params, dict) else {}
+        algo_cfg = params.get("algo", {}) if isinstance(params, dict) else {}
+        model_cfg = params.get("model", {}) if isinstance(params, dict) else {}
+
+        config_keys = (
+            "name",
+            "env_name",
+            "learning_rate",
+            "lr_schedule",
+            "kl_threshold",
+            "grad_norm",
+            "entropy_coef",
+            "truncate_grads",
+            "e_clip",
+            "clip_value",
+            "num_actors",
+            "horizon_length",
+            "minibatch_size",
+            "mini_epochs",
+            "critic_coef",
+            "normalize_input",
+            "seq_length",
+            "bounds_loss_coef",
+            "max_epochs",
+            "normalize_value",
+            "use_diagnostics",
+            "value_bootstrap",
+            "use_smooth_clamp",
+            "gamma",
+            "tau",
+            "normalize_advantage",
+            "save_frequency",
+            "save_best_after",
+            "score_to_win",
+        )
+        ppo_hyperparameters = {
+            "config_path": ppo_config_path if ppo_config_path else None,
+            "seed": self._to_serializable(params.get("seed")) if isinstance(params, dict) else None,
+            "algo": self._to_serializable(algo_cfg),
+            "model": self._to_serializable(model_cfg),
+            "network": self._to_serializable(network_cfg),
+            "config": {
+                key: self._to_serializable(train_cfg[key])
+                for key in config_keys
+                if isinstance(train_cfg, dict) and key in train_cfg
+            },
+        }
+        if isinstance(train_cfg, dict) and "env_config" in train_cfg:
+            ppo_hyperparameters["env_config"] = self._to_serializable(train_cfg["env_config"])
+        if isinstance(train_cfg, dict) and "reward_shaper" in train_cfg:
+            ppo_hyperparameters["reward_shaper"] = self._to_serializable(
+                train_cfg["reward_shaper"]
+            )
+        if isinstance(train_cfg, dict) and "task_overrides" in train_cfg:
+            ppo_hyperparameters["task_overrides"] = self._to_serializable(
+                train_cfg["task_overrides"]
+            )
+
+        return {
+            "ppo_config_path": ppo_config_path if ppo_config_path else None,
+            "ppo_hyperparameters": ppo_hyperparameters,
+            "ppo_config_full": self._to_serializable(ppo_config_full),
+        }
+
     def _write_reward_weight_snapshot(self, run_dir=None):
         """Write reward-weight/config snapshot to a run directory."""
         try:
@@ -872,10 +949,17 @@ class NavigationTaskGmmNoise(BaseTask):
             drop_reward_weight_fields = {
                 k: v for k, v in drop_reward_dump.items() if any(tag in k for tag in weight_like_keys)
             }
+            resume_flag = os.environ.get("AERIAL_GYM_IS_RESUME", "0").strip().lower()
+            is_resumed_training = resume_flag in ("1", "true", "yes", "y", "t")
+            resume_checkpoint = os.environ.get("AERIAL_GYM_RESUME_CHECKPOINT", "").strip()
+            if not is_resumed_training:
+                resume_checkpoint = ""
 
             snapshot = {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "experiment_name": os.environ.get("AERIAL_GYM_EXPERIMENT_NAME", "experiment"),
+                "is_resumed_training": bool(is_resumed_training),
+                "resume_checkpoint": resume_checkpoint if resume_checkpoint else None,
                 "reward_parameters": reward_params_dump,
                 "drop_reward_config_weights": drop_reward_weight_fields,
                 "drop_reward_config_full": drop_reward_dump,
@@ -883,6 +967,7 @@ class NavigationTaskGmmNoise(BaseTask):
                 "drop_impact_config": self._config_object_to_dict(self.drop_impact_config),
                 "success_config": self._config_object_to_dict(self.success_config),
             }
+            snapshot.update(self._get_ppo_config_snapshot())
 
             snapshot_path = os.path.join(run_dir, "reward_weights_snapshot.json")
             with open(snapshot_path, "w", encoding="utf-8") as handle:
@@ -2013,10 +2098,12 @@ class NavigationTaskGmmNoise(BaseTask):
         # Push modified root-state tensors to Isaac Gym before the next physics step.
         self.sim_env.IGE_env.write_to_sim()
 
-    def _simulate_child_free_fall(self, env_ids, init_pos=None, init_vel=None):
-        """Simulate child payload free fall with a = g + (c_child/m_child)*(v_w - v_child)."""
+    def _predict_child_landing_xy(self, env_ids, init_pos=None, init_vel=None):
+        """Predict child landing position/distance without mutating DROP buffers."""
         if env_ids.numel() == 0:
-            return
+            empty_pos = torch.empty((0, 3), device=self.device)
+            empty_dist = torch.empty((0,), device=self.device)
+            return empty_pos, empty_dist
 
         env_ids = env_ids.to(dtype=torch.long, device=self.device)
         if init_pos is None:
@@ -2110,10 +2197,23 @@ class NavigationTaskGmmNoise(BaseTask):
             landing_pos[remain_local, 0:2] = child_pos[remain_local, 0:2]
             landing_pos[remain_local, 2] = torch.clamp(child_pos[remain_local, 2], min=0.0)
 
-        self.child_landing_position[env_ids] = landing_pos
-        self.child_landing_xy_distance[env_ids] = torch.norm(
+        landing_dist = torch.norm(
             landing_pos[:, 0:2] - self.target_position[env_ids, 0:2], dim=1
         )
+        return landing_pos, landing_dist
+
+    def _simulate_child_free_fall(self, env_ids, init_pos=None, init_vel=None):
+        """Simulate child payload free fall with a = g + (c_child/m_child)*(v_w - v_child)."""
+        if env_ids.numel() == 0:
+            return
+        env_ids = env_ids.to(dtype=torch.long, device=self.device)
+        landing_pos, landing_dist = self._predict_child_landing_xy(
+            env_ids=env_ids,
+            init_pos=init_pos,
+            init_vel=init_vel,
+        )
+        self.child_landing_position[env_ids] = landing_pos
+        self.child_landing_xy_distance[env_ids] = landing_dist
 
 
 
@@ -3405,17 +3505,69 @@ class NavigationTaskGmmNoise(BaseTask):
         self.window_drop_end_count += step_drop_end_count
         done_mask_pre_reward = (self.terminations > 0) | (self.truncations > 0)
         no_drop_done_mask = done_mask_pre_reward & (~self.child_has_dropped)
-        no_drop_penalty = float(
+        step_no_drop_done_count = int(no_drop_done_mask.sum().item())
+        no_drop_crash_mask = no_drop_done_mask & (self.terminations > 0)
+        no_drop_timeout_mask = no_drop_done_mask & (self.terminations == 0) & (self.truncations > 0)
+        crash_no_drop_penalty = float(
             getattr(
                 self.drop_reward_config,
-                "no_drop_penalty",
+                "crash_no_drop_penalty",
                 getattr(self.drop_reward_config, "outside_region_penalty", 20.0),
             )
         )
-        if no_drop_penalty > 0.0 and no_drop_done_mask.any():
-            self.rewards[no_drop_done_mask] = self.rewards[no_drop_done_mask] - no_drop_penalty
-        step_no_drop_done_count = int(no_drop_done_mask.sum().item())
+        missed_drop_no_drop_penalty = float(
+            getattr(self.drop_reward_config, "missed_drop_no_drop_penalty", 8.0)
+        )
+        reasonable_no_drop_reward = float(
+            getattr(self.drop_reward_config, "reasonable_no_drop_reward", 2.0)
+        )
+        reasonable_no_drop_threshold = float(
+            getattr(self.drop_reward_config, "reasonable_no_drop_pred_error_threshold", 5.0)
+        )
+        if crash_no_drop_penalty > 0.0 and no_drop_crash_mask.any():
+            self.rewards[no_drop_crash_mask] = (
+                self.rewards[no_drop_crash_mask] - crash_no_drop_penalty
+            )
+
+        reasonable_no_drop_count = 0
+        missed_drop_no_drop_count = 0
+        no_drop_pred_error_mean = 0.0
+        if no_drop_timeout_mask.any():
+            timeout_env_ids = no_drop_timeout_mask.nonzero(as_tuple=False).squeeze(-1)
+            pred_pos = self.obs_dict["robot_position"][timeout_env_ids].clone()
+            pred_vel = self.obs_dict["robot_linvel"][timeout_env_ids].clone()
+            add_child_eject_velocity = bool(
+                getattr(self.drop_impact_config, "add_child_eject_velocity", True)
+            )
+            if add_child_eject_velocity:
+                pred_vel += self._compute_eject_velocity_world(timeout_env_ids)
+            _, pred_error_xy = self._predict_child_landing_xy(
+                timeout_env_ids,
+                init_pos=pred_pos,
+                init_vel=pred_vel,
+            )
+            reasonable_mask = pred_error_xy > reasonable_no_drop_threshold
+            missed_mask = ~reasonable_mask
+            reasonable_env_ids = timeout_env_ids[reasonable_mask]
+            missed_env_ids = timeout_env_ids[missed_mask]
+
+            if reasonable_no_drop_reward != 0.0 and reasonable_env_ids.numel() > 0:
+                self.rewards[reasonable_env_ids] = (
+                    self.rewards[reasonable_env_ids] + reasonable_no_drop_reward
+                )
+            if missed_drop_no_drop_penalty > 0.0 and missed_env_ids.numel() > 0:
+                self.rewards[missed_env_ids] = (
+                    self.rewards[missed_env_ids] - missed_drop_no_drop_penalty
+                )
+
+            reasonable_no_drop_count = int(reasonable_env_ids.numel())
+            missed_drop_no_drop_count = int(missed_env_ids.numel())
+            no_drop_pred_error_mean = float(pred_error_xy.mean().item())
+
         self.extras["no_drop_done_count"] = step_no_drop_done_count
+        self.extras["reasonable_no_drop_count"] = reasonable_no_drop_count
+        self.extras["missed_drop_no_drop_count"] = missed_drop_no_drop_count
+        self.extras["no_drop_pred_landing_error_xy_mean"] = no_drop_pred_error_mean
         self.window_no_drop_done_count += step_no_drop_done_count
 
         # Scheme B: Dynamic Stability & Terminal Reward

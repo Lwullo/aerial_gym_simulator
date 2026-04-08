@@ -1,6 +1,7 @@
 import numpy as np
 import os
 import yaml
+import json
 
 
 import isaacgym
@@ -556,6 +557,18 @@ if __name__ == "__main__":
         runs_dir = os.path.join(runner_dir, "runs")
         os.environ["AERIAL_GYM_RUNS_DIR"] = runs_dir
         os.environ["AERIAL_GYM_EXPERIMENT_NAME"] = experiment_name
+        os.environ["AERIAL_GYM_PPO_CONFIG_PATH"] = config_name
+        os.environ["AERIAL_GYM_PPO_CONFIG_JSON"] = json.dumps(config, ensure_ascii=False)
+        checkpoint_path = args.get("checkpoint")
+        if checkpoint_path is not None and str(checkpoint_path).strip() != "":
+            checkpoint_path = str(checkpoint_path).strip()
+            if not os.path.isabs(checkpoint_path):
+                checkpoint_path = os.path.abspath(os.path.join(original_cwd, checkpoint_path))
+            os.environ["AERIAL_GYM_IS_RESUME"] = "1"
+            os.environ["AERIAL_GYM_RESUME_CHECKPOINT"] = checkpoint_path
+        else:
+            os.environ["AERIAL_GYM_IS_RESUME"] = "0"
+            os.environ["AERIAL_GYM_RESUME_CHECKPOINT"] = ""
         learning_rate = config.get("params", {}).get("config", {}).get("learning_rate")
         if learning_rate is not None:
             os.environ["AERIAL_GYM_LR"] = str(learning_rate)

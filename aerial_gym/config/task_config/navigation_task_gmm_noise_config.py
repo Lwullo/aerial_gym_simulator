@@ -300,17 +300,22 @@ class task_config:
         # DROP accuracy reward (continuous):
         # R_score = score_reward_weight * score_max * exp(- (landing_error_xy / score_d0)^score_p)
         score_max = 20.0
-        score_d0 = 3.6
-        score_p = 1.0
+        score_d0 = 2.0
+        score_p = 2.0
         # Keep outer region threshold for hard override penalty (outside -> -outside_region_penalty).
-        piecewise_r = 2.0
-        piecewise_thresholds = [0.2, 0.4, 0.8, 1.2, 2.2, 4.0, 6.2, 12.2]
+        piecewise_r = 1.0
+        piecewise_thresholds = [0.2, 0.4, 0.8, 1.2, 2.2, 4.0, 6.2, 8.0]
         # If landing_error_xy is outside the outermost scored region (d > max threshold),
         # the DROP reward is overridden to -outside_region_penalty.
         outside_region_penalty = 20.0
-        # If episode ends without any DROP event, apply this terminal penalty.
-        # Default is aligned with outside_region_penalty.
-        no_drop_penalty = 20.0
+        # Risk-aware no-DROP terminal reward:
+        # crash+no_drop is still bad; timeout+no_drop is acceptable when the predicted
+        # landing error is already too large for a reasonable release.
+        no_drop_penalty = 0.0
+        crash_no_drop_penalty = 20.0
+        missed_drop_no_drop_penalty = 8.0
+        reasonable_no_drop_reward = 2.0
+        reasonable_no_drop_pred_error_threshold = 5.0
         # Optional single obstacle around target for drop-risk training:
         # - each env samples whether obstacle exists with drop_obstacle_spawn_prob
         # - if exists, center is sampled in annulus [center_radius_min, center_radius_max]

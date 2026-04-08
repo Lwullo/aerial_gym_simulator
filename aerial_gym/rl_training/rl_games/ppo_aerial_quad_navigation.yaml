@@ -48,16 +48,16 @@ params:
     gamma: 0.99
     tau: 0.95
     ppo: True
-    learning_rate: 1e-4
+    learning_rate: 5e-5
     lr_schedule: adaptive
-    kl_threshold: 0.01
+    kl_threshold: 0.007
     save_frequency: 10
     save_best_after: 10
     score_to_win: 100000
     grad_norm: 1.0
-    entropy_coef: 0.008
+    entropy_coef: 0.003
     truncate_grads: True
-    e_clip: 0.2
+    e_clip: 0.15
     clip_value: False
     num_actors: 1024
     horizon_length: 32
@@ -66,7 +66,7 @@ params:
     critic_coef: 2
     normalize_input: True  # [ENABLED] Normalize observations for stable training
     seq_length: 8
-    bounds_loss_coef: 0.0001
+    bounds_loss_coef: 0.0005
     max_epochs: 10000
     normalize_value: True
     use_diagnostics: True
