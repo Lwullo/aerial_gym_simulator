@@ -2,6 +2,8 @@
 Paper-style comparative evaluation for DROP task:
 1) PPO(baseline) policy (loaded from checkpoint)
 2) PPO-GRU policy (loaded from checkpoint)
+3) PPO-RNN policy (optional checkpoint)
+4) MPC controller
 
 Outputs:
 - Raw CSVs, summary CSVs
@@ -10,6 +12,7 @@ Outputs:
 
 import argparse
 import csv
+import logging
 import math
 import os
 import sys
@@ -25,10 +28,7 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.append(_PROJECT_ROOT)
 
-from aerial_gym.utils.logging import CustomLogger
-from aerial_gym.config.task_config.navigation_task_gmm_noise_config import task_config
-from aerial_gym.task.navigation_task_gmm_noise.navigation_task_gmm_noise import NavigationTaskGmmNoise
-
+import isaacgym
 import torch
 import torch.nn as nn
 import matplotlib
@@ -36,8 +36,29 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+logger = logging.getLogger("eval_drop_paper_comparison")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(name)s] %(levelname)s: %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-logger = CustomLogger("eval_drop_paper_comparison")
+
+task_config = None
+NavigationTaskGmmNoise = None
+
+
+def _ensure_eval_env_modules_loaded():
+    global task_config, NavigationTaskGmmNoise
+    if task_config is not None and NavigationTaskGmmNoise is not None:
+        return
+    from aerial_gym.config.task_config.navigation_task_gmm_noise_config import task_config as _task_config
+    from aerial_gym.task.navigation_task_gmm_noise.navigation_task_gmm_noise import (
+        NavigationTaskGmmNoise as _NavigationTaskGmmNoise,
+    )
+
+    task_config = _task_config
+    NavigationTaskGmmNoise = _NavigationTaskGmmNoise
 
 DEFAULT_BASELINE_CHECKPOINT = (
     "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/"
@@ -47,6 +68,7 @@ DEFAULT_GRU_CHECKPOINT = (
     "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/"
     "runs/PPO-GRU-plus/nn/last_gmm_noise_run_ep_10000_rew__27.005426_.pth"
 )
+DEFAULT_RNN_CHECKPOINT = ""
 DEFAULT_OUTPUT_ROOT = (
     "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/result"
 )
@@ -69,6 +91,7 @@ class MethodSpec:
     rms: Optional["RunningMeanStd"]
     obs_dim: int
     use_rnn: bool = False
+    rnn_hidden_size: int = 64
     kind: str = "ppo"
     controller: Optional["MPCDropController"] = None
     force_drop_step: Optional[int] = None
@@ -117,7 +140,13 @@ class RNNBlock(nn.Module):
 
 
 class PPOActorGRU(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        rnn_hidden_size: int = 64,
+        use_layer_norm: bool = True,
+    ):
         super().__init__()
         self.actor_mlp = nn.Sequential(
             nn.Linear(obs_dim, 256),
@@ -127,13 +156,35 @@ class PPOActorGRU(nn.Module):
             nn.Linear(128, 64),
             nn.ELU(),
         )
-        self.rnn = RNNBlock(input_size=64, hidden_size=64)
-        self.layer_norm = nn.LayerNorm(64)
-        self.mu = nn.Linear(64, act_dim)
+        self.rnn = RNNBlock(input_size=64, hidden_size=rnn_hidden_size)
+        self.layer_norm = nn.LayerNorm(rnn_hidden_size) if use_layer_norm else nn.Identity()
+        self.mu = nn.Linear(rnn_hidden_size, act_dim)
 
     def forward(self, obs: torch.Tensor, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.actor_mlp(obs)
         x = x.unsqueeze(0)  # [1, N, 64]
+        x, h_next = self.rnn(x, h)
+        x = x.squeeze(0)
+        x = self.layer_norm(x)
+        mu = self.mu(x)
+        return mu, h_next
+
+
+class PPOActorRNNOnly(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        rnn_hidden_size: int = 64,
+        use_layer_norm: bool = True,
+    ):
+        super().__init__()
+        self.rnn = RNNBlock(input_size=obs_dim, hidden_size=rnn_hidden_size)
+        self.layer_norm = nn.LayerNorm(rnn_hidden_size) if use_layer_norm else nn.Identity()
+        self.mu = nn.Linear(rnn_hidden_size, act_dim)
+
+    def forward(self, obs: torch.Tensor, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = obs.unsqueeze(0)  # [1, N, obs_dim]
         x, h_next = self.rnn(x, h)
         x = x.squeeze(0)
         x = self.layer_norm(x)
@@ -267,18 +318,49 @@ class MPCDropController:
         return action
 
 
-def _infer_ppo_dims(model_state: Dict[str, torch.Tensor]) -> Tuple[int, int]:
-    obs_key = "a2c_network.actor_mlp.0.weight"
-    act_key = "a2c_network.mu.weight"
-    if obs_key not in model_state or act_key not in model_state:
-        raise RuntimeError("Failed to infer PPO obs/action dimensions from checkpoint model state.")
-    obs_dim = int(model_state[obs_key].shape[1])
-    act_dim = int(model_state[act_key].shape[0])
-    return obs_dim, act_dim
+def _ppo_checkpoint_has_actor_mlp(model_state: Dict[str, torch.Tensor]) -> bool:
+    return "a2c_network.actor_mlp.0.weight" in model_state
 
 
 def _ppo_checkpoint_has_rnn(model_state: Dict[str, torch.Tensor]) -> bool:
     return any(k.startswith("a2c_network.rnn.") for k in model_state.keys())
+
+
+def _ppo_checkpoint_has_layer_norm(model_state: Dict[str, torch.Tensor]) -> bool:
+    return "a2c_network.layer_norm.weight" in model_state
+
+
+def _infer_ppo_dims(model_state: Dict[str, torch.Tensor]) -> Tuple[int, int, int, bool]:
+    actor_mlp_obs_key = "a2c_network.actor_mlp.0.weight"
+    rnn_input_key = "a2c_network.rnn.rnn.weight_ih_l0"
+    rnn_hidden_key = "a2c_network.rnn.rnn.weight_hh_l0"
+    act_key = "a2c_network.mu.weight"
+
+    if act_key not in model_state:
+        raise RuntimeError("Failed to infer PPO action dimension: mu.weight missing.")
+
+    act_dim = int(model_state[act_key].shape[0])
+    has_actor_mlp = _ppo_checkpoint_has_actor_mlp(model_state)
+    has_rnn = _ppo_checkpoint_has_rnn(model_state)
+
+    if has_actor_mlp:
+        obs_dim = int(model_state[actor_mlp_obs_key].shape[1])
+    elif has_rnn and rnn_input_key in model_state:
+        # RNN-only checkpoint: observations feed directly into the recurrent block.
+        obs_dim = int(model_state[rnn_input_key].shape[1])
+    else:
+        raise RuntimeError(
+            "Failed to infer PPO observation dimension: neither actor_mlp nor RNN input weights found."
+        )
+
+    if has_rnn:
+        if rnn_hidden_key not in model_state:
+            raise RuntimeError("Failed to infer PPO RNN hidden size: recurrent hidden weights missing.")
+        rnn_hidden_size = int(model_state[rnn_hidden_key].shape[1])
+    else:
+        rnn_hidden_size = 0
+
+    return obs_dim, act_dim, rnn_hidden_size, has_actor_mlp
 
 
 def load_ppo_policy(checkpoint_path: str, device: str):
@@ -289,10 +371,24 @@ def load_ppo_policy(checkpoint_path: str, device: str):
     model_state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     if not isinstance(model_state, dict):
         raise RuntimeError("Unsupported checkpoint format: model state dict not found.")
-    ppo_obs_dim, ppo_act_dim = _infer_ppo_dims(model_state)
+    ppo_obs_dim, ppo_act_dim, rnn_hidden_size, has_actor_mlp = _infer_ppo_dims(model_state)
     use_rnn = _ppo_checkpoint_has_rnn(model_state)
     if use_rnn:
-        actor = PPOActorGRU(obs_dim=ppo_obs_dim, act_dim=ppo_act_dim).to(device)
+        use_layer_norm = _ppo_checkpoint_has_layer_norm(model_state)
+        if has_actor_mlp:
+            actor = PPOActorGRU(
+                obs_dim=ppo_obs_dim,
+                act_dim=ppo_act_dim,
+                rnn_hidden_size=rnn_hidden_size,
+                use_layer_norm=use_layer_norm,
+            ).to(device)
+        else:
+            actor = PPOActorRNNOnly(
+                obs_dim=ppo_obs_dim,
+                act_dim=ppo_act_dim,
+                rnn_hidden_size=rnn_hidden_size,
+                use_layer_norm=use_layer_norm,
+            ).to(device)
     else:
         actor = PPOActorMLP(obs_dim=ppo_obs_dim, act_dim=ppo_act_dim).to(device)
 
@@ -318,7 +414,7 @@ def load_ppo_policy(checkpoint_path: str, device: str):
     else:
         rms = RunningMeanStd(mean=rms_mean, var=rms_var, count=rms_count, device=device)
 
-    return actor, rms, ppo_obs_dim, ppo_act_dim, use_rnn
+    return actor, rms, ppo_obs_dim, ppo_act_dim, use_rnn, rnn_hidden_size, has_actor_mlp
 
 
 class SACActorMLP(nn.Module):
@@ -435,6 +531,7 @@ def _set_config_attr(root: Any, dotted_key: str, value: Any):
 
 
 def _apply_task_overrides(overrides: Dict[str, Any]):
+    _ensure_eval_env_modules_loaded()
     for key, value in overrides.items():
         _set_config_attr(task_config, key, value)
 
@@ -449,6 +546,7 @@ def build_env(
     use_wind_estimation_features: bool = None,
     overrides: Optional[Dict[str, Any]] = None,
 ):
+    _ensure_eval_env_modules_loaded()
     task_config.num_envs = num_envs
     task_config.seed = seed
     task_config.device = device
@@ -469,6 +567,7 @@ def apply_runtime_overrides_to_env(env, overrides: Dict[str, Any]):
     """
     Update task config and env-cached fields without creating a new Isaac Foundation.
     """
+    _ensure_eval_env_modules_loaded()
     if overrides:
         _apply_task_overrides(overrides)
 
@@ -538,6 +637,9 @@ def _collect_step_arrays(env, infos: Dict) -> Dict[str, np.ndarray]:
     num_envs_local = env.sim_env.num_envs
     zeros_bool = torch.zeros(num_envs_local, device=env.device, dtype=torch.bool)
     zeros_float = torch.zeros(num_envs_local, device=env.device, dtype=torch.float32)
+    trace_samples = int(getattr(env, "eval_drop_trace_num_samples", 64))
+    zeros_trace = torch.zeros((num_envs_local, trace_samples), device=env.device, dtype=torch.float32)
+    zeros_long = torch.zeros(num_envs_local, device=env.device, dtype=torch.long)
     dones_tensor = (env.terminations > 0) | (env.truncations > 0)
 
     drops_t = _info_tensor(infos, "drops_snapshot", "drops", zeros_bool)
@@ -552,6 +654,13 @@ def _collect_step_arrays(env, infos: Dict) -> Dict[str, np.ndarray]:
     impulse_t = _info_tensor(infos, "impulse_metric_snapshot", "", zeros_float)
     landerr_t = _info_tensor(infos, "landing_error_xy_snapshot", "", zeros_float)
     rel2tgt_t = _info_tensor(infos, "release_to_target_xy_snapshot", "", zeros_float)
+    trace_norm_t = _info_tensor(infos, "drop_trace_norm_t_snapshot", "", zeros_trace)
+    trace_error_t = _info_tensor(infos, "drop_trace_error_xy_snapshot", "", zeros_trace)
+    trace_pos_x_t = _info_tensor(infos, "drop_trace_pos_x_snapshot", "", zeros_trace)
+    trace_pos_y_t = _info_tensor(infos, "drop_trace_pos_y_snapshot", "", zeros_trace)
+    trace_pos_z_t = _info_tensor(infos, "drop_trace_pos_z_snapshot", "", zeros_trace)
+    trace_fall_steps_t = _info_tensor(infos, "drop_trace_fall_steps_snapshot", "", zeros_long)
+    trace_fall_time_t = _info_tensor(infos, "drop_trace_fall_time_snapshot", "", zeros_float)
 
     return {
         "drops": _to_numpy_bool(drops_t),
@@ -566,6 +675,13 @@ def _collect_step_arrays(env, infos: Dict) -> Dict[str, np.ndarray]:
         "impulse": _to_numpy_float(impulse_t),
         "landing_error_xy": _to_numpy_float(landerr_t),
         "release_to_target_xy": _to_numpy_float(rel2tgt_t),
+        "trace_norm_t": _to_numpy_float(trace_norm_t),
+        "trace_error_xy": _to_numpy_float(trace_error_t),
+        "trace_pos_x": _to_numpy_float(trace_pos_x_t),
+        "trace_pos_y": _to_numpy_float(trace_pos_y_t),
+        "trace_pos_z": _to_numpy_float(trace_pos_z_t),
+        "trace_fall_steps": _to_numpy_float(trace_fall_steps_t),
+        "trace_fall_time": _to_numpy_float(trace_fall_time_t),
     }
 
 
@@ -628,6 +744,38 @@ def _build_case_row(
             }
         )
     return row
+
+
+def _build_post_drop_trace_record(
+    method: str,
+    seed: int,
+    case_seed: int,
+    batch_idx: int,
+    env_id: int,
+    case_id: int,
+    sim_step: int,
+    crashed: bool,
+    timeout: bool,
+    arrays: Dict[str, np.ndarray],
+) -> Dict[str, Any]:
+    return {
+        "method": method,
+        "seed": int(seed),
+        "case_seed": int(case_seed),
+        "batch_idx": int(batch_idx),
+        "case_id": int(case_id),
+        "env_id": int(env_id),
+        "sim_step": int(sim_step),
+        "crashed": int(crashed),
+        "timeout": int(timeout),
+        "trace_fall_steps": int(round(float(arrays["trace_fall_steps"][env_id]))),
+        "trace_fall_time_s": float(arrays["trace_fall_time"][env_id]),
+        "norm_t": np.asarray(arrays["trace_norm_t"][env_id], dtype=np.float32).copy(),
+        "error_xy_m": np.asarray(arrays["trace_error_xy"][env_id], dtype=np.float32).copy(),
+        "pos_x_m": np.asarray(arrays["trace_pos_x"][env_id], dtype=np.float32).copy(),
+        "pos_y_m": np.asarray(arrays["trace_pos_y"][env_id], dtype=np.float32).copy(),
+        "pos_z_m": np.asarray(arrays["trace_pos_z"][env_id], dtype=np.float32).copy(),
+    }
 
 
 def _run_method_on_case_batch(
@@ -818,7 +966,7 @@ def _run_method_on_case_batch_generic(
     valid_env_count: int,
     device: str,
     post_reset_hook: Optional[Callable[[Any, int], None]] = None,
-) -> Tuple[List[Dict[str, float]], MethodSummary]:
+) -> Tuple[List[Dict[str, float]], MethodSummary, List[Dict[str, Any]]]:
     env.seed(case_seed)
     env.reset()
     # Eval-only safety: some backends keep non-zero per-env step counters across resets.
@@ -841,6 +989,7 @@ def _run_method_on_case_batch_generic(
     done_seen = np.logical_not(active_eval)
 
     rows_by_env: List[Dict[str, float]] = [None] * valid_env_count
+    trace_records: List[Dict[str, Any]] = []
     done_total = 0
     drop_done = 0
     no_drop_done = 0
@@ -849,7 +998,11 @@ def _run_method_on_case_batch_generic(
 
     hidden = None
     if method_spec.kind == "ppo" and method_spec.use_rnn:
-        hidden = torch.zeros((1, num_envs, 64), device=device, dtype=torch.float32)
+        hidden = torch.zeros(
+            (1, num_envs, int(method_spec.rnn_hidden_size)),
+            device=device,
+            dtype=torch.float32,
+        )
 
     while (not np.all(done_seen)) and sim_step < max_steps:
         obs_full = env.task_obs["observations"]
@@ -913,6 +1066,21 @@ def _run_method_on_case_batch_generic(
                     timeout=timeout,
                     arrays=arrays,
                 )
+                if dropped:
+                    trace_records.append(
+                        _build_post_drop_trace_record(
+                            method=method_spec.name,
+                            seed=seed,
+                            case_seed=case_seed,
+                            batch_idx=batch_idx,
+                            env_id=int(idx),
+                            case_id=int(case_id),
+                            sim_step=sim_step,
+                            crashed=crashed,
+                            timeout=timeout,
+                            arrays=arrays,
+                        )
+                    )
                 done_total += 1
                 if dropped:
                     drop_done += 1
@@ -953,7 +1121,7 @@ def _run_method_on_case_batch_generic(
         drop_done=drop_done,
         no_drop_done=no_drop_done,
     )
-    return rows, summary
+    return rows, summary, trace_records
 
 
 def evaluate_methods_single_seed(
@@ -963,9 +1131,10 @@ def evaluate_methods_single_seed(
     episodes_target: int,
     device: str,
     post_reset_hook: Optional[Callable[[Any, int], None]] = None,
-) -> Tuple[List[Dict[str, float]], List[MethodSummary]]:
+) -> Tuple[List[Dict[str, float]], List[MethodSummary], List[Dict[str, Any]]]:
     num_envs = env.sim_env.num_envs
     all_rows: List[Dict[str, float]] = []
+    all_trace_records: List[Dict[str, Any]] = []
     summary_map: Dict[str, MethodSummary] = {
         m.name: MethodSummary(method=m.name, seed=seed, done_total=0, drop_done=0, no_drop_done=0)
         for m in method_specs
@@ -978,7 +1147,7 @@ def evaluate_methods_single_seed(
         case_seed = int(seed + batch_idx * CASE_SEED_STRIDE)
 
         for method_spec in method_specs:
-            rows_batch, summary_batch = _run_method_on_case_batch_generic(
+            rows_batch, summary_batch, trace_records_batch = _run_method_on_case_batch_generic(
                 env=env,
                 method_spec=method_spec,
                 seed=seed,
@@ -990,6 +1159,7 @@ def evaluate_methods_single_seed(
                 post_reset_hook=post_reset_hook,
             )
             all_rows.extend(rows_batch)
+            all_trace_records.extend(trace_records_batch)
             agg = summary_map[method_spec.name]
             agg.done_total += summary_batch.done_total
             agg.drop_done += summary_batch.drop_done
@@ -1001,7 +1171,7 @@ def evaluate_methods_single_seed(
         case_offset += valid_env_count
         batch_idx += 1
 
-    return all_rows, [summary_map[m.name] for m in method_specs]
+    return all_rows, [summary_map[m.name] for m in method_specs], all_trace_records
 
 
 def evaluate_paired_single_seed(
@@ -1122,6 +1292,204 @@ def write_rows_csv(path: str, rows: List[Dict[str, float]]):
         writer.writerows(rows)
 
 
+def _safe_int_from_csv(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    text = str(value).strip()
+    if text == "":
+        return default
+    try:
+        return int(float(text))
+    except Exception:
+        return default
+
+
+def _safe_float_from_csv(value: Any, default: float = float("nan")) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (float, int, np.floating, np.integer)):
+        return float(value)
+    text = str(value).strip()
+    if text == "":
+        return default
+    try:
+        return float(text)
+    except Exception:
+        return default
+
+
+def _normalize_saved_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    if "landing_error_xy_m" in row and "done_reached" in row:
+        out = dict(row)
+        out["seed"] = _safe_int_from_csv(out.get("seed", 0), default=0)
+        out["case_seed"] = _safe_int_from_csv(out.get("case_seed", out["seed"]), default=out["seed"])
+        out["batch_idx"] = _safe_int_from_csv(out.get("batch_idx", 0), default=0)
+        out["case_id"] = _safe_int_from_csv(out.get("case_id", 0), default=0)
+        out["env_id"] = _safe_int_from_csv(out.get("env_id", out["case_id"]), default=out["case_id"])
+        out["sim_step"] = _safe_int_from_csv(out.get("sim_step", 0), default=0)
+        out["done_reached"] = _safe_int_from_csv(out.get("done_reached", 0), default=0)
+        out["dropped"] = _safe_int_from_csv(out.get("dropped", 0), default=0)
+        out["crashed"] = _safe_int_from_csv(out.get("crashed", 0), default=0)
+        out["timeout"] = _safe_int_from_csv(out.get("timeout", 0), default=0)
+        out["no_drop_done"] = _safe_int_from_csv(
+            out.get("no_drop_done", int(out["done_reached"] == 1 and out["dropped"] == 0)),
+            default=int(out["done_reached"] == 1 and out["dropped"] == 0),
+        )
+        for metric_key in [
+            "roll_deg",
+            "pitch_deg",
+            "yaw_deg",
+            "landing_error_xy_m",
+            "release_to_target_xy_m",
+            "delta_theta_rad",
+            "delta_theta_deg",
+            "delta_omega_rad_s",
+            "delta_omega_deg_s",
+            "impulse_metric",
+        ]:
+            out[metric_key] = _safe_float_from_csv(out.get(metric_key, float("nan")))
+        return out
+
+    method = str(row.get("method", "")).strip()
+    seed = _safe_int_from_csv(row.get("seed", 0), default=0)
+    case_index = _safe_int_from_csv(row.get("case_id", row.get("case_index", 0)), default=0)
+    done_reached = _safe_int_from_csv(row.get("done_reached", 1), default=1)
+    dropped = _safe_int_from_csv(row.get("dropped", 0), default=0)
+    crashed = _safe_int_from_csv(row.get("crashed", row.get("termination_flag", 0)), default=0)
+    timeout = _safe_int_from_csv(row.get("timeout", row.get("timeout_flag", 0)), default=0)
+    normalized = {
+        "method": method,
+        "seed": seed,
+        "case_seed": _safe_int_from_csv(row.get("case_seed", seed), default=seed),
+        "batch_idx": _safe_int_from_csv(row.get("batch_idx", 0), default=0),
+        "case_id": case_index,
+        "env_id": _safe_int_from_csv(row.get("env_id", case_index), default=case_index),
+        "sim_step": _safe_int_from_csv(row.get("sim_step", 0), default=0),
+        "done_reached": done_reached,
+        "dropped": dropped,
+        "crashed": crashed,
+        "timeout": timeout,
+        "no_drop_done": int(done_reached == 1 and dropped == 0),
+        "roll_deg": _safe_float_from_csv(row.get("roll_deg", row.get("drop_roll_deg", float("nan")))),
+        "pitch_deg": _safe_float_from_csv(row.get("pitch_deg", row.get("drop_pitch_deg", float("nan")))),
+        "yaw_deg": _safe_float_from_csv(row.get("yaw_deg", float("nan"))),
+        "landing_error_xy_m": _safe_float_from_csv(
+            row.get("landing_error_xy_m", row.get("drop_error_xy", float("nan")))
+        ),
+        "release_to_target_xy_m": _safe_float_from_csv(row.get("release_to_target_xy_m", float("nan"))),
+        "delta_theta_rad": _safe_float_from_csv(row.get("delta_theta_rad", float("nan"))),
+        "delta_theta_deg": _safe_float_from_csv(row.get("delta_theta_deg", float("nan"))),
+        "delta_omega_rad_s": _safe_float_from_csv(row.get("delta_omega_rad_s", float("nan"))),
+        "delta_omega_deg_s": _safe_float_from_csv(row.get("delta_omega_deg_s", float("nan"))),
+        "impulse_metric": _safe_float_from_csv(row.get("impulse_metric", float("nan"))),
+    }
+    return normalized
+
+
+def load_rows_csv(path: str) -> List[Dict[str, str]]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Saved evaluation CSV not found: {path}")
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        return [_normalize_saved_row(dict(row)) for row in reader]
+
+
+def _empty_post_drop_trace_bundle(num_samples: int = 0) -> Dict[str, np.ndarray]:
+    return {
+        "method": np.asarray([], dtype="<U16"),
+        "seed": np.asarray([], dtype=np.int64),
+        "case_seed": np.asarray([], dtype=np.int64),
+        "batch_idx": np.asarray([], dtype=np.int64),
+        "case_id": np.asarray([], dtype=np.int64),
+        "env_id": np.asarray([], dtype=np.int64),
+        "sim_step": np.asarray([], dtype=np.int64),
+        "crashed": np.asarray([], dtype=np.int64),
+        "timeout": np.asarray([], dtype=np.int64),
+        "trace_fall_steps": np.asarray([], dtype=np.int64),
+        "trace_fall_time_s": np.asarray([], dtype=np.float32),
+        "norm_t": np.zeros((0, num_samples), dtype=np.float32),
+        "error_xy_m": np.zeros((0, num_samples), dtype=np.float32),
+        "pos_x_m": np.zeros((0, num_samples), dtype=np.float32),
+        "pos_y_m": np.zeros((0, num_samples), dtype=np.float32),
+        "pos_z_m": np.zeros((0, num_samples), dtype=np.float32),
+    }
+
+
+def write_post_drop_traces_npz(path: str, trace_records: List[Dict[str, Any]]) -> str:
+    if not trace_records:
+        np.savez_compressed(path, **_empty_post_drop_trace_bundle())
+        return path
+    num_samples = int(np.asarray(trace_records[0]["norm_t"]).shape[0])
+    bundle = {
+        "method": np.asarray([str(r["method"]) for r in trace_records]),
+        "seed": np.asarray([int(r["seed"]) for r in trace_records], dtype=np.int64),
+        "case_seed": np.asarray([int(r["case_seed"]) for r in trace_records], dtype=np.int64),
+        "batch_idx": np.asarray([int(r["batch_idx"]) for r in trace_records], dtype=np.int64),
+        "case_id": np.asarray([int(r["case_id"]) for r in trace_records], dtype=np.int64),
+        "env_id": np.asarray([int(r["env_id"]) for r in trace_records], dtype=np.int64),
+        "sim_step": np.asarray([int(r["sim_step"]) for r in trace_records], dtype=np.int64),
+        "crashed": np.asarray([int(r["crashed"]) for r in trace_records], dtype=np.int64),
+        "timeout": np.asarray([int(r["timeout"]) for r in trace_records], dtype=np.int64),
+        "trace_fall_steps": np.asarray(
+            [int(r["trace_fall_steps"]) for r in trace_records], dtype=np.int64
+        ),
+        "trace_fall_time_s": np.asarray(
+            [float(r["trace_fall_time_s"]) for r in trace_records], dtype=np.float32
+        ),
+        "norm_t": np.stack(
+            [np.asarray(r["norm_t"], dtype=np.float32) for r in trace_records], axis=0
+        ).reshape(-1, num_samples),
+        "error_xy_m": np.stack(
+            [np.asarray(r["error_xy_m"], dtype=np.float32) for r in trace_records], axis=0
+        ).reshape(-1, num_samples),
+        "pos_x_m": np.stack(
+            [np.asarray(r["pos_x_m"], dtype=np.float32) for r in trace_records], axis=0
+        ).reshape(-1, num_samples),
+        "pos_y_m": np.stack(
+            [np.asarray(r["pos_y_m"], dtype=np.float32) for r in trace_records], axis=0
+        ).reshape(-1, num_samples),
+        "pos_z_m": np.stack(
+            [np.asarray(r["pos_z_m"], dtype=np.float32) for r in trace_records], axis=0
+        ).reshape(-1, num_samples),
+    }
+    np.savez_compressed(path, **bundle)
+    return path
+
+
+def load_post_drop_traces_npz(path: str) -> Dict[str, np.ndarray]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Saved post-drop trace file not found: {path}")
+    with np.load(path, allow_pickle=False) as data:
+        bundle = {k: data[k] for k in data.files}
+    if "method" not in bundle:
+        return _empty_post_drop_trace_bundle()
+    return bundle
+
+
+def build_summaries_from_rows(rows: List[Dict[str, Any]], methods: List[str]) -> List[MethodSummary]:
+    summaries: List[MethodSummary] = []
+    for method in methods:
+        done_rows = [
+            r for r in rows if str(r.get("method", "")) == method and int(r.get("done_reached", 0)) == 1
+        ]
+        seed = int(done_rows[0].get("seed", 0)) if done_rows else 0
+        done_total = len(done_rows)
+        drop_done = sum(int(r.get("dropped", 0)) for r in done_rows)
+        no_drop_done = sum(int(r.get("no_drop_done", 0)) for r in done_rows)
+        summaries.append(
+            MethodSummary(
+                method=method,
+                seed=seed,
+                done_total=done_total,
+                drop_done=drop_done,
+                no_drop_done=no_drop_done,
+            )
+        )
+    return summaries
+
+
 def metric_stats(values: np.ndarray):
     values = values[np.isfinite(values)]
     if values.size == 0:
@@ -1179,7 +1547,10 @@ def save_summary_tables(stats_dir: str, rows: List[Dict[str, float]], summaries:
         for method in methods:
             method_rows = [r for r in rows if r["method"] == method]
             for metric in metrics:
-                arr = np.array([float(r[metric]) for r in method_rows], dtype=np.float64)
+                arr = np.array(
+                    [float(r.get(metric, float("nan"))) for r in method_rows],
+                    dtype=np.float64,
+                )
                 st = metric_stats(arr)
                 w_mean.writerow(
                     [method, metric, st["n"], st["mean"], st["std"], st["min"], st["max"]]
@@ -1270,6 +1641,8 @@ def method_display_name(method: str) -> str:
         return "PPO-GRU"
     if method == "ppo_gru":
         return "PPO-GRU"
+    if method == "ppo_rnn":
+        return "PPO-RNN"
     if method == "mpc":
         return "MPC"
     return method.upper()
@@ -1965,6 +2338,7 @@ def plot_multi_method_cdf_single_metric(
         "ppo_baseline": "#1f77b4",
         "ppo_gru": "#d62728",
         "ppo_gru_plus": "#d62728",
+        "ppo_rnn": "#ff7f0e",
         "mpc": "#2ca02c",
     }
 
@@ -2006,9 +2380,12 @@ def _moving_mean_std(values: np.ndarray, window: int) -> Tuple[np.ndarray, np.nd
     vals = np.asarray(values, dtype=np.float64)
     if vals.size == 0:
         return vals.copy(), vals.copy()
+    if vals.size < 3:
+        return vals.copy(), np.zeros_like(vals, dtype=np.float64)
     w = int(max(3, min(window, vals.size)))
     if w % 2 == 0:
-        w += 1
+        w -= 1
+    w = int(max(3, min(w, vals.size if vals.size % 2 == 1 else vals.size - 1)))
     kernel = np.ones(w, dtype=np.float64) / float(w)
     mean = np.convolve(vals, kernel, mode="same")
     mean_sq = np.convolve(vals * vals, kernel, mode="same")
@@ -2030,6 +2407,7 @@ def plot_multi_method_roll_pitch_case_series(
         "ppo_baseline": "#1f77b4",
         "ppo_gru": "#d62728",
         "ppo_gru_plus": "#d62728",
+        "ppo_rnn": "#ff7f0e",
         "mpc": "#2ca02c",
     }
     metric_specs = [
@@ -2250,7 +2628,7 @@ def plot_four_pdf_comparison_table(
             ]
         )
 
-    # Cross-case analysis: among MPC no-drop cases, how PPO/PPO-GRU behave.
+    # Cross-case analysis: among MPC no-drop cases, how learned policies behave.
     col_labels_cross = [
         "Method",
         "In MPC-NoDrop",
@@ -2268,7 +2646,7 @@ def plot_four_pdf_comparison_table(
             for cid, r in case_map["mpc"].items()
             if int(r.get("done_reached", 0)) == 1 and int(r.get("dropped", 0)) == 0
         }
-        for method in ("ppo", "ppo_gru"):
+        for method in [m for m in methods if m != "mpc"]:
             if method not in case_map:
                 continue
             in_ref_rows = [
@@ -2330,8 +2708,10 @@ def plot_four_pdf_comparison_table(
         t2.auto_set_font_size(False)
         t2.set_fontsize(10)
         t2.scale(1.0, 1.42)
+    learned_labels = "/".join(method_display_name(m) for m in methods if m != "mpc")
     axes[2].set_title(
-        f"Cross-Case Check: PPO/PPO-GRU on MPC No-Drop Cases (large error > {large_error_threshold_m:.1f}m)",
+        f"Cross-Case Check: {learned_labels} on MPC No-Drop Cases "
+        f"(large error > {large_error_threshold_m:.1f}m)",
         fontweight="bold",
         pad=8,
     )
@@ -2339,6 +2719,240 @@ def plot_four_pdf_comparison_table(
     fig.suptitle(title, fontsize=20, fontweight="bold")
     fig.savefig(out_pdf, dpi=600, bbox_inches="tight")
     plt.close(fig)
+
+
+def _preferred_method_order() -> List[str]:
+    return ["ppo", "ppo_gru", "ppo_rnn", "mpc"]
+
+
+def save_condition_eval_artifacts(
+    raw_dir: str,
+    stats_dir: str,
+    rows: List[Dict[str, float]],
+    trace_records: List[Dict[str, Any]],
+    summaries: List[MethodSummary],
+    methods: List[str],
+) -> Tuple[str, str]:
+    raw_csv_path = os.path.join(raw_dir, "combined_drop_metrics.csv")
+    trace_npz_path = os.path.join(raw_dir, "post_drop_trace.npz")
+    write_rows_csv(raw_csv_path, rows)
+    write_post_drop_traces_npz(trace_npz_path, trace_records)
+    save_summary_tables(stats_dir=stats_dir, rows=rows, summaries=summaries)
+    save_condition_key_metrics_csv(
+        stats_dir=stats_dir,
+        rows=rows,
+        summaries=summaries,
+        methods=methods,
+    )
+    return raw_csv_path, trace_npz_path
+
+
+def render_condition_outputs(
+    rows: List[Dict[str, Any]],
+    methods: List[str],
+    experiment_display_name: str,
+    condition_display_name: str,
+    fig_dir: str,
+    large_error_threshold_m: float,
+):
+    # 1) Precision CDF
+    plot_multi_method_cdf_single_metric(
+        rows=rows,
+        methods=methods,
+        metric_key="landing_error_xy_m",
+        title=f"{experiment_display_name} | {condition_display_name} | Landing Precision CDF",
+        x_label="Landing Error XY (m)",
+        out_pdf=os.path.join(fig_dir, "precision_cdf.pdf"),
+        use_abs=False,
+    )
+
+    # 2) Case-level ROLL/PITCH series (with shadow)
+    plot_multi_method_roll_pitch_case_series(
+        rows=rows,
+        methods=methods,
+        title=f"{experiment_display_name} | {condition_display_name} | Roll/Pitch",
+        out_pdf=os.path.join(fig_dir, "roll_pitch_case.pdf"),
+    )
+
+    # 3) Impact CDF
+    plot_multi_method_cdf_single_metric(
+        rows=rows,
+        methods=methods,
+        metric_key="impulse_metric",
+        title=f"{experiment_display_name} | {condition_display_name} | Impact CDF",
+        x_label="Impact Metric",
+        out_pdf=os.path.join(fig_dir, "impact_cdf.pdf"),
+        use_abs=False,
+    )
+
+    # 4) Summary table PDF
+    plot_four_pdf_comparison_table(
+        rows=rows,
+        methods=methods,
+        title=f"{experiment_display_name} | {condition_display_name} | Comparison Table",
+        out_pdf=os.path.join(fig_dir, "summary_table.pdf"),
+        large_error_threshold_m=float(large_error_threshold_m),
+    )
+
+
+def _wind_condition_style(condition_name: str) -> Tuple[str, str]:
+    if condition_name == "weak_wind":
+        return "Weak Wind", "#2ca02c"
+    if condition_name == "medium_wind":
+        return "Medium Wind", "#ff7f0e"
+    if condition_name == "strong_wind":
+        return "Strong Wind", "#d62728"
+    return condition_name, "#1f77b4"
+
+
+def save_post_drop_wind_summary_csv(
+    out_csv: str,
+    condition_trace_bundles: Dict[str, Dict[str, np.ndarray]],
+    methods: List[str],
+):
+    with open(out_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "method",
+                "wind_condition",
+                "wind_label",
+                "n_valid_drop",
+                "mean_final_error_m",
+                "median_final_error_m",
+                "p90_final_error_m",
+                "mean_fall_time_s",
+                "median_fall_time_s",
+            ]
+        )
+        for condition_name, bundle in condition_trace_bundles.items():
+            wind_label, _ = _wind_condition_style(condition_name)
+            for method in methods:
+                mask = (bundle["method"] == method) & (bundle["crashed"] == 0)
+                n = int(np.sum(mask))
+                final_err = bundle["error_xy_m"][mask, -1] if n > 0 else np.asarray([], dtype=np.float32)
+                fall_time = (
+                    bundle["trace_fall_time_s"][mask] if n > 0 else np.asarray([], dtype=np.float32)
+                )
+                mean_final = float(np.mean(final_err)) if final_err.size > 0 else float("nan")
+                median_final = float(np.median(final_err)) if final_err.size > 0 else float("nan")
+                p90_final = (
+                    float(np.percentile(final_err, 90.0)) if final_err.size > 0 else float("nan")
+                )
+                mean_fall = float(np.mean(fall_time)) if fall_time.size > 0 else float("nan")
+                median_fall = float(np.median(fall_time)) if fall_time.size > 0 else float("nan")
+                w.writerow(
+                    [
+                        method_display_name(method),
+                        condition_name,
+                        wind_label,
+                        n,
+                        mean_final,
+                        median_final,
+                        p90_final,
+                        mean_fall,
+                        median_fall,
+                    ]
+                )
+
+
+def plot_post_drop_wind_error_evolution(
+    condition_trace_bundles: Dict[str, Dict[str, np.ndarray]],
+    methods: List[str],
+    title: str,
+    out_pdf: str,
+):
+    set_paper_style()
+    n_methods = len(methods)
+    if n_methods <= 0:
+        return
+    if n_methods <= 3:
+        ncols = n_methods
+    else:
+        ncols = 2
+    nrows = int(math.ceil(float(n_methods) / float(ncols)))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(8.6 * ncols, 5.6 * nrows),
+        constrained_layout=True,
+    )
+    axes = np.atleast_1d(axes).reshape(nrows, ncols)
+
+    ordered_conditions = [c for c in ["weak_wind", "medium_wind", "strong_wind"] if c in condition_trace_bundles]
+
+    for ax_idx, method in enumerate(methods):
+        ax = axes.flat[ax_idx]
+        for condition_name in ordered_conditions:
+            bundle = condition_trace_bundles[condition_name]
+            mask = (bundle["method"] == method) & (bundle["crashed"] == 0)
+            n = int(np.sum(mask))
+            if n <= 0:
+                continue
+            x = np.asarray(bundle["norm_t"][mask][0], dtype=np.float64)
+            curves = np.asarray(bundle["error_xy_m"][mask], dtype=np.float64)
+            if curves.ndim != 2 or curves.shape[1] <= 0:
+                continue
+            median = np.nanmedian(curves, axis=0)
+            q1 = np.nanpercentile(curves, 25.0, axis=0)
+            q3 = np.nanpercentile(curves, 75.0, axis=0)
+            p90 = np.nanpercentile(curves, 90.0, axis=0)
+            wind_label, color = _wind_condition_style(condition_name)
+            ax.plot(x, median, color=color, linewidth=2.6, label=f"{wind_label} (N={n})")
+            ax.fill_between(x, q1, q3, color=color, alpha=0.18)
+            ax.plot(x, p90, color=color, linewidth=1.2, linestyle="--", alpha=0.75)
+
+        ax.set_title(method_display_name(method), fontweight="bold", pad=10)
+        ax.set_xlabel("Normalized Post-DROP Time")
+        ax.set_ylabel("Post-DROP XY Error (m)")
+        ax.grid(True, linestyle="--", linewidth=1.0, alpha=0.5, color="#b0b0b0")
+        leg = ax.legend(loc="best", frameon=True, fancybox=False, framealpha=0.95)
+        leg.get_frame().set_linewidth(1.0)
+        leg.get_frame().set_edgecolor("#222222")
+
+    for ax in axes.flat[n_methods:]:
+        ax.axis("off")
+
+    fig.suptitle(title, fontsize=20, fontweight="bold")
+    fig.savefig(out_pdf, dpi=600, bbox_inches="tight")
+    plt.close(fig)
+
+
+def render_experiment_level_outputs(exp_root: str, exp: ExperimentSpec):
+    if exp.name != "exp4_fixedH_multiW_obs":
+        return
+    _, exp_stats_dir, exp_fig_dir = ensure_dirs(exp_root)
+    condition_trace_bundles: Dict[str, Dict[str, np.ndarray]] = {}
+    for cond in exp.conditions:
+        trace_path = os.path.join(exp_root, cond.name, "raw", "post_drop_trace.npz")
+        if not os.path.exists(trace_path):
+            logger.warning(f"Skip experiment-level wind figure, missing trace file: {trace_path}")
+            return
+        condition_trace_bundles[cond.name] = load_post_drop_traces_npz(trace_path)
+
+    present_methods = set()
+    for bundle in condition_trace_bundles.values():
+        for method in bundle.get("method", np.asarray([], dtype="<U16")):
+            present_methods.add(str(method))
+    methods = _methods_in_rows(
+        [{"method": m} for m in present_methods],
+        preferred_order=_preferred_method_order(),
+    )
+    if not methods:
+        logger.warning("Skip experiment-level wind figure due to empty post-drop traces.")
+        return
+
+    save_post_drop_wind_summary_csv(
+        out_csv=os.path.join(exp_stats_dir, "post_drop_wind_summary.csv"),
+        condition_trace_bundles=condition_trace_bundles,
+        methods=methods,
+    )
+    plot_post_drop_wind_error_evolution(
+        condition_trace_bundles=condition_trace_bundles,
+        methods=methods,
+        title=f"{exp.display_name} | Post-DROP Error Evolution Across Wind Strengths",
+        out_pdf=os.path.join(exp_fig_dir, "post_drop_error_evolution_wind.pdf"),
+    )
 
 
 def _compute_key_metric_stats(rows: List[Dict[str, float]], method: str) -> Dict[str, float]:
@@ -2696,7 +3310,7 @@ def _parse_experiment_ids(text: str) -> List[int]:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Paper comparison: PPO vs PPO-GRU vs MPC across five DROP experiments."
+        description="Paper comparison: PPO vs PPO-GRU vs optional PPO-RNN vs MPC across five DROP experiments."
     )
     parser.add_argument(
         "--baseline_checkpoint",
@@ -2710,7 +3324,22 @@ def parse_args():
         default=DEFAULT_GRU_CHECKPOINT,
         help="PPO-GRU checkpoint path.",
     )
+    parser.add_argument(
+        "--rnn_checkpoint",
+        type=str,
+        default=DEFAULT_RNN_CHECKPOINT,
+        help="Optional pure PPO-RNN checkpoint path. If empty, PPO-RNN is skipped.",
+    )
     parser.add_argument("--output_root", type=str, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--render_only_from_saved",
+        type=lambda x: bool(distutils.util.strtobool(x)),
+        default=False,
+        help=(
+            "Skip simulation and regenerate PDFs directly from saved "
+            "raw/combined_drop_metrics.csv files under output_root."
+        ),
+    )
     parser.add_argument("--num_envs", type=int, default=256)
     parser.add_argument("--episodes_per_seed", type=int, default=2000)
     parser.add_argument("--episode_len_steps", type=int, default=1000)
@@ -2785,10 +3414,54 @@ def main():
     seeds = parse_seed_list(args.seeds)
     os.makedirs(args.output_root, exist_ok=True)
 
-    logger.info("Paper comparison: PPO vs PPO-GRU vs MPC (five experiments)")
+    logger.info("Paper comparison: PPO vs PPO-GRU vs optional PPO-RNN vs MPC (five experiments)")
     logger.info(f"baseline_checkpoint={args.baseline_checkpoint}")
     logger.info(f"gru_checkpoint={args.gru_checkpoint}")
+    logger.info(f"rnn_checkpoint={args.rnn_checkpoint or '<disabled>'}")
     logger.info(f"output_root={args.output_root}")
+
+    all_experiments = _experiment_specs()
+    selected_ids = _parse_experiment_ids(args.experiments)
+    selected_experiments: List[ExperimentSpec] = []
+    for exp_id in selected_ids:
+        if exp_id < 1 or exp_id > len(all_experiments):
+            raise ValueError(f"Invalid experiment id: {exp_id}, valid range is 1-{len(all_experiments)}")
+        selected_experiments.append(all_experiments[exp_id - 1])
+
+    if bool(args.render_only_from_saved):
+        logger.info("Render-only mode: regenerate PDFs directly from saved raw CSV files.")
+        for exp in selected_experiments:
+            exp_root = os.path.join(args.output_root, exp.name)
+            os.makedirs(exp_root, exist_ok=True)
+            logger.info(f"[render-only] {exp.display_name}")
+
+            for cond in exp.conditions:
+                cond_root = os.path.join(exp_root, cond.name)
+                raw_dir, stats_dir, fig_dir = ensure_dirs(cond_root)
+                raw_csv_path = os.path.join(raw_dir, "combined_drop_metrics.csv")
+                rows = load_rows_csv(raw_csv_path)
+                methods = _methods_in_rows(rows, preferred_order=_preferred_method_order())
+                summaries = build_summaries_from_rows(rows=rows, methods=methods)
+                save_summary_tables(stats_dir=stats_dir, rows=rows, summaries=summaries)
+                save_condition_key_metrics_csv(
+                    stats_dir=stats_dir,
+                    rows=rows,
+                    summaries=summaries,
+                    methods=methods,
+                )
+                render_condition_outputs(
+                    rows=rows,
+                    methods=methods,
+                    experiment_display_name=exp.display_name,
+                    condition_display_name=cond.display_name,
+                    fig_dir=fig_dir,
+                    large_error_threshold_m=float(args.large_error_threshold_m),
+                )
+                logger.info(
+                    f"[render-only] Regenerated PDFs from {raw_csv_path} into {fig_dir}"
+                )
+            render_experiment_level_outputs(exp_root=exp_root, exp=exp)
+        return
 
     if len(seeds) > 1:
         logger.warning(
@@ -2798,12 +3471,46 @@ def main():
         )
     seed = seeds[0]
 
-    ppo_actor, ppo_rms, ppo_obs_dim, ppo_act_dim, ppo_use_rnn = load_ppo_policy(
+    (
+        ppo_actor,
+        ppo_rms,
+        ppo_obs_dim,
+        ppo_act_dim,
+        ppo_use_rnn,
+        ppo_rnn_hidden_size,
+        ppo_has_actor_mlp,
+    ) = load_ppo_policy(
         checkpoint_path=args.baseline_checkpoint, device=args.device
     )
-    gru_actor, gru_rms, gru_obs_dim, gru_act_dim, gru_use_rnn = load_ppo_policy(
+    (
+        gru_actor,
+        gru_rms,
+        gru_obs_dim,
+        gru_act_dim,
+        gru_use_rnn,
+        gru_rnn_hidden_size,
+        gru_has_actor_mlp,
+    ) = load_ppo_policy(
         checkpoint_path=args.gru_checkpoint, device=args.device
     )
+    rnn_actor = None
+    rnn_rms = None
+    rnn_obs_dim = 0
+    rnn_act_dim = None
+    rnn_use_rnn = False
+    rnn_hidden_size = 0
+    rnn_has_actor_mlp = False
+    rnn_checkpoint = str(args.rnn_checkpoint).strip()
+    if rnn_checkpoint:
+        (
+            rnn_actor,
+            rnn_rms,
+            rnn_obs_dim,
+            rnn_act_dim,
+            rnn_use_rnn,
+            rnn_hidden_size,
+            rnn_has_actor_mlp,
+        ) = load_ppo_policy(checkpoint_path=rnn_checkpoint, device=args.device)
 
     if ppo_use_rnn:
         raise RuntimeError(
@@ -2815,24 +3522,37 @@ def main():
             "gru_checkpoint appears to be pure MLP. "
             "Please provide PPO-GRU checkpoint."
         )
+    if not gru_has_actor_mlp:
+        raise RuntimeError(
+            "gru_checkpoint appears to be RNN-only. "
+            "Please provide a PPO-GRU checkpoint with actor_mlp + GRU."
+        )
+    if rnn_checkpoint and (not rnn_use_rnn or rnn_has_actor_mlp):
+        raise RuntimeError(
+            "rnn_checkpoint must be a pure RNN checkpoint: GRU weights present and actor_mlp weights absent."
+        )
     if int(ppo_act_dim) != int(gru_act_dim):
         raise RuntimeError(
             f"Action dim mismatch between PPO and PPO-GRU checkpoints: {ppo_act_dim} vs {gru_act_dim}"
         )
+    if rnn_checkpoint and int(ppo_act_dim) != int(rnn_act_dim):
+        raise RuntimeError(
+            f"Action dim mismatch between PPO and PPO-RNN checkpoints: {ppo_act_dim} vs {rnn_act_dim}"
+        )
 
-    eval_obs_dim = max(int(ppo_obs_dim), int(gru_obs_dim))
+    obs_dims = [int(ppo_obs_dim), int(gru_obs_dim)]
+    if rnn_checkpoint:
+        obs_dims.append(int(rnn_obs_dim))
+    eval_obs_dim = max(obs_dims)
     use_augmented_obs = bool(eval_obs_dim > 12)
     logger.info(
         f"Policy dims: ppo(obs={ppo_obs_dim}, act={ppo_act_dim}, rnn={ppo_use_rnn}), "
-        f"gru(obs={gru_obs_dim}, act={gru_act_dim}, rnn={gru_use_rnn}), eval_obs_dim={eval_obs_dim}"
+        f"gru(obs={gru_obs_dim}, act={gru_act_dim}, rnn={gru_use_rnn}, hidden={gru_rnn_hidden_size}), "
+        f"rnn(obs={rnn_obs_dim if rnn_checkpoint else 'disabled'}, "
+        f"act={rnn_act_dim if rnn_checkpoint else 'disabled'}, "
+        f"hidden={rnn_hidden_size if rnn_checkpoint else 'disabled'}), "
+        f"eval_obs_dim={eval_obs_dim}"
     )
-    all_experiments = _experiment_specs()
-    selected_ids = _parse_experiment_ids(args.experiments)
-    selected_experiments: List[ExperimentSpec] = []
-    for exp_id in selected_ids:
-        if exp_id < 1 or exp_id > len(all_experiments):
-            raise ValueError(f"Invalid experiment id: {exp_id}, valid range is 1-{len(all_experiments)}")
-        selected_experiments.append(all_experiments[exp_id - 1])
 
     first_overrides = (
         selected_experiments[0].conditions[0].overrides if selected_experiments and selected_experiments[0].conditions else {}
@@ -2848,10 +3568,15 @@ def main():
         overrides=first_overrides,
     )
     env_act_dim = int(env.task_config.action_space_dim)
-    if env_act_dim != int(ppo_act_dim) or env_act_dim != int(gru_act_dim):
+    if (
+        env_act_dim != int(ppo_act_dim)
+        or env_act_dim != int(gru_act_dim)
+        or (rnn_checkpoint and env_act_dim != int(rnn_act_dim))
+    ):
         env.close()
         raise RuntimeError(
-            f"Action dim mismatch: env={env_act_dim}, ppo={ppo_act_dim}, gru={gru_act_dim}"
+            f"Action dim mismatch: env={env_act_dim}, ppo={ppo_act_dim}, "
+            f"gru={gru_act_dim}, rnn={rnn_act_dim if rnn_checkpoint else 'disabled'}"
         )
     if int(env.task_config.observation_space_dim) < eval_obs_dim:
         env.close()
@@ -2867,8 +3592,7 @@ def main():
 
             for cond in exp.conditions:
                 cond_root = os.path.join(exp_root, cond.name)
-                fig_dir = os.path.join(cond_root, "figures")
-                os.makedirs(fig_dir, exist_ok=True)
+                raw_dir, stats_dir, fig_dir = ensure_dirs(cond_root)
                 logger.info(f"Condition: {cond.display_name}")
 
                 apply_runtime_overrides_to_env(env, cond.overrides)
@@ -2901,6 +3625,7 @@ def main():
                         rms=ppo_rms,
                         obs_dim=int(ppo_obs_dim),
                         use_rnn=bool(ppo_use_rnn),
+                        rnn_hidden_size=int(ppo_rnn_hidden_size or 64),
                         kind="ppo",
                     ),
                     MethodSpec(
@@ -2909,8 +3634,23 @@ def main():
                         rms=gru_rms,
                         obs_dim=int(gru_obs_dim),
                         use_rnn=bool(gru_use_rnn),
+                        rnn_hidden_size=int(gru_rnn_hidden_size or 64),
                         kind="ppo",
                     ),
+                ]
+                if rnn_checkpoint:
+                    method_specs.append(
+                        MethodSpec(
+                            name="ppo_rnn",
+                            actor=rnn_actor,
+                            rms=rnn_rms,
+                            obs_dim=int(rnn_obs_dim),
+                            use_rnn=bool(rnn_use_rnn),
+                            rnn_hidden_size=int(rnn_hidden_size or 64),
+                            kind="ppo",
+                        )
+                    )
+                method_specs.append(
                     MethodSpec(
                         name="mpc",
                         actor=None,
@@ -2920,11 +3660,11 @@ def main():
                         kind="mpc",
                         controller=mpc_controller,
                         force_drop_step=force_drop_step,
-                    ),
-                ]
+                    )
+                )
 
                 post_reset_hook = _make_post_reset_hook(cond)
-                rows, summaries = evaluate_methods_single_seed(
+                rows, summaries, trace_records = evaluate_methods_single_seed(
                     env=env,
                     method_specs=method_specs,
                     seed=seed,
@@ -2933,53 +3673,32 @@ def main():
                     post_reset_hook=post_reset_hook,
                 )
 
-                methods_present = _methods_in_rows(rows, preferred_order=["ppo", "ppo_gru", "mpc"])
-                methods = [m for m in ("ppo", "ppo_gru", "mpc") if m in methods_present]
+                method_order = [m.name for m in method_specs]
+                methods_present = _methods_in_rows(rows, preferred_order=method_order)
+                methods = [m for m in method_order if m in methods_present]
 
-                # 1) Precision CDF
-                plot_multi_method_cdf_single_metric(
+                raw_csv_path, trace_npz_path = save_condition_eval_artifacts(
+                    raw_dir=raw_dir,
+                    stats_dir=stats_dir,
                     rows=rows,
+                    trace_records=trace_records,
+                    summaries=summaries,
                     methods=methods,
-                    metric_key="landing_error_xy_m",
-                    title=f"{exp.display_name} | {cond.display_name} | Landing Precision CDF",
-                    x_label="Landing Error XY (m)",
-                    out_pdf=os.path.join(fig_dir, "precision_cdf.pdf"),
-                    use_abs=False,
                 )
-
-                # 2) Case-level ROLL/PITCH series (with shadow)
-                plot_multi_method_roll_pitch_case_series(
+                render_condition_outputs(
                     rows=rows,
                     methods=methods,
-                    title=f"{exp.display_name} | {cond.display_name} | Roll/Pitch",
-                    out_pdf=os.path.join(fig_dir, "roll_pitch_case.pdf"),
-                )
-
-                # 3) Impact CDF
-                plot_multi_method_cdf_single_metric(
-                    rows=rows,
-                    methods=methods,
-                    metric_key="impulse_metric",
-                    title=f"{exp.display_name} | {cond.display_name} | Impact CDF",
-                    x_label="Impact Metric",
-                    out_pdf=os.path.join(fig_dir, "impact_cdf.pdf"),
-                    use_abs=False,
-                )
-
-                # 4) Summary table PDF
-                plot_four_pdf_comparison_table(
-                    rows=rows,
-                    methods=methods,
-                    title=f"{exp.display_name} | {cond.display_name} | Comparison Table",
-                    out_pdf=os.path.join(fig_dir, "summary_table.pdf"),
+                    experiment_display_name=exp.display_name,
+                    condition_display_name=cond.display_name,
+                    fig_dir=fig_dir,
                     large_error_threshold_m=float(args.large_error_threshold_m),
                 )
 
                 logger.info(
-                    f"Saved 4 PDFs to {fig_dir}: "
-                    f"precision_cdf.pdf, roll_pitch_case.pdf, "
-                    f"impact_cdf.pdf, summary_table.pdf"
+                    f"Saved raw/stats/figures for {cond.display_name}: "
+                    f"raw={raw_csv_path}, trace={trace_npz_path}, stats={stats_dir}, figures={fig_dir}"
                 )
+            render_experiment_level_outputs(exp_root=exp_root, exp=exp)
     finally:
         env.close()
 

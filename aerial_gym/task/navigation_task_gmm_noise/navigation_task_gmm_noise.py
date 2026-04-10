@@ -3,6 +3,7 @@ import sys
 import json
 import numpy as np
 import torch
+import torch.nn.functional as F
 from isaacgym import gymapi
 from torch.utils.tensorboard import SummaryWriter
 import gymnasium as gym
@@ -380,6 +381,47 @@ class NavigationTaskGmmNoise(BaseTask):
             self.sim_env.num_envs, device=self.device, requires_grad=False
         )
         self.step_release_to_target_xy = torch.zeros(
+            self.sim_env.num_envs, device=self.device, requires_grad=False
+        )
+        self.record_drop_trajectory_for_eval = bool(
+            getattr(
+                self.task_config,
+                "record_drop_trajectory_for_eval",
+                os.environ.get("AERIAL_GYM_EVAL_MODE", "0") == "1",
+            )
+        )
+        self.eval_drop_trace_num_samples = int(
+            max(8, getattr(self.drop_model_config, "eval_trace_num_samples", 64))
+        )
+        self.step_drop_trace_norm_t = torch.zeros(
+            (self.sim_env.num_envs, self.eval_drop_trace_num_samples),
+            device=self.device,
+            requires_grad=False,
+        )
+        self.step_drop_trace_error_xy = torch.zeros(
+            (self.sim_env.num_envs, self.eval_drop_trace_num_samples),
+            device=self.device,
+            requires_grad=False,
+        )
+        self.step_drop_trace_pos_x = torch.zeros(
+            (self.sim_env.num_envs, self.eval_drop_trace_num_samples),
+            device=self.device,
+            requires_grad=False,
+        )
+        self.step_drop_trace_pos_y = torch.zeros(
+            (self.sim_env.num_envs, self.eval_drop_trace_num_samples),
+            device=self.device,
+            requires_grad=False,
+        )
+        self.step_drop_trace_pos_z = torch.zeros(
+            (self.sim_env.num_envs, self.eval_drop_trace_num_samples),
+            device=self.device,
+            requires_grad=False,
+        )
+        self.step_drop_trace_fall_steps = torch.zeros(
+            self.sim_env.num_envs, device=self.device, dtype=torch.long, requires_grad=False
+        )
+        self.step_drop_trace_fall_time = torch.zeros(
             self.sim_env.num_envs, device=self.device, requires_grad=False
         )
         self.drop_obstacle_exists = torch.zeros(
@@ -2098,11 +2140,58 @@ class NavigationTaskGmmNoise(BaseTask):
         # Push modified root-state tensors to Isaac Gym before the next physics step.
         self.sim_env.IGE_env.write_to_sim()
 
-    def _predict_child_landing_xy(self, env_ids, init_pos=None, init_vel=None):
+    def _resample_child_drop_trace(self, trace_pos_seq, trace_len, env_ids, dt):
+        num_cases = int(trace_pos_seq.shape[1])
+        num_samples = int(self.eval_drop_trace_num_samples)
+        norm_t = torch.linspace(0.0, 1.0, num_samples, device=self.device).view(1, -1).repeat(num_cases, 1)
+        pos_x = torch.zeros((num_cases, num_samples), device=self.device, dtype=torch.float32)
+        pos_y = torch.zeros((num_cases, num_samples), device=self.device, dtype=torch.float32)
+        pos_z = torch.zeros((num_cases, num_samples), device=self.device, dtype=torch.float32)
+        err_xy = torch.zeros((num_cases, num_samples), device=self.device, dtype=torch.float32)
+        target_xy = self.target_position[env_ids, 0:2]
+
+        for idx in range(num_cases):
+            seq_len = int(max(int(trace_len[idx].item()), 1))
+            seq = trace_pos_seq[:seq_len, idx, :]
+            err_seq = torch.norm(seq[:, 0:2] - target_xy[idx].view(1, 2), dim=1, keepdim=True)
+            feat = torch.cat([seq, err_seq], dim=1).transpose(0, 1).unsqueeze(0)
+            if seq_len == 1:
+                feat_rs = feat.repeat(1, 1, num_samples)
+            else:
+                feat_rs = F.interpolate(feat, size=num_samples, mode="linear", align_corners=True)
+            pos_x[idx] = feat_rs[0, 0]
+            pos_y[idx] = feat_rs[0, 1]
+            pos_z[idx] = feat_rs[0, 2]
+            err_xy[idx] = feat_rs[0, 3]
+
+        duration_steps = torch.clamp(trace_len - 1, min=0)
+        duration_s = duration_steps.to(dtype=torch.float32) * float(dt)
+        return {
+            "norm_t": norm_t,
+            "pos_x": pos_x,
+            "pos_y": pos_y,
+            "pos_z": pos_z,
+            "error_xy": err_xy,
+            "duration_steps": duration_steps,
+            "duration_s": duration_s,
+        }
+
+    def _predict_child_landing_xy(self, env_ids, init_pos=None, init_vel=None, return_trace=False):
         """Predict child landing position/distance without mutating DROP buffers."""
         if env_ids.numel() == 0:
             empty_pos = torch.empty((0, 3), device=self.device)
             empty_dist = torch.empty((0,), device=self.device)
+            if return_trace:
+                empty_trace = {
+                    "norm_t": torch.empty((0, self.eval_drop_trace_num_samples), device=self.device),
+                    "pos_x": torch.empty((0, self.eval_drop_trace_num_samples), device=self.device),
+                    "pos_y": torch.empty((0, self.eval_drop_trace_num_samples), device=self.device),
+                    "pos_z": torch.empty((0, self.eval_drop_trace_num_samples), device=self.device),
+                    "error_xy": torch.empty((0, self.eval_drop_trace_num_samples), device=self.device),
+                    "duration_steps": torch.empty((0,), device=self.device, dtype=torch.long),
+                    "duration_s": torch.empty((0,), device=self.device),
+                }
+                return empty_pos, empty_dist, empty_trace
             return empty_pos, empty_dist
 
         env_ids = env_ids.to(dtype=torch.long, device=self.device)
@@ -2133,6 +2222,11 @@ class NavigationTaskGmmNoise(BaseTask):
 
         landing_pos = child_pos.clone()
         active = torch.ones(env_ids.shape[0], device=self.device, dtype=torch.bool)
+        trace_pos_frames = None
+        trace_len = None
+        if return_trace:
+            trace_pos_frames = [child_pos.clone()]
+            trace_len = torch.ones(env_ids.shape[0], device=self.device, dtype=torch.long)
         # Local Dryden state for child free-fall integration.
         # Use a per-call copy so child rollout sees time-varying wind without mutating global env state.
         dryden_state_local = None
@@ -2185,21 +2279,38 @@ class NavigationTaskGmmNoise(BaseTask):
                 landed_local = local_ids[landed_now]
                 landing_pos[landed_local, 0:2] = next_pos[landed_now, 0:2]
                 landing_pos[landed_local, 2] = 0.0
+                child_pos[landed_local] = landing_pos[landed_local]
                 active[landed_local] = False
 
             flying_now = ~landed_now
             if flying_now.any():
                 child_pos[local_ids[flying_now]] = next_pos[flying_now]
+            if return_trace:
+                trace_len[local_ids] += 1
+                trace_pos_frames.append(child_pos.clone())
 
         # Fallback in case max_steps is reached before touching ground.
         if active.any():
             remain_local = active.nonzero(as_tuple=False).squeeze(-1)
             landing_pos[remain_local, 0:2] = child_pos[remain_local, 0:2]
             landing_pos[remain_local, 2] = torch.clamp(child_pos[remain_local, 2], min=0.0)
+            child_pos[remain_local] = landing_pos[remain_local]
+            if return_trace:
+                trace_len[remain_local] += 1
+                trace_pos_frames.append(child_pos.clone())
 
         landing_dist = torch.norm(
             landing_pos[:, 0:2] - self.target_position[env_ids, 0:2], dim=1
         )
+        if return_trace:
+            trace_pos_seq = torch.stack(trace_pos_frames, dim=0)
+            trace_dict = self._resample_child_drop_trace(
+                trace_pos_seq=trace_pos_seq,
+                trace_len=trace_len,
+                env_ids=env_ids,
+                dt=dt,
+            )
+            return landing_pos, landing_dist, trace_dict
         return landing_pos, landing_dist
 
     def _simulate_child_free_fall(self, env_ids, init_pos=None, init_vel=None):
@@ -2207,13 +2318,30 @@ class NavigationTaskGmmNoise(BaseTask):
         if env_ids.numel() == 0:
             return
         env_ids = env_ids.to(dtype=torch.long, device=self.device)
-        landing_pos, landing_dist = self._predict_child_landing_xy(
-            env_ids=env_ids,
-            init_pos=init_pos,
-            init_vel=init_vel,
-        )
+        trace_dict = None
+        if self.record_drop_trajectory_for_eval:
+            landing_pos, landing_dist, trace_dict = self._predict_child_landing_xy(
+                env_ids=env_ids,
+                init_pos=init_pos,
+                init_vel=init_vel,
+                return_trace=True,
+            )
+        else:
+            landing_pos, landing_dist = self._predict_child_landing_xy(
+                env_ids=env_ids,
+                init_pos=init_pos,
+                init_vel=init_vel,
+            )
         self.child_landing_position[env_ids] = landing_pos
         self.child_landing_xy_distance[env_ids] = landing_dist
+        if trace_dict is not None:
+            self.step_drop_trace_norm_t[env_ids] = trace_dict["norm_t"]
+            self.step_drop_trace_error_xy[env_ids] = trace_dict["error_xy"]
+            self.step_drop_trace_pos_x[env_ids] = trace_dict["pos_x"]
+            self.step_drop_trace_pos_y[env_ids] = trace_dict["pos_y"]
+            self.step_drop_trace_pos_z[env_ids] = trace_dict["pos_z"]
+            self.step_drop_trace_fall_steps[env_ids] = trace_dict["duration_steps"]
+            self.step_drop_trace_fall_time[env_ids] = trace_dict["duration_s"]
 
 
 
@@ -2987,6 +3115,13 @@ class NavigationTaskGmmNoise(BaseTask):
         self.step_landing_error_xy[env_ids] = 0.0
         self.step_release_to_target_xy[env_ids] = 0.0
         self.step_drop_hit_obstacle[env_ids] = False
+        self.step_drop_trace_norm_t[env_ids] = 0.0
+        self.step_drop_trace_error_xy[env_ids] = 0.0
+        self.step_drop_trace_pos_x[env_ids] = 0.0
+        self.step_drop_trace_pos_y[env_ids] = 0.0
+        self.step_drop_trace_pos_z[env_ids] = 0.0
+        self.step_drop_trace_fall_steps[env_ids] = 0
+        self.step_drop_trace_fall_time[env_ids] = 0.0
         
         # Reset success counter
         self.success_counter[env_ids] = 0.0
@@ -3359,6 +3494,13 @@ class NavigationTaskGmmNoise(BaseTask):
         self.step_landing_error_xy[:] = 0.0
         self.step_release_to_target_xy[:] = 0.0
         self.step_drop_hit_obstacle[:] = False
+        self.step_drop_trace_norm_t[:] = 0.0
+        self.step_drop_trace_error_xy[:] = 0.0
+        self.step_drop_trace_pos_x[:] = 0.0
+        self.step_drop_trace_pos_y[:] = 0.0
+        self.step_drop_trace_pos_z[:] = 0.0
+        self.step_drop_trace_fall_steps[:] = 0
+        self.step_drop_trace_fall_time[:] = 0.0
 
         if actions.shape[1] < 4:
             raise ValueError("Action tensor must include at least 4 mother-control dimensions.")
@@ -3752,6 +3894,13 @@ class NavigationTaskGmmNoise(BaseTask):
         self.infos["impulse_metric_snapshot"] = self.step_impulse_metric.clone()
         self.infos["landing_error_xy_snapshot"] = self.step_landing_error_xy.clone()
         self.infos["release_to_target_xy_snapshot"] = self.step_release_to_target_xy.clone()
+        self.infos["drop_trace_norm_t_snapshot"] = self.step_drop_trace_norm_t.clone()
+        self.infos["drop_trace_error_xy_snapshot"] = self.step_drop_trace_error_xy.clone()
+        self.infos["drop_trace_pos_x_snapshot"] = self.step_drop_trace_pos_x.clone()
+        self.infos["drop_trace_pos_y_snapshot"] = self.step_drop_trace_pos_y.clone()
+        self.infos["drop_trace_pos_z_snapshot"] = self.step_drop_trace_pos_z.clone()
+        self.infos["drop_trace_fall_steps_snapshot"] = self.step_drop_trace_fall_steps.clone()
+        self.infos["drop_trace_fall_time_snapshot"] = self.step_drop_trace_fall_time.clone()
 
         self.logging_sanity_check(self.infos)
         self.check_and_update_curriculum_level(
