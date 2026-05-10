@@ -1,221 +1,252 @@
-# Navigation GMM Noise Task 神经网络与训练稳定性说明（当前代码快照）
+# Navigation Task GMM Noise: 当前观测、网络与训练配置说明
 
-> 任务名：`navigation_task_gmm_noise`  
-> 更新时间：2026-03-19  
-> 文档用途：记录当前任务所用策略网络架构、关键超参数，以及可复现实验中的稳定性论证
+本文档记录当前与 `navigation_task_gmm_noise` 相关的观测定义、网络结构以及最近引入的轻量 `MLP+RNN` 配置。
 
----
+对齐文件：
 
-## 1. 配置来源（Source of Truth）
+- 任务配置：[navigation_task_gmm_noise_config.py](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/config/task_config/navigation_task_gmm_noise_config.py)
+- 任务实现：[navigation_task_gmm_noise.py](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/task/navigation_task_gmm_noise/navigation_task_gmm_noise.py)
+- 训练配置：
+  - [ppo_aerial_quad_navigation.yaml](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/ppo_aerial_quad_navigation.yaml)
+  - [ppo_aerial_quad_navigation_rnn_only.yaml](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/ppo_aerial_quad_navigation_rnn_only.yaml)
+  - [ppo_aerial_quad_navigation_mlp_rnn_lite.yaml](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/ppo_aerial_quad_navigation_mlp_rnn_lite.yaml)
 
-- 任务配置：`aerial_gym/config/task_config/navigation_task_gmm_noise_config.py`
-- PPO 配置：`aerial_gym/rl_training/rl_games/ppo_aerial_quad_navigation.yaml`
-- 训练入口：`aerial_gym/rl_training/rl_games/runner.py`
+更新时间：2026-04-10
 
----
+## 1. 观测空间
 
-## 2. 网络输入输出定义
+### 1.1 基础观测
 
-### 2.1 输入层（Observation）
-
-当前输入维度为 `12`：
-
-```text
-s = [x_rel, y_rel, z_rel, vx, vy, vz, roll, pitch, wx, wy, wz, height]
-```
-
-- `x_rel,y_rel,z_rel`：目标相对位置
-- `v_x,v_y,v_z`：机体线速度
-- `roll,pitch`：roll/pitch
-- `wx,wy,wz`：机体角速度
-- `h`：当前高度（绝对 z）
-
-说明：训练侧启用了 `normalize_input=True`，进入策略网络前会进行运行均值/方差归一化。
-
-### 2.2 输出层（Action）
-
-当前动作维度为 `5`：
+当前基础观测前缀为 15 维：
 
 ```text
-a = [a_vx, a_vy, a_vz, a_yawrate, a_drop] in [-1, 1]^5
+[0:3]   target_relative_position (x_rel, y_rel, z_rel)
+[3:6]   robot_body_linvel       (vx, vy, vz)
+[6]     roll
+[7]     pitch
+[8:11]  robot_body_angvel       (wx, wy, wz)
+[11]    robot_height_z
+[12:15] drop_obstacle_position  (obs_x, obs_y, obs_z)
 ```
 
-动作映射（环境侧）：
+对应代码：
+- [navigation_task_gmm_noise.py:3460](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/task/navigation_task_gmm_noise/navigation_task_gmm_noise.py:3460)
 
-- `v_cmd = 1.2 * [a_vx, a_vy, a_vz]` (m/s)
-- `yawrate_cmd = (pi/6) * a_yawrate` (rad/s)
-- `drop_switch = a_drop`，当 `drop_switch > 0.7` 触发 DROP
+说明：
 
----
+- 当前障碍观测仍是“单个 DROP 风险障碍物位置”；
+- 若障碍不存在，位置会写入 `drop_obstacle_absent_obs_value = -1e3`。
 
-## 3. 网络架构（Actor-Critic + RNN）
+### 1.2 风估计增强观测
 
-当前使用 `rl_games` 的 `continuous_a2c_logstd`，并开启 PPO 训练模式。
-
-### 3.1 主干结构
-
-- `separate=False`：Actor/Critic 共享特征主干
-- MLP：`12 -> 256 -> 128 -> 64`
-- 激活函数：`ELU`
-- RNN：`GRU(64)`，`layers=1`，`before_mlp=False`（即 MLP 后接 GRU）
-- `layer_norm=True`（对 GRU 输出做 LayerNorm）
-
-### 3.2 输出头
-
-- Actor 均值头（`mu`）：`Linear(64, 5)`，`mu_activation=None`
-- Actor 方差头（`logstd`）：`fixed_sigma=True`，5 维全局可训练参数（非状态相关）
-- Critic 价值头：`Linear(64, 1)`
-
-### 3.3 可训练参数量
-
-按当前配置实例化后统计得到：
-
-- **总可训练参数：`69,963`**
-
-主要分布：
-
-- MLP：44,480
-- GRU：24,960
-- LayerNorm：128
-- Value head：65
-- Mu head：325
-- LogStd 参数：5
-
-### 3.4 按层展开（你要的“输入/隐藏/激活/输出”）
+当 `use_wind_estimation_features=True` 时，在基础观测后追加：
 
 ```text
-输入层:
-  Linear in: 12-dim observation
-
-隐藏层:
-  MLP hidden-1: 256
-  MLP hidden-2: 128
-  MLP hidden-3: 64
-  RNN hidden:   GRU(64), 1 layer
-
-激活函数:
-  MLP activation: ELU
-  GRU internal gates: sigmoid/tanh (框架内部)
-  mu head activation: None
-  sigma head activation: None (logstd -> exp 转为 sigma)
-
-输出层:
-  Actor mu:    Linear(64 -> 5)
-  Actor sigma: fixed trainable 5-dim logstd/sigma parameter
-  Critic V:    Linear(64 -> 1)
+prev_cmd_body      : 4 dims
+delta_v            : 3 dims
+linvel_history     : 3 * obs_linvel_history_frames dims
 ```
 
----
-
-## 4. 关键超参数（PPO）
-
-以下为 `ppo_aerial_quad_navigation.yaml` 当前值：
-
-- 算法：`a2c_continuous`（`ppo=True`）
-- 学习率：`1e-4`
-- 学习率策略：`adaptive`
-- KL 阈值：`0.008`
-- 折扣因子 `gamma`：`0.99`
-- GAE `tau`：`0.95`
-- PPO clip `e_clip`：`0.2`
-- 熵系数 `entropy_coef`：`0.008`
-- Critic 系数 `critic_coef`：`2`
-- 梯度裁剪：`grad_norm=1.0`，`truncate_grads=True`
-- rollout 长度：`horizon_length=32`
-- minibatch：`2048`
-- mini-epochs：`2`
-- RNN 序列长度：`seq_length=8`
-- 优势归一化：`normalize_advantage=True`
-- 观测归一化：`normalize_input=True`
-- 价值归一化：`normalize_value=True`
-- reward 缩放：`reward_shaper.scale_value=0.1`
-- 最大 epoch：`9000`
-
-运行注意：
-
-- `runner.py` 默认会把 `num_envs` 覆盖为命令行参数值（默认 `1024`），并同步覆盖 `num_actors`。
-- 若你训练时显式传入 `--num_envs`，以命令行为准。
-
----
-
-## 5. 稳定性证明（工程可验证版）
-
-### 5.1 结论范围
-
-这里给出的是**训练稳定性与数值有界性论证**（practical stability），不是“全局最优收敛”的严格数学证明。
-
-### 5.2 命题 A：动作有界
-
-策略输出先经 `[-1,1]` 截断，再映射到控制指令，因此：
+默认 `obs_linvel_history_frames = 4`，因此增强维度总计：
 
 ```text
-|vx|, |vy|, |vz| <= 1.2
-|yawrate| <= pi/6
+4 + 3 + 12 = 19
 ```
 
-因此策略不会因动作无界导致控制量爆炸。
+所以：
 
-### 5.3 命题 B：回报有界（有限时域）
+- 基础观测：`15D`
+- 风增强观测：`15 + 19 = 34D`
 
-episode 长度有限（当前 `1000` 步），且主要奖励项幅值受限：
+### 1.3 新增的高层投放特征
 
-- 评分项：`R_score \in [0, 20]`
-- 投放姿态奖励：`R_att \in [0, 1.0]`（两项各 `<=0.5`）
-- 额外终止惩罚：`no_drop=-20`，外圈投放 `-20`
-- 高度软惩罚由环境高度区间与权重限制在有限范围内
+本次更新新增可选开关：
 
-在“仿真状态有界”的条件下（Isaac Gym 常规安全边界与重置机制），回报为有界随机变量，方差可控。
+```python
+use_drop_decision_features = False
+```
 
-### 5.4 命题 C：策略更新步长受控
+当开启时，在当前观测末尾再追加 3 个高层特征：
 
-PPO 目标：
+1. `predicted_drop_error_xy`
+2. `predicted_fall_time`
+3. `predicted_release_risk`
+
+对应代码：
+- 开关定义：[navigation_task_gmm_noise_config.py:107](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/config/task_config/navigation_task_gmm_noise_config.py:107)
+- 特征计算：[navigation_task_gmm_noise.py:3425](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/task/navigation_task_gmm_noise/navigation_task_gmm_noise.py:3425)
+- 特征写入：[navigation_task_gmm_noise.py:3494](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/task/navigation_task_gmm_noise/navigation_task_gmm_noise.py:3494)
+
+这三个量当前定义为：
+
+### `predicted_drop_error_xy`
 
 ```text
-L_clip(theta) = E[min(r_t(theta) * A_hat_t,
-                      clip(r_t(theta), 1-eps, 1+eps) * A_hat_t)]
+|| target_rel_xy - body_linvel_xy * predicted_fall_time ||
 ```
 
-其中 `eps=0.2`。配合：
+含义：
+- 如果“现在立刻释放”，按当前高度和当前水平速度估计的 XY 偏差有多大。
 
-- `kl_threshold=0.008` + `lr_schedule=adaptive`
-- `grad_norm=1.0` 梯度裁剪
+### `predicted_fall_time`
 
-可限制单次更新过大，抑制策略突变。
+```text
+sqrt(2 * z / g)
+```
 
-### 5.5 命题 D：RNN 数值稳定性增强
+含义：
+- 现在投放后，自由落体到地面的估计时间。
 
-当前 RNN 为 GRU + LayerNorm，并使用短序列截断反传（`seq_length=8`）：
+### `predicted_release_risk`
 
-- GRU 门控结构可抑制长期依赖下的数值漂移
-- LayerNorm 降低 hidden state 分布漂移
-- 短序列 BPTT + 梯度裁剪降低梯度爆炸风险
+```text
+attitude_deg + 10 * omega_xy
+```
 
-### 5.6 工程判据（建议持续监控）
+含义：
+- 当前释放姿态和角速度综合形成的启发式风险分数。
 
-建议同时观察：
+### 1.4 当前支持的观测维度
 
-- `rewards/*`：是否持续上升并趋于平稳
-- `losses/entropy`：是否异常单调上升（可能探索过强）
-- `losses/*`（policy/value）：是否出现震荡放大
-- `performance/landing_error_xy_ema`：是否下降
-- `performance/attitude_total_deg_ema` 与 `performance/attitude_total_deg_std`：投放姿态稳定性
-- `performance/impulse_metric_mean/std`：投放冲击是否收敛
+现在任务和评估脚本支持 4 种观测布局：
 
-若出现“reward 上升但 entropy 持续上升且动作抖动”，通常需要联调：
+- `15D`：基础观测
+- `18D`：基础观测 + 3 个高层投放特征
+- `34D`：基础观测 + 风增强
+- `37D`：基础观测 + 风增强 + 3 个高层投放特征
 
-- 熵系数
-- 学习率/KL 阈值
-- 奖励项权重比例（尤其 `R_score` 与冲击/姿态项）
+评估脚本已做显式识别：
+- [eval_drop_paper_comparison.py:76](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/scripts/eval_drop_paper_comparison.py:76)
+- [eval_drop_paper_comparison.py:367](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/scripts/eval_drop_paper_comparison.py:367)
 
----
+并增加了保护：
 
-## 6. 版本注记
+- `18D` 基础观测 + 新特征版本
+- 不能和 `34D/37D` 风增强版本在同一次评估里混跑
 
-本说明针对当前仓库配置快照。后续若修改了：
+原因：
+- 两者前缀布局不同，强行混跑会导致语义错位。
 
-- `observation_space_dim / action_space_dim`
-- `network.mlp / rnn`
-- `learning_rate / entropy_coef / kl_threshold`
-- DROP 奖励结构
+## 2. 当前主要训练配置
 
-请同步更新本文档，避免“文档参数”与“训练参数”不一致。
+### 2.1 PPO-MLP-RNN（原配置）
+
+配置文件：
+- [ppo_aerial_quad_navigation.yaml](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/ppo_aerial_quad_navigation.yaml)
+
+结构：
+
+- MLP：`[256, 128, 64]`
+- RNN：`GRU(64)`
+- `seq_length = 8`
+- `learning_rate = 5e-5`
+
+语义：
+- 这是“MLP 前端 + GRU”结构
+
+### 2.2 PPO-RNN-only
+
+配置文件：
+- [ppo_aerial_quad_navigation_rnn_only.yaml](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/ppo_aerial_quad_navigation_rnn_only.yaml)
+
+结构：
+
+- MLP：`[]`
+- RNN：`GRU(64)`
+- `seq_length = 8`
+- `learning_rate = 5e-5`
+
+语义：
+- 这是“纯 GRU”，不是 vanilla 无门控 RNN
+
+### 2.3 新增 PPO-MLP-RNN-lite
+
+为了压尾部误差、并给 `MLP+RNN` 一个更合理的轻量前端，本次新增：
+
+- [ppo_aerial_quad_navigation_mlp_rnn_lite.yaml](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/ppo_aerial_quad_navigation_mlp_rnn_lite.yaml)
+
+关键改动：
+
+- `mlp.units: [128, 64]`
+- `seq_length: 16`
+- `learning_rate: 3e-5`
+- `env_config.use_drop_decision_features: True`
+
+设计目的：
+
+1. 降低原版 `[256,128,64]` 前端过重带来的尾部风险
+2. 用更长序列增强时序判断
+3. 利用 3 个高层投放特征帮助 `MLP+RNN` 做更明确的“何时释放”决策
+
+## 3. 训练入口兼容性更新
+
+训练入口 `runner.py` 会把 YAML 中的 `env_config` 字段直接传给任务注册器。
+
+本次为了支持：
+
+```yaml
+env_config:
+  use_drop_decision_features: True
+```
+
+对注册器做了兼容扩展：
+
+- [task_registry.py](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/registry/task_registry.py)
+
+现在 `TaskRegistry.make_task(...)` 会：
+
+- 接收额外 `env_config` 字段
+- 若对应字段存在于 `task_config`，则写回配置后再创建任务
+
+这样新配置训练时不会再报：
+
+```text
+make_task() got an unexpected keyword argument 'use_drop_decision_features'
+```
+
+## 4. 评估脚本的当前约束
+
+评估脚本：
+- [eval_drop_paper_comparison.py](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/scripts/eval_drop_paper_comparison.py)
+
+当前评估脚本会根据 checkpoint 自动推断：
+
+- 是否有 `actor_mlp`
+- 是否有 `GRU`
+- 输入观测维度是多少
+
+然后自动设置环境：
+
+- `observation_space_dim`
+- `use_wind_estimation_features`
+- `use_drop_decision_features`
+
+对应逻辑：
+- [eval_drop_paper_comparison.py:3579](/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/scripts/eval_drop_paper_comparison.py:3579)
+
+因此：
+
+- 旧的 `PPO-MLP`
+- 旧的 `PPO-MLP-RNN`
+- 旧的 `PPO-RNN-only`
+- 新的 `PPO-MLP-RNN-lite`
+
+都可以通过同一评估脚本加载，只要观测布局不冲突。
+
+## 5. 当前工程结论
+
+截至这次更新，当前代码逻辑已经从“单一固定观测 + 单一 PPO-GRU 配置”演化为：
+
+1. 支持基础观测和风增强观测
+2. 支持额外高层投放特征
+3. 支持纯 RNN、MLP+RNN、轻量 MLP+RNN 三类结构
+4. 评估脚本支持按 checkpoint 自动适配观测维度
+
+如果后续你继续改：
+
+- 观测维度
+- 高层投放特征定义
+- 轻量 MLP-RNN 配置
+- 风增强开关
+
+请同步更新本文档，避免网络结构说明和实际训练代码再次脱节。

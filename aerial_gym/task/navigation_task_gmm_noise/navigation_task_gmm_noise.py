@@ -117,44 +117,60 @@ class NavigationTaskGmmNoise(BaseTask):
         self.terminations = self.obs_dict["crashes"]
         self.truncations = self.obs_dict["truncations"]
         self.rewards = torch.zeros(self.truncations.shape[0], device=self.device)
-        self.use_wind_estimation_features = bool(
-            getattr(self.task_config, "use_wind_estimation_features", False)
+        self.base_observation_space_dim = int(
+            getattr(self.task_config, "base_observation_dim", 13)
         )
-        self.drop_obstacle_obs_dim = 3  # obstacle xyz (or -1e3 sentinel when absent)
-        self.base_observation_space_dim = 12 + self.drop_obstacle_obs_dim
-        self.obs_linvel_history_frames = int(
-            getattr(self.task_config, "obs_linvel_history_frames", 4)
-        )
-        if self.obs_linvel_history_frames < 1:
-            self.obs_linvel_history_frames = 1
-        self.wind_aug_prev_cmd_dim = 4
-        self.wind_aug_delta_v_dim = 3
-        self.wind_aug_linvel_hist_dim = 3 * self.obs_linvel_history_frames
-        self.augmented_observation_space_dim = (
-            self.base_observation_space_dim
-            + self.wind_aug_prev_cmd_dim
-            + self.wind_aug_delta_v_dim
-            + self.wind_aug_linvel_hist_dim
-        )
-        self.wind_aug_prev_cmd_start = self.base_observation_space_dim
-        self.wind_aug_prev_cmd_end = self.wind_aug_prev_cmd_start + self.wind_aug_prev_cmd_dim
-        self.wind_aug_delta_v_start = self.wind_aug_prev_cmd_end
-        self.wind_aug_delta_v_end = self.wind_aug_delta_v_start + self.wind_aug_delta_v_dim
-        self.wind_aug_linvel_hist_start = self.wind_aug_delta_v_end
-        self.wind_aug_linvel_hist_end = (
-            self.wind_aug_linvel_hist_start + self.wind_aug_linvel_hist_dim
-        )
-        expected_obs_dim = (
-            self.augmented_observation_space_dim
-            if self.use_wind_estimation_features
-            else self.base_observation_space_dim
-        )
-        if int(getattr(self.task_config, "observation_space_dim", expected_obs_dim)) != expected_obs_dim:
+        if self.base_observation_space_dim != 13:
             logger.warning(
-                f"Overriding observation_space_dim to {expected_obs_dim} "
-                f"(use_wind_estimation_features={self.use_wind_estimation_features})."
+                "Overriding base_observation_dim to 13 for asymmetric frame-stacked observations."
             )
-        self.task_config.observation_space_dim = expected_obs_dim
+            self.base_observation_space_dim = 13
+
+        self.obs_frame_stack = int(getattr(self.task_config, "frame_stack", 6))
+        if self.obs_frame_stack < 1:
+            logger.warning("frame_stack must be >= 1. Falling back to 1.")
+            self.obs_frame_stack = 1
+
+        self.privileged_observation_dim = int(
+            getattr(self.task_config, "privileged_observation_space_dim", 13)
+        )
+        if self.privileged_observation_dim != 13:
+            logger.warning(
+                "Overriding privileged_observation_space_dim to 13 "
+                "for the asymmetric critic privileged inputs."
+            )
+            self.privileged_observation_dim = 13
+
+        self.actor_observation_space_dim = (
+            self.base_observation_space_dim * self.obs_frame_stack
+        )
+        self.critic_observation_space_dim = (
+            self.actor_observation_space_dim + self.privileged_observation_dim
+        )
+        if int(
+            getattr(self.task_config, "observation_space_dim", self.actor_observation_space_dim)
+        ) != self.actor_observation_space_dim:
+            logger.warning(
+                f"Overriding observation_space_dim to {self.actor_observation_space_dim} "
+                "for stacked actor observations."
+            )
+        if int(
+            getattr(
+                self.task_config,
+                "critic_observation_space_dim",
+                self.critic_observation_space_dim,
+            )
+        ) != self.critic_observation_space_dim:
+            logger.warning(
+                f"Overriding critic_observation_space_dim to {self.critic_observation_space_dim} "
+                "for asymmetric critic observations."
+            )
+        self.use_central_value = bool(getattr(self.task_config, "use_central_value", True))
+        self.task_config.base_observation_dim = self.base_observation_space_dim
+        self.task_config.frame_stack = self.obs_frame_stack
+        self.task_config.observation_space_dim = self.actor_observation_space_dim
+        self.task_config.critic_observation_space_dim = self.critic_observation_space_dim
+        self.task_config.use_central_value = self.use_central_value
 
         self.observation_space = Dict(
             {
@@ -162,6 +178,12 @@ class NavigationTaskGmmNoise(BaseTask):
                     low=-1.0,
                     high=1.0,
                     shape=(self.task_config.observation_space_dim,),
+                    dtype=np.float32,
+                ),
+                "states": Box(
+                    low=-1.0,
+                    high=1.0,
+                    shape=(self.task_config.critic_observation_space_dim,),
                     dtype=np.float32,
                 ),
             }
@@ -180,28 +202,34 @@ class NavigationTaskGmmNoise(BaseTask):
                 device=self.device,
                 requires_grad=False,
             ),
+            "states": torch.zeros(
+                (self.sim_env.num_envs, self.task_config.critic_observation_space_dim),
+                device=self.device,
+                requires_grad=False,
+            ),
         }
-        # Observation-history buffers for optional non-privileged wind-estimation features.
-        self.obs_prev_cmd_body = torch.zeros(
-            (self.sim_env.num_envs, 4), device=self.device, requires_grad=False
-        )
-        self.obs_prev_body_linvel = torch.zeros(
-            (self.sim_env.num_envs, 3), device=self.device, requires_grad=False
-        )
-        self.obs_body_linvel_history = torch.zeros(
-            (self.sim_env.num_envs, self.obs_linvel_history_frames, 3),
+        self.base_task_observations = torch.zeros(
+            (self.sim_env.num_envs, self.base_observation_space_dim),
             device=self.device,
             requires_grad=False,
         )
-        self.current_cmd_body_for_obs = torch.zeros(
-            (self.sim_env.num_envs, 4), device=self.device, requires_grad=False
+        self.obs_frame_buffer = torch.zeros(
+            (
+                self.sim_env.num_envs,
+                self.obs_frame_stack,
+                self.base_observation_space_dim,
+            ),
+            device=self.device,
+            requires_grad=False,
+        )
+        self.privileged_observations = torch.zeros(
+            (self.sim_env.num_envs, self.privileged_observation_dim),
+            device=self.device,
+            requires_grad=False,
         )
 
         self.num_task_steps = 0
         self.infos = {}
-
-        self.noise_config = self.task_config.noise_config
-        self.num_noise_sources = int(self.noise_config.num_sources)
 
         self.env_bounds_min = torch.tensor(
             self.task_config.env_bounds_min, device=self.device, requires_grad=False
@@ -275,31 +303,6 @@ class NavigationTaskGmmNoise(BaseTask):
         self.drop_model_config = getattr(self.task_config, "drop_model_config", None)
         self.drop_impact_config = getattr(self.task_config, "drop_impact_config", None)
         self.drop_reward_config = getattr(self.task_config, "drop_reward_config", None)
-        # Optional single obstacle around target used for drop-risk scoring.
-        self.drop_obstacle_enable = bool(
-            getattr(self.drop_reward_config, "drop_obstacle_enable", False)
-        )
-        self.drop_obstacle_spawn_prob = float(
-            getattr(self.drop_reward_config, "drop_obstacle_spawn_prob", 0.5)
-        )
-        self.drop_obstacle_center_radius_min = float(
-            getattr(self.drop_reward_config, "drop_obstacle_center_radius_min", 1.0)
-        )
-        self.drop_obstacle_center_radius_max = float(
-            getattr(self.drop_reward_config, "drop_obstacle_center_radius_max", 2.0)
-        )
-        self.drop_obstacle_radius_min = float(
-            getattr(self.drop_reward_config, "drop_obstacle_radius_min", 1.0)
-        )
-        self.drop_obstacle_radius_max = float(
-            getattr(self.drop_reward_config, "drop_obstacle_radius_max", 3.0)
-        )
-        self.drop_obstacle_height = float(
-            getattr(self.drop_reward_config, "drop_obstacle_height", 0.4)
-        )
-        self.drop_obstacle_absent_obs_value = float(
-            getattr(self.drop_reward_config, "drop_obstacle_absent_obs_value", -1e3)
-        )
         self.fixed_payload_mount_index = -1
         self.fixed_payload_offset_body = torch.zeros(
             3, device=self.device, dtype=torch.float32, requires_grad=False
@@ -383,6 +386,34 @@ class NavigationTaskGmmNoise(BaseTask):
         self.step_release_to_target_xy = torch.zeros(
             self.sim_env.num_envs, device=self.device, requires_grad=False
         )
+        self.confidence_history_len = int(
+            max(1, getattr(self.drop_model_config, "confidence_history_len", 5))
+        )
+        confidence_history_init = float(
+            max(getattr(self.drop_model_config, "confidence_error_scale", 3.0), 1e-6)
+        )
+        self.pred_drop_error_history = torch.full(
+            (self.sim_env.num_envs, self.confidence_history_len),
+            confidence_history_init,
+            device=self.device,
+            dtype=torch.float32,
+            requires_grad=False,
+        )
+        self.release_confidence = torch.zeros(
+            self.sim_env.num_envs, device=self.device, requires_grad=False
+        )
+        self.release_confidence_error_component = torch.zeros(
+            self.sim_env.num_envs, device=self.device, requires_grad=False
+        )
+        self.release_confidence_risk_component = torch.zeros(
+            self.sim_env.num_envs, device=self.device, requires_grad=False
+        )
+        self.release_confidence_stability_component = torch.zeros(
+            self.sim_env.num_envs, device=self.device, requires_grad=False
+        )
+        self.confidence_gate_blocked_mask = torch.zeros(
+            self.sim_env.num_envs, device=self.device, dtype=torch.bool, requires_grad=False
+        )
         self.record_drop_trajectory_for_eval = bool(
             getattr(
                 self.task_config,
@@ -424,29 +455,6 @@ class NavigationTaskGmmNoise(BaseTask):
         self.step_drop_trace_fall_time = torch.zeros(
             self.sim_env.num_envs, device=self.device, requires_grad=False
         )
-        self.drop_obstacle_exists = torch.zeros(
-            self.sim_env.num_envs, device=self.device, dtype=torch.bool, requires_grad=False
-        )
-        self.drop_obstacle_position = torch.full(
-            (self.sim_env.num_envs, 3),
-            self.drop_obstacle_absent_obs_value,
-            device=self.device,
-            dtype=torch.float32,
-            requires_grad=False,
-        )
-        self.drop_obstacle_radius = torch.zeros(
-            self.sim_env.num_envs, device=self.device, requires_grad=False
-        )
-        self.step_drop_hit_obstacle = torch.zeros(
-            self.sim_env.num_envs, device=self.device, dtype=torch.bool, requires_grad=False
-        )
-        self.drop_obstacle_asset_file = str(
-            getattr(
-                self.drop_reward_config, "drop_obstacle_asset_file", "drop_box_0p2_0p2_0p4.urdf"
-            )
-        )
-        self.drop_obstacle_asset_index = -1
-        self.drop_obstacle_instance_enabled = False
         # Runtime rigid-body update cache for DROP (mass/COM/inertia update at release time).
         self._drop_rb_cache_ready = False
         self._drop_base_body_index = 0
@@ -464,6 +472,10 @@ class NavigationTaskGmmNoise(BaseTask):
         self._mother_rigidbody_updated = torch.zeros(
             self.sim_env.num_envs, device=self.device, dtype=torch.bool, requires_grad=False
         )
+        self._payload_mass_reference = 0.0
+        self._payload_com_body_reference = torch.zeros(
+            3, device=self.device, dtype=torch.float32, requires_grad=False
+        )
         
         # Success counter for continuous success check (NEW)
         self.success_counter = torch.zeros(self.sim_env.num_envs, device=self.device)
@@ -472,17 +484,22 @@ class NavigationTaskGmmNoise(BaseTask):
         self.recent_episodes = deque(maxlen=100)
         
         # Distance tracking for reward shaping
+        self.previous_position = torch.zeros(
+            (self.sim_env.num_envs, 3), device=self.device
+        )
         self.previous_distance = torch.zeros(self.sim_env.num_envs, device=self.device)
         self.initial_distance_xy = torch.zeros(self.sim_env.num_envs, device=self.device)
         self.previous_distance_xy = torch.zeros(self.sim_env.num_envs, device=self.device)
         
         # Velocity tracking for acceleration penalty
         self.previous_velocity = torch.zeros(self.sim_env.num_envs, 3, device=self.device)
+        self.previous_actions = torch.zeros(
+            (self.sim_env.num_envs, self.task_config.action_space_dim), device=self.device
+        )
         
         # Hover time counter for cumulative hover reward (NEW)
         self.hover_time_counter = torch.zeros(self.sim_env.num_envs, device=self.device)
         
-        self._init_noise_buffers()
         self._load_fixed_env_preset()
         
         self.best_point_path = self._resolve_best_point_path()
@@ -513,7 +530,6 @@ class NavigationTaskGmmNoise(BaseTask):
 
         # Ensure assets are placed within the fixed bounds.
         self.sim_env.reset()
-        self._resolve_drop_obstacle_asset_index()
         self._initialize_drop_rigidbody_cache()
         
         # Initialize Arrival Metric Buffer
@@ -560,7 +576,6 @@ class NavigationTaskGmmNoise(BaseTask):
         self.window_drop_end_count = 0
         self.window_no_drop_done_count = 0
         self.window_drop_sample_count = 0
-        self.window_raw_score_hist = self._init_score_histogram()
         self.window_landing_error_xy_sum = 0.0
         self.window_release_to_target_xy_sum = 0.0
         self.window_release_to_target_xy_min = float("inf")
@@ -583,6 +598,8 @@ class NavigationTaskGmmNoise(BaseTask):
         self.attitude_total_ema_alpha = float(
             getattr(self.drop_reward_config, "attitude_total_ema_alpha", 0.9)
         )
+        self.current_score_d0 = float(getattr(self.drop_reward_config, "score_d0", 4.0))
+        self.score_d0_curriculum_stage = 0
         self._train_epoch = 0
         self.spawn_z_curriculum_min_current = float(
             getattr(self.task_config, "spawn_random_z_min", 2.0)
@@ -605,38 +622,12 @@ class NavigationTaskGmmNoise(BaseTask):
             device=self.device,
             dtype=torch.float32,
         )
+        self.prev_predicted_drop_error_xy = torch.zeros(
+            self.sim_env.num_envs, device=self.device, requires_grad=False
+        )
         
         
         self.reset_idx(torch.arange(self.sim_env.num_envs, device=self.device))
-
-    @staticmethod
-    def _format_score_label(score_value):
-        score_f = float(score_value)
-        if score_f.is_integer():
-            return str(int(score_f))
-        return f"{score_f:g}"
-
-    @staticmethod
-    def _score_label_to_tag(score_label):
-        return str(score_label).replace("-", "neg_").replace(".", "p")
-
-    def _get_piecewise_scores(self):
-        scores = list(
-            getattr(
-                self.drop_reward_config,
-                "piecewise_scores",
-                [20.0, 16.0, 13.0, 10.0, 8.0, 6.0, 3.0, 1.0, 0.0],
-            )
-        )
-        if len(scores) == 0:
-            scores = [20.0, 16.0, 13.0, 10.0, 8.0, 6.0, 3.0, 1.0, 0.0]
-        return [float(v) for v in scores]
-
-    def _init_score_histogram(self):
-        return {
-            self._format_score_label(score): 0
-            for score in self._get_piecewise_scores()
-        }
 
     def _get_env_world_offset_xy(self, env_ids):
         """Get per-env world origin offset in XY."""
@@ -676,167 +667,6 @@ class NavigationTaskGmmNoise(BaseTask):
         release_xy = release_pos_world[:, 0:2]
         target_xy = self.target_position[env_ids, 0:2]
         return torch.norm(target_xy - release_xy, dim=1)
-
-    def _resample_drop_obstacles(self, env_ids):
-        """Sample one optional obstacle per env around the target for DROP scoring."""
-        env_ids = env_ids.to(dtype=torch.long, device=self.device)
-        if env_ids.numel() == 0:
-            return
-
-        self.drop_obstacle_exists[env_ids] = False
-        self.drop_obstacle_position[env_ids] = self.drop_obstacle_absent_obs_value
-        self.drop_obstacle_radius[env_ids] = 0.0
-
-        if not self.drop_obstacle_enable:
-            return
-
-        spawn_prob = float(min(max(self.drop_obstacle_spawn_prob, 0.0), 1.0))
-        spawn_mask = torch.rand((env_ids.shape[0],), device=self.device) < spawn_prob
-        if not spawn_mask.any():
-            return
-
-        active_env_ids = env_ids[spawn_mask]
-        n_active = active_env_ids.shape[0]
-        if n_active == 0:
-            return
-
-        center_r_min = max(
-            0.0, min(self.drop_obstacle_center_radius_min, self.drop_obstacle_center_radius_max)
-        )
-        center_r_max = max(
-            center_r_min,
-            max(self.drop_obstacle_center_radius_min, self.drop_obstacle_center_radius_max),
-        )
-        if abs(center_r_max - center_r_min) < 1e-9:
-            radial_dist = torch.full((n_active,), center_r_min, device=self.device)
-        else:
-            # Uniform-in-area sampling on annulus [r_min, r_max].
-            rand_u = torch.rand((n_active,), device=self.device)
-            radial_dist = torch.sqrt(
-                rand_u * (center_r_max * center_r_max - center_r_min * center_r_min)
-                + center_r_min * center_r_min
-            )
-        angles = torch.rand((n_active,), device=self.device) * (2.0 * torch.pi)
-        offsets_xy = torch.stack(
-            [radial_dist * torch.cos(angles), radial_dist * torch.sin(angles)], dim=1
-        )
-        obstacle_xy = self.target_position[active_env_ids, 0:2] + offsets_xy
-        lower_xy = self.env_bounds_min[0:2].view(1, 2)
-        upper_xy = self.env_bounds_max[0:2].view(1, 2)
-        obstacle_xy = torch.max(torch.min(obstacle_xy, upper_xy), lower_xy)
-
-        obstacle_r_min = max(
-            0.0, min(self.drop_obstacle_radius_min, self.drop_obstacle_radius_max)
-        )
-        obstacle_r_max = max(
-            obstacle_r_min,
-            max(self.drop_obstacle_radius_min, self.drop_obstacle_radius_max),
-        )
-        if abs(obstacle_r_max - obstacle_r_min) < 1e-9:
-            obstacle_radius = torch.full((n_active,), obstacle_r_min, device=self.device)
-        else:
-            obstacle_radius = torch.empty((n_active,), device=self.device)
-            obstacle_radius.uniform_(obstacle_r_min, obstacle_r_max)
-
-        obstacle_z = torch.full(
-            (n_active,),
-            0.5 * max(self.drop_obstacle_height, 0.0),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        self.drop_obstacle_position[active_env_ids, 0:2] = obstacle_xy
-        self.drop_obstacle_position[active_env_ids, 2] = obstacle_z
-        self.drop_obstacle_radius[active_env_ids] = obstacle_radius
-        self.drop_obstacle_exists[active_env_ids] = True
-
-    def _resolve_drop_obstacle_asset_index(self):
-        """Resolve the sim asset slot used for the instantiated DROP obstacle."""
-        self.drop_obstacle_asset_index = -1
-        self.drop_obstacle_instance_enabled = False
-
-        if "obstacle_position" not in self.obs_dict:
-            logger.warning("DROP obstacle instancing disabled: obstacle tensors not found.")
-            return
-
-        global_asset_dicts = getattr(self.sim_env, "global_asset_dicts", None)
-        if not global_asset_dicts or len(global_asset_dicts) == 0:
-            logger.warning("DROP obstacle instancing disabled: global_asset_dicts unavailable.")
-            return
-        env0_assets = global_asset_dicts[0]
-        if env0_assets is None or len(env0_assets) == 0:
-            logger.warning("DROP obstacle instancing disabled: no env assets loaded.")
-            return
-
-        target_file = os.path.basename(self.drop_obstacle_asset_file)
-        resolved_index = -1
-        for idx, asset_info in enumerate(env0_assets):
-            filename = os.path.basename(str(asset_info.get("filename", "")))
-            if filename != target_file:
-                continue
-            # Prefer explicit object assets if duplicated filenames exist.
-            asset_type = str(asset_info.get("asset_type", ""))
-            if asset_type == "objects":
-                resolved_index = idx
-                break
-            if resolved_index < 0:
-                resolved_index = idx
-
-        if resolved_index < 0:
-            logger.warning(
-                "DROP obstacle instancing disabled: asset '%s' not found in env assets.",
-                target_file,
-            )
-            return
-
-        num_assets_tensor = int(self.obs_dict["obstacle_position"].shape[1])
-        if resolved_index >= num_assets_tensor:
-            logger.warning(
-                "DROP obstacle instancing disabled: resolved index %d out of tensor range %d.",
-                resolved_index,
-                num_assets_tensor,
-            )
-            return
-
-        self.drop_obstacle_asset_index = resolved_index
-        self.drop_obstacle_instance_enabled = True
-        logger.info(
-            "DROP obstacle actor slot resolved: file=%s, slot=%d",
-            target_file,
-            self.drop_obstacle_asset_index,
-        )
-
-    def _sync_drop_obstacle_instances(self, env_ids):
-        """Apply sampled DROP obstacle states to the instantiated sim obstacle actor."""
-        if env_ids.numel() == 0:
-            return
-        if not self.drop_obstacle_instance_enabled:
-            return
-        if "obstacle_position" not in self.obs_dict:
-            return
-
-        idx = int(self.drop_obstacle_asset_index)
-        num_assets = int(self.obs_dict["obstacle_position"].shape[1])
-        if idx < 0 or idx >= num_assets:
-            return
-
-        env_ids = env_ids.to(dtype=torch.long, device=self.device)
-        id_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device, dtype=torch.float32)
-
-        # Default: hide obstacle actor for these envs.
-        self.obs_dict["obstacle_position"][env_ids, idx, 0:3] = -1000.0
-        self.obs_dict["obstacle_orientation"][env_ids, idx, 0:4] = id_quat.view(1, 4)
-        self.obs_dict["obstacle_linvel"][env_ids, idx, :].zero_()
-        self.obs_dict["obstacle_angvel"][env_ids, idx, :].zero_()
-
-        active_mask = self.drop_obstacle_exists[env_ids]
-        if bool(active_mask.any().item()):
-            active_env_ids = env_ids[active_mask]
-            self.obs_dict["obstacle_position"][active_env_ids, idx, 0:3] = (
-                self.drop_obstacle_position[active_env_ids]
-            )
-            self.obs_dict["obstacle_orientation"][active_env_ids, idx, 0:4] = id_quat.view(1, 4)
-            self.obs_dict["obstacle_linvel"][active_env_ids, idx, :].zero_()
-            self.obs_dict["obstacle_angvel"][active_env_ids, idx, :].zero_()
 
     def _resolve_best_point_path(self):
         runs_dir = os.environ.get("AERIAL_GYM_RUNS_DIR", "runs")
@@ -1024,6 +854,40 @@ class NavigationTaskGmmNoise(BaseTask):
             self._train_epoch = int(getattr(algo, "epoch_num", self._train_epoch))
         except Exception:
             pass
+
+    def _update_score_d0_curriculum(self):
+        cfg = self.drop_reward_config
+        if not bool(getattr(cfg, "score_d0_curriculum_enable", False)):
+            self.current_score_d0 = float(getattr(cfg, "score_d0", self.current_score_d0))
+            return
+
+        curriculum_values = list(getattr(cfg, "score_d0_curriculum_values", [4.0, 3.0, 2.5, 2.0]))
+        if len(curriculum_values) == 0:
+            self.current_score_d0 = float(getattr(cfg, "score_d0", self.current_score_d0))
+            return
+
+        min_drop_rates = list(getattr(cfg, "score_d0_curriculum_min_drop_rate", []))
+        max_error_ema = list(getattr(cfg, "score_d0_curriculum_max_error_ema", []))
+        max_stage = len(curriculum_values) - 1
+        self.score_d0_curriculum_stage = int(np.clip(self.score_d0_curriculum_stage, 0, max_stage))
+
+        drop_count_window = int(getattr(self, "window_drop_end_count", 0))
+        no_drop_count_window = int(getattr(self, "window_no_drop_done_count", 0))
+        drop_total = drop_count_window + no_drop_count_window
+        if drop_total <= 0 or self.landing_error_xy_ema is None:
+            self.current_score_d0 = float(curriculum_values[self.score_d0_curriculum_stage])
+            return
+
+        drop_rate = float(drop_count_window) / float(drop_total)
+        landing_error_ema = float(self.landing_error_xy_ema)
+        next_stage = self.score_d0_curriculum_stage + 1
+        if next_stage <= max_stage:
+            rate_req = float(min_drop_rates[next_stage - 1]) if (next_stage - 1) < len(min_drop_rates) else 1.0
+            error_req = float(max_error_ema[next_stage - 1]) if (next_stage - 1) < len(max_error_ema) else -1.0
+            if drop_rate >= rate_req and landing_error_ema <= error_req:
+                self.score_d0_curriculum_stage = next_stage
+
+        self.current_score_d0 = float(curriculum_values[self.score_d0_curriculum_stage])
 
     def _get_spawn_z_sampling_range(self):
         """Get current spawn-Z sampling range, optionally with epoch-based curriculum."""
@@ -1273,6 +1137,18 @@ class NavigationTaskGmmNoise(BaseTask):
             _, _, default_com_root = self._compute_robot_aggregate_dynamics(0)
             self._robot_com_body_default = default_com_root
             self._robot_com_body[:] = default_com_root.view(1, 3).expand(self.sim_env.num_envs, -1)
+            payload_body_idx = self._drop_mount_to_body_index.get(
+                int(self.fixed_payload_mount_index), -1
+            )
+            if payload_body_idx >= 0 and len(self._drop_body_props_default) > 0:
+                payload_cached = self._drop_body_props_default[0][payload_body_idx]
+                self._payload_mass_reference = float(payload_cached["mass"])
+                self._payload_com_body_reference = torch.tensor(
+                    payload_cached["com"], device=self.device, dtype=torch.float32
+                )
+            else:
+                self._payload_mass_reference = float(getattr(self.drop_impact_config, "child_mass", 1.0))
+                self._payload_com_body_reference.zero_()
             self._mother_rigidbody_updated[:] = False
             self._drop_rb_cache_ready = True
         except Exception as err:
@@ -1378,36 +1254,6 @@ class NavigationTaskGmmNoise(BaseTask):
             except Exception as err:
                 logger.warning(f"DROP rigid-body restore failed in env {env_id}: {err}")
 
-    def _init_noise_buffers(self):
-        num_envs = self.sim_env.num_envs
-        num_sources = self.num_noise_sources
-        
-        # Initialize previous state buffers for reward calculation
-        self.previous_position = torch.zeros(
-            (num_envs, 3), device=self.device, requires_grad=False
-        )
-        self.previous_actions = torch.zeros(
-            (num_envs, 4), device=self.device, requires_grad=False
-        )
-
-        self.noise_centers = torch.zeros(
-            (num_envs, num_sources, 3), device=self.device, requires_grad=False
-        )
-        self.noise_sigmas = torch.zeros(
-            (num_envs, num_sources, 3), device=self.device, requires_grad=False
-        )
-        self.noise_weights = torch.zeros(
-            (num_envs, num_sources), device=self.device, requires_grad=False
-        )
-        self.position_noise = torch.zeros((num_envs, 3), device=self.device, requires_grad=False)
-
-        self.noise_sigma_min = torch.tensor(
-            self.noise_config.sigma_min, device=self.device, requires_grad=False
-        )
-        self.noise_sigma_max = torch.tensor(
-            self.noise_config.sigma_max, device=self.device, requires_grad=False
-        )
-
     def _load_fixed_env_preset(self):
         preset_id = getattr(self.task_config, "preset_id", -1)
         try:
@@ -1429,9 +1275,6 @@ class NavigationTaskGmmNoise(BaseTask):
         preset = presets[preset_id]
         required_keys = (
             "target_position",
-            "noise_centers",
-            "noise_sigmas",
-            "noise_weights",
             "obstacle_positions",
         )
         for key in required_keys:
@@ -1461,34 +1304,8 @@ class NavigationTaskGmmNoise(BaseTask):
         if obstacle_positions.shape[0] != expected_obstacles:
             obstacle_positions = obstacle_positions[:expected_obstacles]
 
-        noise_centers = torch.tensor(
-            preset["noise_centers"], device=self.device, dtype=torch.float32
-        )
-        noise_sigmas = torch.tensor(
-            preset["noise_sigmas"], device=self.device, dtype=torch.float32
-        )
-        noise_weights = torch.tensor(
-            preset["noise_weights"], device=self.device, dtype=torch.float32
-        )
-
-        expected_sources = int(self.num_noise_sources)
-        if noise_centers.shape != (expected_sources, 3):
-            raise ValueError("Fixed noise_centers must be shaped as (num_sources, 3).")
-        if noise_sigmas.shape != (expected_sources, 3):
-            raise ValueError("Fixed noise_sigmas must be shaped as (num_sources, 3).")
-        if noise_weights.shape != (expected_sources,):
-            raise ValueError("Fixed noise_weights must be shaped as (num_sources,).")
-
-        weight_sum = float(noise_weights.sum().item())
-        if weight_sum <= 0.0:
-            raise ValueError("Fixed noise_weights must sum to a positive value.")
-        noise_weights = noise_weights / weight_sum
-
         self.fixed_target_position = target_position
         self.fixed_obstacle_positions = obstacle_positions
-        self.fixed_noise_centers = noise_centers
-        self.fixed_noise_sigmas = noise_sigmas
-        self.fixed_noise_weights = noise_weights
         self.fixed_obstacle_orientation = torch.tensor(
             [0.0, 0.0, 0.0, 1.0], device=self.device, dtype=torch.float32
         )
@@ -1503,15 +1320,6 @@ class NavigationTaskGmmNoise(BaseTask):
     def _apply_fixed_target(self, env_ids):
         target = self.fixed_target_position.view(1, 3).expand(env_ids.shape[0], -1)
         self.target_position[env_ids] = target
-
-    def _apply_fixed_noise(self, env_ids):
-        num_envs = env_ids.shape[0]
-        centers = self.fixed_noise_centers.view(1, -1, 3).expand(num_envs, -1, -1)
-        sigmas = self.fixed_noise_sigmas.view(1, -1, 3).expand(num_envs, -1, -1)
-        weights = self.fixed_noise_weights.view(1, -1).expand(num_envs, -1)
-        self.noise_centers[env_ids] = centers
-        self.noise_sigmas[env_ids] = sigmas
-        self.noise_weights[env_ids] = weights
 
     def _apply_fixed_obstacles(self, env_ids):
         num_assets = self.obs_dict["obstacle_position"].shape[1]
@@ -1544,118 +1352,6 @@ class NavigationTaskGmmNoise(BaseTask):
         self.sim_env.IGE_env.write_to_sim()
         if self.sim_env.use_warp:
             self.sim_env.warp_env.reset_idx(env_ids)
-
-    def _resample_noise_sources(self, env_ids):
-        if self.num_noise_sources <= 0:
-            return
-
-        env_ids = env_ids.to(dtype=torch.long, device=self.device)
-        num_envs = env_ids.shape[0]
-        num_sources = self.num_noise_sources
-
-        # Stratified Noise Sampling Strategy
-        # Group 1: Global roaming sources
-        #   - Randomly distributed across the entire environment.
-        # Group 2: Local target-near sources
-        #   - Spawned within 1.0m to 3.0m radius of the target.
-        # NOTE: No source is placed exactly at the target point.
-        
-        # --- Group 1: Global sources ---
-        num_global = min(3, num_sources)
-        bounds_min_global = self.env_bounds_min.view(1, 1, 3).expand(num_envs, num_global, 3)
-        bounds_max_global = self.env_bounds_max.view(1, 1, 3).expand(num_envs, num_global, 3)
-        centers_global = torch_rand_float_tensor(bounds_min_global, bounds_max_global)
-
-        # --- Group 2: Local target-near sources ---
-        num_local = num_sources - num_global
-        if num_local > 0:
-            # Generate random directions
-            random_dirs = torch.randn((num_envs, num_local, 3), device=self.device)
-            random_dirs = torch.nn.functional.normalize(random_dirs, dim=2)
-            
-            # Generate random distances between 1.0m and 3.0m
-            # dist = min + rand * (max - min)
-            local_dist_min = 1.0
-            local_dist_max = 3.0
-            random_dists = torch.rand((num_envs, num_local, 1), device=self.device) * (local_dist_max - local_dist_min) + local_dist_min
-            
-            # Calculate offsets: direction * distance
-            offsets = random_dirs * random_dists
-            
-            # Add to target position (need to reshape target to broadcast)
-            # self.target_position: (num_envs, 3) -> (num_envs, 1, 3)
-            # CRITICAL FIX: Must index target_position with env_ids to match current batch!
-            centers_local = self.target_position[env_ids].unsqueeze(1) + offsets
-            
-            # Clamp to environment bounds just in case target is near wall
-            centers_local = torch.max(centers_local, self.env_bounds_min.view(1, 1, 3))
-            centers_local = torch.min(centers_local, self.env_bounds_max.view(1, 1, 3))
-            
-            # Concatenate all groups: global + local
-            centers = torch.cat([centers_global, centers_local], dim=1)
-        else:
-            centers = centers_global
-
-        sigma_min = self.noise_sigma_min.view(1, 1, 3).expand(num_envs, num_sources, 3)
-        sigma_max = self.noise_sigma_max.view(1, 1, 3).expand(num_envs, num_sources, 3)
-        sigmas = torch_rand_float_tensor(sigma_min, sigma_max)
-
-        weight_min = float(self.noise_config.weight_min)
-        weight_max = float(self.noise_config.weight_max)
-        weights = torch.rand((num_envs, num_sources), device=self.device) * (
-            weight_max - weight_min
-        ) + weight_min
-        weights = weights / weights.sum(dim=1, keepdim=True)
-
-        self.noise_centers[env_ids] = centers
-        self.noise_sigmas[env_ids] = sigmas
-        self.noise_weights[env_ids] = weights
-
-    def _estimate_noise_range(self, env_ids):
-        """
-        Monte Carlo estimation of min and max noise intensity in the environment.
-        Used for normalizing noise intensity in the Unified Cost Function.
-        """
-        if not self.noise_config.enable_noise or self.num_noise_sources <= 0:
-            self.estimated_n_min[env_ids] = 0.0
-            self.estimated_n_max[env_ids] = 1.0
-            return
-
-        num_samples = int(self.reward_params.get("n_min_max_sample_size", 1000))
-        num_envs_reset = env_ids.shape[0]
-        
-        # 1. Sample random positions inside environment bounds
-        # shape: (num_envs_reset, num_samples, 3)
-        sample_positions = torch_rand_float_tensor(
-            self.env_bounds_min.view(1, 1, 3).expand(num_envs_reset, num_samples, 3),
-            self.env_bounds_max.view(1, 1, 3).expand(num_envs_reset, num_samples, 3)
-        )
-        
-        # 2. Compute noise intensity for all samples
-        # Expand noise params to match samples
-        # centers: (num_envs_reset, 1, num_sources, 3)
-        centers = self.noise_centers[env_ids].unsqueeze(1)
-        sigmas = self.noise_sigmas[env_ids].unsqueeze(1)
-        weights = self.noise_weights[env_ids].unsqueeze(1)
-        
-        # sample_positions: (num_envs_reset, num_samples, 1, 3)
-        pos = sample_positions.unsqueeze(2)
-        
-        # Vectorized GMM computation
-        deltas = pos - centers
-        scaled = (deltas / sigmas).pow(2).sum(dim=-1)
-        mixture = torch.exp(-0.5 * scaled)
-        intensity = (weights * mixture).sum(dim=2) # (num_envs_reset, num_samples)
-        
-        # 3. Find min and max for each environment
-        n_min, _ = intensity.min(dim=1)
-        n_max, _ = intensity.max(dim=1)
-        
-        # Avoid division by zero if flat
-        n_max = torch.max(n_max, n_min + 1e-6)
-        
-        self.estimated_n_min[env_ids] = n_min
-        self.estimated_n_max[env_ids] = n_max
 
     def _draw_env0_debug_markers(self):
         if not self._target_marker_draw_enabled:
@@ -1742,31 +1438,6 @@ class NavigationTaskGmmNoise(BaseTask):
                 self._target_marker_warned = True
             self._target_marker_draw_enabled = False
 
-    def _compute_position_noise(self):
-        # DEBUG: Print noise status every 50 steps
-        # if hasattr(self, 'num_task_steps') and self.num_task_steps % 50 == 0:
-        #     print(f"[NOISE DEBUG] enable_noise={self.noise_config.enable_noise}, num_sources={self.num_noise_sources}")
-        
-        if not self.noise_config.enable_noise or self.num_noise_sources <= 0:
-            self.position_noise.zero_()
-            # if hasattr(self, 'num_task_steps') and self.num_task_steps % 50 == 0:
-            #     print(f"[NOISE DEBUG] Position noise is DISABLED (returning zeros)")
-            return self.position_noise
-
-        position = self.obs_dict["robot_position"]
-        deltas = position.unsqueeze(1) - self.noise_centers
-        scaled = (deltas / self.noise_sigmas).pow(2).sum(dim=-1)
-        mixture = torch.exp(-0.5 * scaled)
-        mixture = (self.noise_weights * mixture).sum(dim=1)
-
-        noise = torch.randn_like(position) * mixture.unsqueeze(1) * self.noise_config.noise_scale
-        self.position_noise[:] = noise
-        
-        # if hasattr(self, 'num_task_steps') and self.num_task_steps % 50 == 0:
-        #     print(f"[NOISE DEBUG] Position noise magnitude: {torch.norm(noise[0]).item():.4f}")
-        
-        return self.position_noise
-    
     def _sample_unit_directions(self, count, horizontal_only=False):
         if count <= 0:
             return torch.zeros((0, 3), device=self.device)
@@ -1870,9 +1541,7 @@ class NavigationTaskGmmNoise(BaseTask):
         """
         Update local disturbance direction smoothly (Layer 2 gust).
         Main wind (Layer 1) is sampled at reset and stays constant.
-        This local gust update is independent from GMM source count so that
-        time-varying gusts can remain enabled even when spatial GMM sources
-        are disabled (num_noise_sources == 0).
+        This local gust update is independent from any spatial source model.
         """
         if self.dryden_enabled:
             # Dryden mode does not use direction-based local gust updates.
@@ -1938,37 +1607,6 @@ class NavigationTaskGmmNoise(BaseTask):
         # Relative-wind drag model: F_drag = c_drag * (v_w - v_uav)
         self.task_external_force_tensor[:] = c_drag * (v_w - v_uav)
 
-    def _compute_gmm_mixture(self, position, env_ids=None):
-        """
-        Compute GMM mixture intensity at given position.
-        
-        Args:
-            position: (num_envs or subset, 3) - positions to evaluate
-            env_ids: (optional) indices of environments to compute for. 
-                     If provided, noise params are sliced.
-            
-        Returns:
-            mixture_intensity: (num_envs or subset,) - GMM intensity
-        """
-        # position: (N, 3)
-        # noise_centers: (num_envs, num_sources, 3)
-        
-        if env_ids is not None:
-            centers = self.noise_centers[env_ids]
-            sigmas = self.noise_sigmas[env_ids]
-            weights = self.noise_weights[env_ids]
-        else:
-            centers = self.noise_centers
-            sigmas = self.noise_sigmas
-            weights = self.noise_weights
-        
-        deltas = position.unsqueeze(1) - centers  # (N, num_sources, 3)
-        scaled = (deltas / sigmas).pow(2).sum(dim=-1)  # (N, num_sources)
-        mixture = torch.exp(-0.5 * scaled)  # Gaussian PDF
-        weighted_mixture = (weights * mixture).sum(dim=1)  # (N,)
-        
-        return weighted_mixture
-
     def _compute_gmm_wind_vector(self, position, env_ids=None):
         """Compute world-frame wind vector: w_total = w_main + w_local."""
         if env_ids is not None:
@@ -1982,27 +1620,7 @@ class NavigationTaskGmmNoise(BaseTask):
                 local_wind = self.dryden_wind_state[env_ids]
             else:
                 local_wind = self.dryden_wind_state
-        elif self.num_noise_sources > 0:
-            mixture_intensity = self._compute_gmm_mixture(position, env_ids=env_ids)
-            if env_ids is not None:
-                weight_sum = self.noise_weights[env_ids].sum(dim=1).clamp_min(1e-6)
-                directions = self.gmm_force_direction[env_ids]
-            else:
-                weight_sum = self.noise_weights.sum(dim=1).clamp_min(1e-6)
-                directions = self.gmm_force_direction
-
-            if getattr(self.gmm_force_config, "normalize_intensity", True):
-                intensity = torch.clamp(mixture_intensity / weight_sum, 0.0, 1.0)
-            else:
-                intensity = torch.clamp(mixture_intensity, min=0.0)
-
-            if env_ids is not None:
-                local_v_max = self.local_wind_max_speed[env_ids]
-            else:
-                local_v_max = self.local_wind_max_speed
-            local_wind = intensity.unsqueeze(1) * local_v_max.unsqueeze(1) * directions
         else:
-            # Spatial GMM disabled: keep a time-varying but spatially uniform local gust.
             if env_ids is not None:
                 directions = self.gmm_force_direction[env_ids]
                 local_v_max = self.local_wind_max_speed[env_ids]
@@ -2031,6 +1649,45 @@ class NavigationTaskGmmNoise(BaseTask):
         v_eject_body = eject_speed * eject_dir_body.view(1, 3).expand(env_ids.shape[0], -1)
         robot_quat = self.obs_dict["robot_orientation"][env_ids]
         return quat_rotate(robot_quat, v_eject_body)
+
+    def _compute_payload_mount_offset_world(self, env_ids):
+        """Compute payload mount offset from mother base origin in world frame."""
+        if env_ids.numel() == 0:
+            return torch.zeros((0, 3), device=self.device, dtype=torch.float32)
+
+        env_ids = env_ids.to(dtype=torch.long, device=self.device)
+        if hasattr(self, "fixed_payload_offset_body"):
+            offset_body = self.fixed_payload_offset_body.view(1, 3).expand(env_ids.shape[0], -1)
+        else:
+            cfg = self.drop_impact_config
+            offset_body = torch.tensor(
+                getattr(cfg, "payload_offset_body", [0.0, 0.0, 0.0]) if cfg is not None else [0.0, 0.0, 0.0],
+                device=self.device,
+                dtype=torch.float32,
+            ).view(1, 3).expand(env_ids.shape[0], -1)
+        robot_quat = self.obs_dict["robot_orientation"][env_ids]
+        return quat_rotate(robot_quat, offset_body)
+
+    def _compute_child_release_kinematics(self, env_ids, include_eject_velocity=True):
+        """
+        Compute child release position and velocity at the payload mount point.
+
+        v_release = v_mother + omega_world x r_mount_world + v_eject_world.
+        """
+        if env_ids.numel() == 0:
+            empty = torch.zeros((0, 3), device=self.device, dtype=torch.float32)
+            return empty, empty
+
+        env_ids = env_ids.to(dtype=torch.long, device=self.device)
+        mount_offset_world = self._compute_payload_mount_offset_world(env_ids)
+        release_pos = self.obs_dict["robot_position"][env_ids].clone() + mount_offset_world
+
+        omega_world = self.obs_dict["robot_angvel"][env_ids].clone()
+        tangential_vel = torch.cross(omega_world, mount_offset_world, dim=1)
+        release_vel = self.obs_dict["robot_linvel"][env_ids].clone() + tangential_vel
+        if include_eject_velocity:
+            release_vel = release_vel + self._compute_eject_velocity_world(env_ids)
+        return release_pos, release_vel
 
     def _apply_drop_impact(self, env_ids):
         """Apply recoil impact to mother UAV when child is released."""
@@ -2348,23 +2005,18 @@ class NavigationTaskGmmNoise(BaseTask):
 
     def _compute_reward_and_scores(self):
         """
-        Drop-decision reward (direct replacement):
-        - WAIT: reward = R_progress
-                where R_progress = direction_reward_weight * (d_prev_xy - d_curr_xy)
-                (only before DROP, positive when getting closer to target in XY)
-        - DROP: reward = R_score + R_drop
-                where:
-                  R_score = score_reward_weight * score_max * exp(-(landing_error_xy/score_d0)^score_p)
-                  R_drop = -impulse_penalty_weight * impulse_metric
-                           + posture_reward_weight * exp(-(theta_drop/attitude_theta0)^2)
-                           + angvel_reward_weight * exp(-(omega_drop_xy/attitude_theta0)^2)
-        where impulse_metric = alpha * Delta_v + beta * Delta_omega.
+        Reward structure:
+        - WAIT: direction-progress shaping + predicted-release-error improvement shaping
+        - DROP: landing-accuracy score + impulse penalty
+        - OUTSIDE: linear penalty beyond outer threshold, keep impulse penalty
+        - HEIGHT: keep the existing soft lower-bound altitude penalty
         """
         cfg = self.drop_reward_config
         altitude_tolerance = float(getattr(cfg, "altitude_tolerance", 0.5))
         altitude_low_penalty_w = float(getattr(cfg, "altitude_low_penalty_weight", 1.0))
         direction_w = float(getattr(cfg, "direction_reward_weight", 0.02))
-        direction_min_target_dist = float(getattr(cfg, "direction_min_target_dist", 0.1))
+        pred_error_w = float(getattr(cfg, "pred_error_shaping_weight", 0.0))
+        pred_error_clip = float(max(getattr(cfg, "pred_error_improvement_clip", 1.0), 1e-6))
         score_reward_w = float(
             getattr(
                 cfg,
@@ -2374,10 +2026,8 @@ class NavigationTaskGmmNoise(BaseTask):
             )
         )
         impulse_lambda = float(getattr(cfg, "impulse_penalty_weight", 0.1))
-        attitude_theta0 = float(getattr(cfg, "attitude_theta0", 0.12))
-        attitude_w = float(getattr(cfg, "attitude_reward_weight", 0.1))
         score_max = float(getattr(cfg, "score_max", 20.0))
-        score_d0 = float(getattr(cfg, "score_d0", 3.6))
+        score_d0 = float(getattr(self, "current_score_d0", getattr(cfg, "score_d0", 4.0)))
         score_p = float(getattr(cfg, "score_p", 1.0))
         piecewise_r = float(getattr(cfg, "piecewise_r", 2.0))
         piecewise_thresholds = list(
@@ -2393,39 +2043,47 @@ class NavigationTaskGmmNoise(BaseTask):
         wait_mask = ~self.child_has_dropped
         drop_ids = self.step_drop_event_mask.nonzero(as_tuple=False).squeeze(-1)
 
-        # Pre-DROP distance-progress shaping (XY plane):
-        # R_progress = w_dir * (d_prev_xy - d_curr_xy)
         direction_reward = torch.zeros_like(reward)
         if direction_w > 0.0:
             current_dist_xy = torch.norm(
                 self.target_position[:, 0:2] - self.obs_dict["robot_position"][:, 0:2], dim=1
             )
             progress_delta = self.previous_distance_xy - current_dist_xy
-            # I_far gate is disabled: keep direction-progress reward active for all pre-DROP steps.
             valid_mask = wait_mask
             direction_reward[valid_mask] = direction_w * progress_delta[valid_mask]
 
-        reward = reward + direction_reward
+        predicted_error_reward = torch.zeros_like(reward)
+        (
+            predicted_drop_error_xy_all,
+            _predicted_fall_time_all,
+            _attitude_deg_all,
+            _omega_xy_all,
+        ) = self._compute_drop_decision_features(
+            target_relative_position=quat_rotate_inverse(
+                self.obs_dict["robot_vehicle_orientation"],
+                (self.target_position - self.obs_dict["robot_position"]),
+            ),
+            body_linvel=self.obs_dict["robot_body_linvel"],
+            euler_angles=ssa(self.obs_dict["robot_euler_angles"]),
+            body_angvel=self.obs_dict["robot_body_angvel"],
+        )
+        if pred_error_w > 0.0:
+            pred_error_improvement = torch.clamp(
+                self.prev_predicted_drop_error_xy - predicted_drop_error_xy_all,
+                min=-pred_error_clip,
+                max=pred_error_clip,
+            )
+            predicted_error_reward[wait_mask] = pred_error_w * pred_error_improvement[wait_mask]
 
-        # Score term is kept independent from R_drop_core by design.
+        reward = reward + direction_reward
+        reward = reward + predicted_error_reward
+
         score_reward = torch.zeros_like(reward)
-        drop_core_reward = torch.zeros_like(reward)
         impulse_penalty = torch.zeros_like(reward)
-        attitude_reward = torch.zeros_like(reward)
         outside_region_penalty_reward = torch.zeros_like(reward)
         if drop_ids.numel() > 0:
             landing_error_xy = self.step_landing_error_xy[drop_ids]
             impulse_metric = self.step_impulse_metric[drop_ids]
-            obstacle_hit_mask = torch.zeros_like(landing_error_xy, dtype=torch.bool)
-            if self.drop_obstacle_enable:
-                has_obstacle = self.drop_obstacle_exists[drop_ids]
-                if has_obstacle.any():
-                    landing_xy = self.child_landing_position[drop_ids, 0:2]
-                    obstacle_xy = self.drop_obstacle_position[drop_ids, 0:2]
-                    obstacle_radius = self.drop_obstacle_radius[drop_ids]
-                    dist_to_obstacle_xy = torch.norm(landing_xy - obstacle_xy, dim=1)
-                    obstacle_hit_mask = has_obstacle & (dist_to_obstacle_xy <= obstacle_radius)
-            self.step_drop_hit_obstacle[drop_ids] = obstacle_hit_mask
             safe_d0 = max(score_d0, 1e-6)
             safe_p = max(score_p, 1e-6)
             raw_score = score_max * torch.exp(-torch.pow(landing_error_xy / safe_d0, safe_p))
@@ -2494,35 +2152,25 @@ class NavigationTaskGmmNoise(BaseTask):
                 self.extras["release_to_target_xy_drop_mean_step"] = release_to_target_xy_mean_step
 
             score_term = score_reward_w * raw_score
-            theta_drop = self.step_drop_attitude_theta[drop_ids]
-            omega_drop_xy = self.step_drop_heading_error[drop_ids]
-            theta_scale = max(attitude_theta0, 1e-6)
-            # Only grant attitude bonus when drop accuracy score is positive.
-            posture_bonus = attitude_w * torch.exp(-torch.square(theta_drop / theta_scale))
-            # Use the same weight/scale as posture bonus for DROP-pre angular-rate stability.
-            angvel_bonus = attitude_w * torch.exp(-torch.square(omega_drop_xy / theta_scale))
-            attitude_bonus = posture_bonus + angvel_bonus
-            attitude_bonus = torch.where(raw_score > 0.0, attitude_bonus, torch.zeros_like(attitude_bonus))
             score_reward[drop_ids] = score_term
             impulse_penalty[drop_ids] = -impulse_lambda * impulse_metric
-            attitude_reward[drop_ids] = attitude_bonus
-            drop_core_reward[drop_ids] = impulse_penalty[drop_ids] + attitude_reward[drop_ids]
             reward[drop_ids] = (
                 score_reward[drop_ids]
-                + drop_core_reward[drop_ids]
+                + impulse_penalty[drop_ids]
             )
             outside_mask = torch.zeros_like(landing_error_xy, dtype=torch.bool)
             if len(scaled_thresholds) > 0:
                 outside_mask = landing_error_xy > scaled_thresholds[-1]
-            penalty_mask = outside_mask | obstacle_hit_mask
-            if outside_region_penalty > 0.0 and penalty_mask.any():
-                penalty_ids = drop_ids[penalty_mask]
-                outside_region_penalty_reward[penalty_ids] = -outside_region_penalty
+            if outside_mask.any():
+                penalty_ids = drop_ids[outside_mask]
+                outside_error = landing_error_xy[outside_mask] - scaled_thresholds[-1]
+                outside_region_penalty_reward[penalty_ids] = torch.clamp(
+                    -outside_error, min=-outside_region_penalty, max=0.0
+                )
                 score_reward[penalty_ids] = 0.0
-                impulse_penalty[penalty_ids] = 0.0
-                attitude_reward[penalty_ids] = 0.0
-                drop_core_reward[penalty_ids] = 0.0
-                reward[penalty_ids] = outside_region_penalty_reward[penalty_ids]
+                reward[penalty_ids] = (
+                    outside_region_penalty_reward[penalty_ids] + impulse_penalty[penalty_ids]
+                )
 
         # Soft lower-bound altitude penalty (no hard state overwrite).
         # Penalize when z < (spawn_height_reference - altitude_tolerance).
@@ -2542,9 +2190,6 @@ class NavigationTaskGmmNoise(BaseTask):
             altitude_penalty = -altitude_low_penalty_w * below_depth
             reward = reward + altitude_penalty
 
-        # Keep legacy buffers/outputs alive for downstream logging code compatibility.
-        self.current_J = torch.zeros_like(reward)
-        self.previous_potential = torch.zeros_like(reward)
         self.previous_position = self.obs_dict["robot_position"].clone()
         self.previous_distance = torch.norm(
             self.target_position - self.obs_dict["robot_position"], dim=1
@@ -2554,15 +2199,14 @@ class NavigationTaskGmmNoise(BaseTask):
         )
         self.previous_velocity = self.obs_dict["robot_linvel"].clone()
         self.previous_actions = self.actions.clone()
+        self.prev_predicted_drop_error_xy[:] = predicted_drop_error_xy_all
 
         improvement_reward = (
             score_reward
             + impulse_penalty
-            + attitude_reward
             + outside_region_penalty_reward
         )
         noise_reduction_reward = torch.zeros_like(reward)
-        noise_intensity = self._compute_gmm_mixture(self.obs_dict["robot_position"])
         safety_reward = altitude_penalty
         action_smoothness_penalty = torch.zeros_like(reward)
         hover_reward = torch.zeros_like(reward)
@@ -2574,7 +2218,6 @@ class NavigationTaskGmmNoise(BaseTask):
             improvement_reward,
             direction_reward,
             noise_reduction_reward,
-            noise_intensity,
             safety_reward,
             action_smoothness_penalty,
             hover_reward,
@@ -2671,34 +2314,9 @@ class NavigationTaskGmmNoise(BaseTask):
         else:
             self.writer = None
 
-    def _populate_extras(self, improvement_reward, direction_reward, noise_reduction_reward, noise_intensity):
-        """Simplified extras logging for unified reward function"""
-        # Calculate diagnostic metrics
-        crash_rate_instant = self.obs_dict["crashes"].float().mean().item()
-        avg_z_pos = self.obs_dict["robot_position"][:, 2].mean().item()
-        drop_count = int(self.extras.get("drop_count", 0))
-        child_dist_to_goal_xy = float(self.extras.get("child_landing_xy_distance_mean", 0.0))
-        release_to_target_xy_step = float(self.extras.get("release_to_target_xy_mean", 0.0))
-        release_to_target_xy_step_min = float(self.extras.get("release_to_target_xy_min", 0.0))
-        release_to_target_xy_step_max = float(self.extras.get("release_to_target_xy_max", 0.0))
-        
-        # Calculate hover metrics
-        avg_hover_time = self.hover_time_counter.mean().item()
-        
-        # Calculate success rate from completed episodes
-        if len(self.recent_episodes) > 0:
-            total_episodes = len(self.recent_episodes)
-            success_count = self.recent_episodes.count('success')
-            crash_count = self.recent_episodes.count('crash')
-            timeout_count = self.recent_episodes.count('timeout')
-            
-            success_rate = success_count / total_episodes
-            crash_rate_episodes = crash_count / total_episodes
-            timeout_rate = timeout_count / total_episodes
-        else:
-            success_rate = 0.0
-            crash_rate_episodes = 0.0
-            timeout_rate = 0.0
+    def _populate_extras(self, improvement_reward, direction_reward, noise_reduction_reward):
+        """Export only compact task metrics: release attitude and landing precision."""
+        del improvement_reward, direction_reward, noise_reduction_reward
 
         # Drop-only window diagnostics (aggregated since last console print).
         drop_samples_window = int(getattr(self, "window_drop_sample_count", 0))
@@ -2706,85 +2324,45 @@ class NavigationTaskGmmNoise(BaseTask):
             landing_error_xy_mean_drop_window = (
                 float(self.window_landing_error_xy_sum) / drop_samples_window
             )
-            release_to_target_xy_mean_drop_window = (
-                float(self.window_release_to_target_xy_sum) / drop_samples_window
-            )
-            release_to_target_xy_min_drop_window = float(self.window_release_to_target_xy_min)
-            release_to_target_xy_max_drop_window = float(self.window_release_to_target_xy_max)
-            drop_roll_deg_mean_window = float(self.window_drop_roll_deg_sum) / drop_samples_window
-            drop_roll_deg_min_window = float(self.window_drop_roll_deg_min)
-            drop_roll_deg_max_window = float(self.window_drop_roll_deg_max)
-            drop_pitch_deg_mean_window = float(self.window_drop_pitch_deg_sum) / drop_samples_window
-            drop_pitch_deg_min_window = float(self.window_drop_pitch_deg_min)
-            drop_pitch_deg_max_window = float(self.window_drop_pitch_deg_max)
-            attitude_total_deg_mean_window = (
+            release_attitude_deg_mean_drop_window = (
                 float(self.window_drop_attitude_total_deg_sum) / drop_samples_window
             )
             attitude_total_deg_var_window = max(
                 float(self.window_drop_attitude_total_deg_sq_sum) / drop_samples_window
-                - attitude_total_deg_mean_window * attitude_total_deg_mean_window,
+                - release_attitude_deg_mean_drop_window * release_attitude_deg_mean_drop_window,
                 0.0,
             )
-            attitude_total_deg_std_window = float(np.sqrt(attitude_total_deg_var_window))
-            impulse_metric_mean_window = float(self.window_impulse_metric_sum) / drop_samples_window
-            impulse_metric_var_window = max(
-                float(self.window_impulse_metric_sq_sum) / drop_samples_window
-                - impulse_metric_mean_window * impulse_metric_mean_window,
-                0.0,
-            )
-            impulse_metric_std_window = float(np.sqrt(impulse_metric_var_window))
+            release_attitude_deg_std_drop_window = float(np.sqrt(attitude_total_deg_var_window))
         else:
             landing_error_xy_mean_drop_window = 0.0
-            release_to_target_xy_mean_drop_window = 0.0
-            release_to_target_xy_min_drop_window = 0.0
-            release_to_target_xy_max_drop_window = 0.0
-            drop_roll_deg_mean_window = 0.0
-            drop_roll_deg_min_window = 0.0
-            drop_roll_deg_max_window = 0.0
-            drop_pitch_deg_mean_window = 0.0
-            drop_pitch_deg_min_window = 0.0
-            drop_pitch_deg_max_window = 0.0
-            attitude_total_deg_mean_window = 0.0
-            attitude_total_deg_std_window = 0.0
-            impulse_metric_mean_window = 0.0
-            impulse_metric_std_window = 0.0
+            release_attitude_deg_mean_drop_window = 0.0
+            release_attitude_deg_std_drop_window = 0.0
+
         landing_error_xy_ema = (
             float(self.landing_error_xy_ema) if self.landing_error_xy_ema is not None else 0.0
         )
-        attitude_total_deg_ema = (
+        release_attitude_deg_ema = (
             float(self.attitude_total_deg_ema) if self.attitude_total_deg_ema is not None else 0.0
         )
-        
-        extras = {
-            "improvement_reward": float(improvement_reward.mean().item()),
-            "direction_reward": float(direction_reward.mean().item()),
-            "noise_reduction_reward": float(noise_reduction_reward.mean().item()),
-            "noise_intensity": float(noise_intensity.mean().item()),
-            "hover_time": avg_hover_time,
-            "total_reward": float(self.rewards.mean().item()),
-            "episode_length": float(self.task_config.episode_len_steps),
-            # Episode-based metrics
-            "metrics/crash_rate": crash_rate_episodes,
-            "metrics/timeout_rate": timeout_rate,
-            # Diagnostic metrics for TensorBoard
-            "info/crash_rate_instant": crash_rate_instant,
-            "info/avg_z_position": avg_z_pos,
-            # Drop-quality diagnostics (window aggregated)
-            "performance/landing_error_xy_mean_drop_window": landing_error_xy_mean_drop_window,
-            "performance/release_to_target_xy_mean_drop_window": release_to_target_xy_mean_drop_window,
-            "performance/landing_error_xy_ema": landing_error_xy_ema,
-            "performance/impulse_metric_mean": impulse_metric_mean_window,
-            "performance/impulse_metric_std": impulse_metric_std_window,
-            "performance/attitude_total_deg_ema": attitude_total_deg_ema,
-            "performance/attitude_total_deg_std_drop_window": attitude_total_deg_std_window,
-            "curriculum/spawn_z_min": float(self.spawn_z_curriculum_min_current),
-            "curriculum/spawn_z_alpha": float(self.spawn_z_curriculum_alpha_current),
-        }
-        if drop_count > 0:
-            extras["performance/release_to_target_xy"] = release_to_target_xy_step
-        learning_rate = os.environ.get("AERIAL_GYM_LR")
-        if learning_rate is not None:
-            extras["learning_rate"] = float(learning_rate)
+
+        exported_extras = {}
+        if "episode_rewards" in self.extras:
+            exported_extras["episode_rewards"] = self.extras["episode_rewards"]
+        if "episode_lengths" in self.extras:
+            exported_extras["episode_lengths"] = self.extras["episode_lengths"]
+        if drop_samples_window > 0:
+            exported_extras["performance/landing_error_xy_mean_drop_window"] = (
+                landing_error_xy_mean_drop_window
+            )
+            exported_extras["performance/release_attitude_deg_mean_drop_window"] = (
+                release_attitude_deg_mean_drop_window
+            )
+        if self.landing_error_xy_ema is not None:
+            exported_extras["performance/landing_error_xy_ema"] = landing_error_xy_ema
+        if self.attitude_total_deg_ema is not None:
+            exported_extras["performance/release_attitude_deg_ema"] = release_attitude_deg_ema
+        exported_extras["performance/score_d0_current"] = float(self.current_score_d0)
+        exported_extras["performance/score_d0_curriculum_stage"] = int(self.score_d0_curriculum_stage)
         
         # Write diagnostics to TensorBoard (with lazy initialization)
         if not self._writer_initialized:
@@ -2792,82 +2370,75 @@ class NavigationTaskGmmNoise(BaseTask):
             self._writer_initialized = True
         
         if self.writer is not None:
-            self.writer.add_scalar(
-                "performance/landing_error_xy_mean_drop_window",
-                landing_error_xy_mean_drop_window,
-                self.num_task_steps,
-            )
-            self.writer.add_scalar(
-                "performance/release_to_target_xy_mean_drop_window",
-                release_to_target_xy_mean_drop_window,
-                self.num_task_steps,
-            )
-            self.writer.add_scalar(
-                "performance/landing_error_xy_ema",
-                landing_error_xy_ema,
-                self.num_task_steps,
-            )
-            self.writer.add_scalar(
-                "performance/impulse_metric_mean",
-                impulse_metric_mean_window,
-                self.num_task_steps,
-            )
-            self.writer.add_scalar(
-                "performance/impulse_metric_std",
-                impulse_metric_std_window,
-                self.num_task_steps,
-            )
-            self.writer.add_scalar(
-                "performance/attitude_total_deg_ema",
-                attitude_total_deg_ema,
-                self.num_task_steps,
-            )
-            self.writer.add_scalar(
-                "performance/attitude_total_deg_std_drop_window",
-                attitude_total_deg_std_window,
-                self.num_task_steps,
-            )
-            if drop_count > 0:
+            if drop_samples_window > 0:
                 self.writer.add_scalar(
-                    "performance/release_to_target_xy", release_to_target_xy_step, self.num_task_steps
+                    "performance/landing_error_xy_mean_drop_window",
+                    landing_error_xy_mean_drop_window,
+                    self.num_task_steps,
                 )
-
-        if self.writer is None and not self._writer_initialized:
-             self._init_tensorboard_writer()
-             self._writer_initialized = True
-             
-        if self.writer:
-            if hasattr(self, "current_raw_signal"):
-                # Mean Magnitude (Scalar summary)
-                mean_signal = self.current_raw_signal.abs().mean().item()
-                self.writer.add_scalar("Performance/mean_abs_signal", mean_signal, self.num_task_steps)
-                # print(f"DEBUG: Wrote signal histogram. Mean signal: {mean_signal:.4f}")
+                self.writer.add_scalar(
+                    "performance/release_attitude_deg_mean_drop_window",
+                    release_attitude_deg_mean_drop_window,
+                    self.num_task_steps,
+                )
+            if self.landing_error_xy_ema is not None:
+                self.writer.add_scalar(
+                    "performance/landing_error_xy_ema",
+                    landing_error_xy_ema,
+                    self.num_task_steps,
+                )
+            if self.attitude_total_deg_ema is not None:
+                self.writer.add_scalar(
+                    "performance/release_attitude_deg_ema",
+                    release_attitude_deg_ema,
+                    self.num_task_steps,
+                )
+            self.writer.add_scalar(
+                "performance/score_d0_current",
+                float(self.current_score_d0),
+                self.num_task_steps,
+            )
+            self.writer.add_scalar(
+                "performance/score_d0_curriculum_stage",
+                int(self.score_d0_curriculum_stage),
+                self.num_task_steps,
+            )
         
         # Console stats: print once every 10 epochs.
         curr_epoch = int(getattr(self, "_train_epoch", 0))
         if curr_epoch > 0 and curr_epoch % 10 == 0 and curr_epoch != self._last_console_stats_epoch:
+            self._update_score_d0_curriculum()
+            drop_count_window = int(getattr(self, "window_drop_end_count", 0))
+            no_drop_count_window = int(getattr(self, "window_no_drop_done_count", 0))
+            drop_decision_total = drop_count_window + no_drop_count_window
+            drop_rate_text = (
+                f"{(100.0 * drop_count_window / drop_decision_total):.1f}%"
+                if drop_decision_total > 0
+                else "N/A"
+            )
+            landing_error_mean_text = (
+                f"{landing_error_xy_mean_drop_window:.3f}" if drop_samples_window > 0 else "N/A"
+            )
+            release_attitude_mean_text = (
+                f"{release_attitude_deg_mean_drop_window:.3f}" if drop_samples_window > 0 else "N/A"
+            )
+            landing_error_ema_text = (
+                f"{landing_error_xy_ema:.3f}" if self.landing_error_xy_ema is not None else "N/A"
+            )
+            release_attitude_ema_text = (
+                f"{release_attitude_deg_ema:.3f}" if self.attitude_total_deg_ema is not None else "N/A"
+            )
+            release_attitude_std_text = (
+                f"{release_attitude_deg_std_drop_window:.3f}" if drop_samples_window > 0 else "N/A"
+            )
             logger.warning(
-                f"[Epoch {curr_epoch}] crash_rate_ep={crash_rate_episodes:.1%}, "
-                f"timeout_rate_ep={timeout_rate:.1%}, "
-                f"release_to_target_xy(mean/min/max)="
-                f"{release_to_target_xy_mean_drop_window:.3f}/"
-                f"{release_to_target_xy_min_drop_window:.3f}/"
-                f"{release_to_target_xy_max_drop_window:.3f}, "
-                f"landing_error_xy_mean={landing_error_xy_mean_drop_window:.3f}, "
-                f"landing_error_xy_ema={landing_error_xy_ema:.3f}, "
-                f"release_roll_deg(mean/min/max)="
-                f"{drop_roll_deg_mean_window:.3f}/"
-                f"{drop_roll_deg_min_window:.3f}/"
-                f"{drop_roll_deg_max_window:.3f}, "
-                f"release_pitch_deg(mean/min/max)="
-                f"{drop_pitch_deg_mean_window:.3f}/"
-                f"{drop_pitch_deg_min_window:.3f}/"
-                f"{drop_pitch_deg_max_window:.3f}, "
-                f"impulse_metric(mean/std)="
-                f"{impulse_metric_mean_window:.3f}/"
-                f"{impulse_metric_std_window:.3f}, "
-                f"attitude_total_deg_ema={attitude_total_deg_ema:.3f}, "
-                f"attitude_total_deg_std_window={attitude_total_deg_std_window:.3f}"
+                f"[Epoch {curr_epoch}] "
+                f"drop_count={drop_count_window}, "
+                f"drop_rate={drop_rate_text}, "
+                f"score_d0={float(self.current_score_d0):.2f}, "
+                f"landing_error_xy(mean/ema)={landing_error_mean_text}/{landing_error_ema_text}, "
+                f"release_attitude_deg(mean/ema/std)="
+                f"{release_attitude_mean_text}/{release_attitude_ema_text}/{release_attitude_std_text}"
             )
             self._last_console_stats_epoch = curr_epoch
             self.window_done_total = 0
@@ -2877,7 +2448,6 @@ class NavigationTaskGmmNoise(BaseTask):
             self.window_drop_end_count = 0
             self.window_no_drop_done_count = 0
             self.window_drop_sample_count = 0
-            self.window_raw_score_hist = self._init_score_histogram()
             self.window_landing_error_xy_sum = 0.0
             self.window_release_to_target_xy_sum = 0.0
             self.window_release_to_target_xy_min = float("inf")
@@ -2893,8 +2463,8 @@ class NavigationTaskGmmNoise(BaseTask):
             self.window_impulse_metric_sum = 0.0
             self.window_impulse_metric_sq_sum = 0.0
 
-        
-        self.infos["extras"] = extras
+        self.extras = exported_extras
+        self.infos["extras"] = exported_extras
 
     def close(self):
         if hasattr(self, 'writer') and self.writer is not None:
@@ -2920,49 +2490,14 @@ class NavigationTaskGmmNoise(BaseTask):
         # Ensure each new episode starts from the default full-payload rigid-body model.
         self._restore_mother_rigidbody(env_ids)
             
-        # --- Capture Final J for Terminated Environments (Stats) ---
-        # Calculate J for the envs about to be reset.
+        # --- Capture minimum distance-to-target for terminated environments ---
         try:
-            # 1. Get current state for reset envs
-            d_pos = self.obs_dict["robot_position"][env_ids]
-            
-            # 2. Compute current noise directly (obs_dict key may not exist)
-            current_noise = self._compute_gmm_mixture(d_pos, env_ids)
-            
-            # 3. Normalize noise
-            if hasattr(self, "estimated_n_min"):
-                n_range = self.estimated_n_max[env_ids] - self.estimated_n_min[env_ids] + 1e-6
-                n_hat = (current_noise - self.estimated_n_min[env_ids]) / n_range
-                n_hat = torch.clamp(n_hat, 0.0, 1.0)
-            else:
-                n_hat = torch.zeros_like(current_noise)
-                
-            # 4. Calculate Distance cost
-            dist_to_tgt = torch.norm(self.target_position[env_ids] - d_pos, dim=1)
-            
-            # 5. Compute J = w_d * (d/d0)^2 + w_n * n_hat
-            w_d = self.reward_params["potential_w_d"]
-            w_n = self.reward_params["potential_w_n"]
-            d0 = self.reward_params["potential_d0"]
-            
-            final_J = w_d * (dist_to_tgt / d0).pow(2) + w_n * n_hat
-            
-            # 6. Add to buffer (CPU side)
-            final_J_vals = final_J.detach().cpu().numpy()
-            self.final_J_buffer.extend(final_J_vals)
-            
-            # --- Capture Min J for Terminated Environments ---
-            min_J_vals = self.episode_min_J[env_ids].detach().cpu().numpy()
-            
-            # Filter out placeholder values (e.g., from initial reset before any steps)
-            valid_mask = min_J_vals < 999.0
+            min_dist_vals = self.episode_min_J[env_ids].detach().cpu().numpy()
+            valid_mask = min_dist_vals < 999.0
             if np.any(valid_mask):
-                self.min_J_buffer.extend(min_J_vals[valid_mask])
-                
-            # Reset Min J tracker for these envs
+                self.min_J_buffer.extend(min_dist_vals[valid_mask])
             self.episode_min_J[env_ids] = 1000.0
-            
-        except Exception as e:
+        except Exception:
             # Silent fail is safer during training loop than crashing
             pass
 
@@ -2973,7 +2508,6 @@ class NavigationTaskGmmNoise(BaseTask):
         self._set_fixed_obstacle_count()
         if self.fixed_env_enabled:
             self._apply_fixed_target(env_ids)
-            self._apply_fixed_noise(env_ids)
             self._apply_fixed_obstacles(env_ids)
         else:
             use_fixed_target = bool(getattr(self.task_config, "target_use_fixed", False))
@@ -3003,9 +2537,6 @@ class NavigationTaskGmmNoise(BaseTask):
                 sampled_xy.uniform_(target_xy_min, target_xy_max)
                 self.target_position[env_ids, 0:2] = sampled_xy
                 self.target_position[env_ids, 2] = target_fixed_z
-        self._resample_drop_obstacles(env_ids)
-        self._sync_drop_obstacle_instances(env_ids)
-
         # Optionally fix spawn XY to reduce training variance.
         use_fixed_spawn_xy = bool(getattr(self.task_config, "spawn_use_fixed_xy", False))
         if use_fixed_spawn_xy:
@@ -3114,7 +2645,15 @@ class NavigationTaskGmmNoise(BaseTask):
         self.step_drop_heading_error[env_ids] = 0.0
         self.step_landing_error_xy[env_ids] = 0.0
         self.step_release_to_target_xy[env_ids] = 0.0
-        self.step_drop_hit_obstacle[env_ids] = False
+        confidence_history_init = float(
+            max(getattr(self.drop_model_config, "confidence_error_scale", 3.0), 1e-6)
+        )
+        self.pred_drop_error_history[env_ids] = confidence_history_init
+        self.release_confidence[env_ids] = 0.0
+        self.release_confidence_error_component[env_ids] = 0.0
+        self.release_confidence_risk_component[env_ids] = 0.0
+        self.release_confidence_stability_component[env_ids] = 0.0
+        self.confidence_gate_blocked_mask[env_ids] = False
         self.step_drop_trace_norm_t[env_ids] = 0.0
         self.step_drop_trace_error_xy[env_ids] = 0.0
         self.step_drop_trace_pos_x[env_ids] = 0.0
@@ -3130,14 +2669,8 @@ class NavigationTaskGmmNoise(BaseTask):
         self.previous_position[env_ids] = self.obs_dict["robot_position"][env_ids]
         self.previous_distance[env_ids] = dist_spawn_to_target
         self.previous_distance_xy[env_ids] = dist_spawn_to_target_xy
+        self.prev_predicted_drop_error_xy[env_ids] = dist_spawn_to_target_xy
         self.previous_actions[env_ids] = 0.0
-        self.current_cmd_body_for_obs[env_ids] = 0.0
-        self.obs_prev_cmd_body[env_ids] = 0.0
-        self.obs_prev_body_linvel[env_ids] = self.obs_dict["robot_body_linvel"][env_ids]
-        reset_body_linvel = self.obs_dict["robot_body_linvel"][env_ids]
-        self.obs_body_linvel_history[env_ids] = reset_body_linvel.unsqueeze(1).repeat(
-            1, self.obs_linvel_history_frames, 1
-        )
 
         # Reset hover time counter
         self.hover_time_counter[env_ids] = 0.0
@@ -3145,16 +2678,14 @@ class NavigationTaskGmmNoise(BaseTask):
         # Reset arrival tracker
         self.has_arrived[env_ids] = False
         
-        # ==== Unified Cost Function Initialization ====
-        # 1. Resample noise env parameters
-        self._resample_noise_sources(env_ids)
-        # 1.1 Resample per-episode main wind (Layer 1)
+        # ==== Wind field initialization ====
+        # 1. Resample per-episode main wind (Layer 1)
         self._resample_main_wind(env_ids)
         if self.dryden_enabled:
-            # 1.15 Dryden mode: sample per-env (sigma, tau), state starts from zero.
+            # 2. Dryden mode: sample per-env (sigma, tau), state starts from zero.
             self._resample_dryden_parameters(env_ids)
         else:
-            # 1.15 Legacy local-gust mode.
+            # 2. Local-gust mode.
             self._resample_local_wind_speed(env_ids)
             local_horizontal_only = bool(
                 getattr(self.gmm_force_config, "local_wind_horizontal_only", True)
@@ -3164,16 +2695,15 @@ class NavigationTaskGmmNoise(BaseTask):
             )
             self.gmm_force_direction[env_ids] = local_dirs
             self.gmm_target_direction[env_ids] = local_dirs
+
+        self._compute_base_observation()
+        reset_base_obs = self.base_task_observations[env_ids]
+        self.obs_frame_buffer[env_ids] = reset_base_obs.unsqueeze(1).repeat(
+            1, self.obs_frame_stack, 1
+        )
         
-        # 2. Estimate noise range for normalization (min/max)
-        if not hasattr(self, "estimated_n_min"): # Initialize buffers if missing (first run)
-            self.estimated_n_min = torch.zeros(self.sim_env.num_envs, device=self.device)
-            self.estimated_n_max = torch.ones(self.sim_env.num_envs, device=self.device)
-            self.previous_potential = torch.zeros(self.sim_env.num_envs, device=self.device)
-            
-            # Scheme B Buffers
-            self.J_best_in_goal = torch.full((self.sim_env.num_envs,), float('inf'), device=self.device)
-            self.J_ema = torch.zeros(self.sim_env.num_envs, device=self.device)
+        # Initialize logging/diagnostic buffers that are still used downstream.
+        if not hasattr(self, "hold_counter"):
             self.hold_counter = torch.zeros(self.sim_env.num_envs, device=self.device)
             self.max_hold_counter = torch.zeros(self.sim_env.num_envs, device=self.device)
             self.failure_log_path = os.path.join(self.task_config.log_dir if hasattr(self.task_config, "log_dir") else ".", "failure_log.txt")
@@ -3210,36 +2740,12 @@ class NavigationTaskGmmNoise(BaseTask):
             # It's usually created in create_sim -> allocate_buffers.
             pass
 
-        # Reset Scheme B buffers
-        self.J_best_in_goal[env_ids] = float('inf')
+        # Reset hold/logging buffers
         self.hold_counter[env_ids] = 0.0
         self.max_hold_counter[env_ids] = 0.0
         if hasattr(self, "hover_good_min"):
             self.hover_good_min[env_ids] = float("inf")
             self.hover_good_max[env_ids] = -float("inf")
-            
-        self._estimate_noise_range(env_ids)
-        
-        # 3. Compute initial potential J_0
-        initial_noise_level = self._compute_gmm_mixture(self.previous_position[env_ids], env_ids)
-        
-        # Normalize noise: n_hat = (n - min) / (max - min)
-        n_hat = (initial_noise_level - self.estimated_n_min[env_ids]) / (
-            self.estimated_n_max[env_ids] - self.estimated_n_min[env_ids] + 1e-6
-        )
-        n_hat = torch.clamp(n_hat, 0.0, 1.0)
-        
-        # Distance component
-        d = self.previous_distance[env_ids]
-        d0 = self.reward_params["potential_d0"]
-        w_d = self.reward_params["potential_w_d"]
-        w_n = self.reward_params["potential_w_n"]
-        
-        # J = w_d * (d/d0)^2 + w_n * n_hat
-        J_0 = w_d * (d / d0).pow(2) + w_n * n_hat
-        self.previous_potential[env_ids] = J_0
-        if hasattr(self, "J_ema"):
-            self.J_ema[env_ids] = J_0
         
         # Keep existing info snapshots (used by external evaluators) and only refresh base keys.
         if not isinstance(self.infos, dict):
@@ -3411,57 +2917,201 @@ class NavigationTaskGmmNoise(BaseTask):
         if self.task_config.vae_config.use_vae:
             self.image_latents[:] = self.vae_model.encode(image_obs)
 
-    def process_obs_for_task(self):
+    def _compute_drop_decision_features(
+        self,
+        target_relative_position,
+        body_linvel,
+        euler_angles,
+        body_angvel,
+    ):
+        gravity = float(getattr(self.drop_model_config, "child_gravity", 9.81))
+        gravity = max(gravity, 1e-6)
+        z = torch.clamp(self.obs_dict["robot_position"][:, 2], min=0.05)
+        predicted_fall_time = torch.sqrt(torch.clamp(2.0 * z / gravity, min=1e-6))
+        predicted_drop_error_xy = torch.norm(
+            target_relative_position[:, 0:2] - body_linvel[:, 0:2] * predicted_fall_time.unsqueeze(1),
+            dim=1,
+        )
+        attitude_deg = torch.rad2deg(
+            torch.sqrt(
+                torch.clamp(
+                    euler_angles[:, 0] * euler_angles[:, 0]
+                    + euler_angles[:, 1] * euler_angles[:, 1],
+                    min=0.0,
+                )
+            )
+        )
+        omega_xy = torch.norm(body_angvel[:, 0:2], dim=1)
+        return predicted_drop_error_xy, predicted_fall_time, attitude_deg, omega_xy
+
+    def _compute_release_confidence(self):
+        """Compute heuristic release confidence in [0, 1] for confidence-gated DROP."""
         target_relative_position = quat_rotate_inverse(
             self.obs_dict["robot_vehicle_orientation"],
             (self.target_position - self.obs_dict["robot_position"]),
         )
-        self.task_obs["observations"][:, 0:3] = target_relative_position
-
-        self.task_obs["observations"][:, 3:6] = self.obs_dict["robot_body_linvel"]
+        body_linvel = self.obs_dict["robot_body_linvel"]
+        body_angvel = self.obs_dict["robot_body_angvel"]
         euler_angles = ssa(self.obs_dict["robot_euler_angles"])
-        self.task_obs["observations"][:, 6] = euler_angles[:, 0]
-        self.task_obs["observations"][:, 7] = euler_angles[:, 1]
-        self.task_obs["observations"][:, 8:11] = self.obs_dict["robot_body_angvel"]
-        self.task_obs["observations"][:, 11] = self.obs_dict["robot_position"][:, 2]
-        self.task_obs["observations"][:, 12:15] = self.drop_obstacle_position
-        if self.use_wind_estimation_features:
-            dt = float(self.obs_dict["dt"]) if "dt" in self.obs_dict else 0.01
-            dt = max(dt, 1e-4)
-            body_linvel = self.obs_dict["robot_body_linvel"]
-            delta_v = (body_linvel - self.obs_prev_body_linvel) / dt
-            self.task_obs["observations"][
-                :, self.wind_aug_prev_cmd_start : self.wind_aug_prev_cmd_end
-            ] = self.obs_prev_cmd_body
-            self.task_obs["observations"][
-                :, self.wind_aug_delta_v_start : self.wind_aug_delta_v_end
-            ] = delta_v
-
-            if self.obs_linvel_history_frames > 1:
-                linvel_stack = torch.cat(
-                    (self.obs_body_linvel_history[:, 1:, :], body_linvel.unsqueeze(1)),
-                    dim=1,
-                )
-            else:
-                linvel_stack = body_linvel.unsqueeze(1)
-            linvel_stack_flat = linvel_stack.reshape(self.sim_env.num_envs, -1)
-            self.task_obs["observations"][
-                :, self.wind_aug_linvel_hist_start : self.wind_aug_linvel_hist_end
-            ] = linvel_stack_flat
-
-    def _update_obs_history_buffers(self):
-        if not self.use_wind_estimation_features:
-            return
-        self.obs_prev_cmd_body[:] = self.current_cmd_body_for_obs
-        self.obs_prev_body_linvel[:] = self.obs_dict["robot_body_linvel"]
-        self.obs_body_linvel_history[:] = torch.roll(
-            self.obs_body_linvel_history, shifts=-1, dims=1
+        predicted_drop_error_xy, _, attitude_deg, omega_xy = (
+            self._compute_drop_decision_features(
+                target_relative_position=target_relative_position,
+                body_linvel=body_linvel,
+                euler_angles=euler_angles,
+                body_angvel=body_angvel,
+            )
         )
-        self.obs_body_linvel_history[:, -1, :] = self.obs_dict["robot_body_linvel"]
+
+        self.pred_drop_error_history[:] = torch.roll(
+            self.pred_drop_error_history, shifts=-1, dims=1
+        )
+        self.pred_drop_error_history[:, -1] = predicted_drop_error_xy
+        predicted_error_std = torch.std(
+            self.pred_drop_error_history, dim=1, unbiased=False
+        )
+
+        error_scale = float(
+            max(getattr(self.drop_model_config, "confidence_error_scale", 3.0), 1e-6)
+        )
+        attitude_limit = float(
+            max(getattr(self.drop_model_config, "max_release_attitude_deg", 10.0), 1e-6)
+        )
+        omega_limit = float(
+            max(getattr(self.drop_model_config, "max_release_omega_xy", 0.3), 1e-6)
+        )
+        preferred_attitude_deg = float(
+            getattr(self.drop_model_config, "preferred_release_attitude_deg", 7.5)
+        )
+        preferred_attitude_band_deg = float(
+            max(getattr(self.drop_model_config, "preferred_release_attitude_band_deg", 2.5), 1e-6)
+        )
+        stability_scale = float(
+            max(getattr(self.drop_model_config, "confidence_stability_scale", 1.0), 1e-6)
+        )
+
+        c_error = torch.exp(-torch.square(predicted_drop_error_xy / error_scale))
+        c_attitude = torch.exp(
+            -torch.square((attitude_deg - preferred_attitude_deg) / preferred_attitude_band_deg)
+        )
+        c_attitude = torch.where(
+            attitude_deg <= attitude_limit,
+            c_attitude,
+            torch.zeros_like(c_attitude),
+        )
+        c_omega = torch.exp(-torch.square(omega_xy / omega_limit))
+        c_risk = c_attitude * c_omega
+        c_stability = torch.exp(-torch.square(predicted_error_std / stability_scale))
+        confidence = torch.clamp(c_error * c_risk * c_stability, 0.0, 1.0)
+
+        self.release_confidence[:] = confidence
+        self.release_confidence_error_component[:] = c_error
+        self.release_confidence_risk_component[:] = c_risk
+        self.release_confidence_stability_component[:] = c_stability
+        return confidence
+
+    def _compute_base_observation(self):
+        target_relative_position = quat_rotate_inverse(
+            self.obs_dict["robot_vehicle_orientation"],
+            (self.target_position - self.obs_dict["robot_position"]),
+        )
+        body_linvel = self.obs_dict["robot_body_linvel"]
+        body_angvel = self.obs_dict["robot_body_angvel"]
+        euler_angles = ssa(self.obs_dict["robot_euler_angles"])
+
+        self.base_task_observations[:, 0:3] = target_relative_position
+        self.base_task_observations[:, 3:6] = body_linvel
+        self.base_task_observations[:, 6] = euler_angles[:, 0]
+        self.base_task_observations[:, 7] = euler_angles[:, 1]
+        self.base_task_observations[:, 8] = euler_angles[:, 2]
+        self.base_task_observations[:, 9:12] = body_angvel
+        self.base_task_observations[:, 12] = self.obs_dict["robot_position"][:, 2]
+        return target_relative_position, body_linvel, body_angvel, euler_angles
+
+    def _compute_predicted_recoil_terms(self):
+        cfg = self.drop_impact_config
+        if cfg is None or not bool(getattr(cfg, "enable_impact", True)):
+            zeros = torch.zeros((self.sim_env.num_envs, 3), device=self.device, dtype=torch.float32)
+            return zeros, zeros
+
+        current_mass = self.obs_dict["robot_mass"].view(-1, 1).clamp_min(1e-6)
+        m_child_cfg = float(getattr(cfg, "child_mass", 1.0))
+        payload_mass = float(self._payload_mass_reference)
+        if payload_mass <= 1e-6:
+            payload_mass = m_child_cfg
+        payload_mass = max(payload_mass, 1e-6)
+        residual_mass = float(getattr(cfg, "dropped_payload_residual_mass", 1e-4))
+        payload_removed_mass = max(payload_mass - max(residual_mass, 0.0), 0.0)
+        dyn_mass = torch.clamp(current_mass - payload_removed_mass, min=1e-6)
+
+        eject_speed = float(getattr(cfg, "eject_speed", 0.5))
+        eject_dir_body = torch.tensor(
+            getattr(cfg, "eject_direction_body", [0.0, 0.0, -1.0]),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        if torch.norm(eject_dir_body) < 1e-6:
+            eject_dir_body = torch.tensor([0.0, 0.0, -1.0], device=self.device, dtype=torch.float32)
+        eject_dir_body = eject_dir_body / torch.norm(eject_dir_body)
+        v_eject_body = eject_speed * eject_dir_body.view(1, 3).expand(self.sim_env.num_envs, -1)
+
+        sim_dt = float(self.obs_dict["dt"]) if "dt" in self.obs_dict else 0.01
+        sim_dt = max(sim_dt, 1e-5)
+        num_substeps = max(self.physics_steps_per_env_step_mean, 1.0)
+        control_dt = max(sim_dt * num_substeps, 1e-5)
+        delta_v_target_body = -(payload_mass / dyn_mass) * v_eject_body
+        recoil_force_body = (dyn_mass / control_dt) * delta_v_target_body
+        recoil_force_world = quat_rotate(self.obs_dict["robot_orientation"], recoil_force_body)
+
+        if hasattr(self, "fixed_payload_offset_body"):
+            payload_offset_body = self.fixed_payload_offset_body.view(1, 3).expand(
+                self.sim_env.num_envs, -1
+            )
+        else:
+            payload_offset_body = torch.tensor(
+                getattr(cfg, "payload_offset_body", [0.0, 0.0, 0.0]),
+                device=self.device,
+                dtype=torch.float32,
+            ).view(1, 3).expand(self.sim_env.num_envs, -1)
+
+        if torch.norm(payload_offset_body[0]).item() > 1e-9:
+            r_body = payload_offset_body - self._robot_com_body
+            recoil_tau_body = torch.cross(r_body, recoil_force_body, dim=1)
+            recoil_tau_world = quat_rotate(self.obs_dict["robot_orientation"], recoil_tau_body)
+        else:
+            recoil_tau_world = torch.zeros_like(recoil_force_world)
+        return recoil_force_world, recoil_tau_world
+
+    def _compute_privileged_observation(self):
+        wind_world = self._compute_gmm_wind_vector(self.obs_dict["robot_position"])
+        robot_mass = self.obs_dict["robot_mass"].view(-1, 1)
+        robot_inertia = self.obs_dict["robot_inertia"]
+        inertia_diag = torch.stack(
+            [robot_inertia[:, 0, 0], robot_inertia[:, 1, 1], robot_inertia[:, 2, 2]], dim=1
+        )
+        recoil_force_world, recoil_tau_world = self._compute_predicted_recoil_terms()
+
+        self.privileged_observations[:, 0:3] = wind_world
+        self.privileged_observations[:, 3:4] = robot_mass
+        self.privileged_observations[:, 4:7] = inertia_diag
+        self.privileged_observations[:, 7:10] = recoil_force_world
+        self.privileged_observations[:, 10:13] = recoil_tau_world
+        return self.privileged_observations
+
+    def _refresh_stacked_observations(self):
+        self.obs_frame_buffer[:] = torch.roll(self.obs_frame_buffer, shifts=-1, dims=1)
+        self.obs_frame_buffer[:, -1, :] = self.base_task_observations
+        actor_obs = self.obs_frame_buffer.reshape(self.sim_env.num_envs, -1)
+        self.task_obs["observations"][:] = actor_obs
+        privileged_obs = self._compute_privileged_observation()
+        self.task_obs["states"][:, 0:self.actor_observation_space_dim] = actor_obs
+        self.task_obs["states"][:, self.actor_observation_space_dim :] = privileged_obs
+
+    def process_obs_for_task(self):
+        self._compute_base_observation()
+        self._refresh_stacked_observations()
 
     def get_return_tuple(self):
         self.process_obs_for_task()
-        self._update_obs_history_buffers()
         return (
             self.task_obs,
             self.rewards,
@@ -3493,7 +3143,6 @@ class NavigationTaskGmmNoise(BaseTask):
         self.step_drop_heading_error[:] = 0.0
         self.step_landing_error_xy[:] = 0.0
         self.step_release_to_target_xy[:] = 0.0
-        self.step_drop_hit_obstacle[:] = False
         self.step_drop_trace_norm_t[:] = 0.0
         self.step_drop_trace_error_xy[:] = 0.0
         self.step_drop_trace_pos_x[:] = 0.0
@@ -3517,20 +3166,75 @@ class NavigationTaskGmmNoise(BaseTask):
         requested_drop_mask = drop_switch > drop_threshold
         allow_multiple_drops = bool(getattr(self.drop_model_config, "allow_multiple_drops", False))
         if allow_multiple_drops:
-            drop_event_mask = requested_drop_mask
+            candidate_drop_mask = requested_drop_mask
         else:
-            drop_event_mask = requested_drop_mask & (~self.child_has_dropped)
+            candidate_drop_mask = requested_drop_mask & (~self.child_has_dropped)
+
+        euler_angles_for_gate = ssa(self.obs_dict["robot_euler_angles"])
+        attitude_deg_for_gate = torch.rad2deg(
+            torch.sqrt(
+                torch.clamp(
+                    euler_angles_for_gate[:, 0] * euler_angles_for_gate[:, 0]
+                    + euler_angles_for_gate[:, 1] * euler_angles_for_gate[:, 1],
+                    min=0.0,
+                )
+            )
+        )
+        omega_xy_for_gate = torch.norm(self.obs_dict["robot_body_angvel"][:, 0:2], dim=1)
+        attitude_limit = float(
+            max(getattr(self.drop_model_config, "max_release_attitude_deg", 10.0), 1e-6)
+        )
+        omega_limit = float(
+            max(getattr(self.drop_model_config, "max_release_omega_xy", 0.3), 1e-6)
+        )
+        hard_release_ready = (
+            (attitude_deg_for_gate <= attitude_limit) & (omega_xy_for_gate <= omega_limit)
+        )
+
+        confidence_gate_enabled = bool(
+            getattr(self.drop_model_config, "confidence_gate_enable", False)
+        )
+        self.confidence_gate_blocked_mask[:] = False
+        if confidence_gate_enabled:
+            confidence = self._compute_release_confidence()
+            confidence_threshold = float(
+                getattr(self.drop_model_config, "confidence_threshold", 0.45)
+            )
+            gate_ready = confidence > confidence_threshold
+            min_steps = int(getattr(self.drop_model_config, "confidence_min_steps", 0))
+            if min_steps > 0:
+                min_step_ready = self.sim_env.sim_steps >= min_steps
+            else:
+                min_step_ready = torch.ones_like(requested_drop_mask, dtype=torch.bool)
+            allowed_drop_mask = gate_ready & min_step_ready & hard_release_ready
+            drop_event_mask = candidate_drop_mask & allowed_drop_mask
+            self.confidence_gate_blocked_mask[:] = candidate_drop_mask & (~allowed_drop_mask)
+        else:
+            drop_event_mask = candidate_drop_mask & hard_release_ready
+            self.confidence_gate_blocked_mask[:] = candidate_drop_mask & (~hard_release_ready)
+        self.extras["confidence_gate_blocked_count"] = int(
+            self.confidence_gate_blocked_mask.sum().item()
+        )
+        self.extras["release_confidence_mean"] = (
+            float(self.release_confidence.mean().item()) if confidence_gate_enabled else 0.0
+        )
+        self.extras["release_confidence_min"] = (
+            float(self.release_confidence.min().item()) if confidence_gate_enabled else 0.0
+        )
+        self.extras["release_confidence_max"] = (
+            float(self.release_confidence.max().item()) if confidence_gate_enabled else 0.0
+        )
         self.child_drop_triggered[:] = drop_event_mask
 
         if bool(getattr(self.drop_model_config, "enable_drop_model", True)) and drop_event_mask.any():
             dropped_env_ids = drop_event_mask.nonzero(as_tuple=False).squeeze(-1)
-            child_release_pos = self.obs_dict["robot_position"][dropped_env_ids].clone()
-            child_release_vel = self.obs_dict["robot_linvel"][dropped_env_ids].clone()
             add_child_eject_velocity = bool(
                 getattr(self.drop_impact_config, "add_child_eject_velocity", True)
             )
-            if add_child_eject_velocity:
-                child_release_vel += self._compute_eject_velocity_world(dropped_env_ids)
+            child_release_pos, child_release_vel = self._compute_child_release_kinematics(
+                dropped_env_ids,
+                include_eject_velocity=add_child_eject_velocity,
+            )
             release_to_target_xy = self._compute_release_to_target_xy_local(
                 dropped_env_ids, child_release_pos
             )
@@ -3556,7 +3260,6 @@ class NavigationTaskGmmNoise(BaseTask):
         self.actions = mother_actions
 
         transformed_action = self.action_transformation_function(mother_actions)
-        self.current_cmd_body_for_obs[:, 0:4] = transformed_action[:, 0:4]
         logger.debug(f"raw_action: {mother_actions[0]}, transformed action: {transformed_action[0]}")
         self.sim_env.step(actions=transformed_action)
 
@@ -3615,20 +3318,29 @@ class NavigationTaskGmmNoise(BaseTask):
             improvement_reward,
             direction_reward,
             noise_reduction_reward,
-            noise_intensity,
             safety_reward,
             action_smoothness_penalty,
             hover_reward,
             threshold_reward,
             anchor_reward,
         ) = self._compute_reward_and_scores()
-        if dropped_env_ids is not None:
-            self.extras["drop_hit_obstacle_count"] = int(
-                self.step_drop_hit_obstacle[dropped_env_ids].sum().item()
+        confidence_gate_penalty = float(
+            getattr(
+                self.drop_reward_config,
+                "blocked_drop_penalty",
+                getattr(self.drop_model_config, "confidence_gate_penalty", 0.0),
+            )
+        )
+        if confidence_gate_penalty > 0.0 and self.confidence_gate_blocked_mask.any():
+            self.rewards[self.confidence_gate_blocked_mask] = (
+                self.rewards[self.confidence_gate_blocked_mask] - confidence_gate_penalty
+            )
+            self.extras["confidence_gate_penalty_mean"] = float(
+                confidence_gate_penalty
+                * self.confidence_gate_blocked_mask.float().mean().item()
             )
         else:
-            self.extras["drop_hit_obstacle_count"] = 0
-
+            self.extras["confidence_gate_penalty_mean"] = 0.0
         if self.task_config.return_state_before_reset is True:
             return_tuple = self.get_return_tuple()
 
@@ -3666,6 +3378,9 @@ class NavigationTaskGmmNoise(BaseTask):
         reasonable_no_drop_threshold = float(
             getattr(self.drop_reward_config, "reasonable_no_drop_pred_error_threshold", 5.0)
         )
+        no_drop_eval_max_xy_dist = float(
+            getattr(self.drop_reward_config, "no_drop_eval_max_xy_dist", 10.0)
+        )
         if crash_no_drop_penalty > 0.0 and no_drop_crash_mask.any():
             self.rewards[no_drop_crash_mask] = (
                 self.rewards[no_drop_crash_mask] - crash_no_drop_penalty
@@ -3676,20 +3391,26 @@ class NavigationTaskGmmNoise(BaseTask):
         no_drop_pred_error_mean = 0.0
         if no_drop_timeout_mask.any():
             timeout_env_ids = no_drop_timeout_mask.nonzero(as_tuple=False).squeeze(-1)
-            pred_pos = self.obs_dict["robot_position"][timeout_env_ids].clone()
-            pred_vel = self.obs_dict["robot_linvel"][timeout_env_ids].clone()
             add_child_eject_velocity = bool(
                 getattr(self.drop_impact_config, "add_child_eject_velocity", True)
             )
-            if add_child_eject_velocity:
-                pred_vel += self._compute_eject_velocity_world(timeout_env_ids)
+            pred_pos, pred_vel = self._compute_child_release_kinematics(
+                timeout_env_ids,
+                include_eject_velocity=add_child_eject_velocity,
+            )
             _, pred_error_xy = self._predict_child_landing_xy(
                 timeout_env_ids,
                 init_pos=pred_pos,
                 init_vel=pred_vel,
             )
-            reasonable_mask = pred_error_xy > reasonable_no_drop_threshold
-            missed_mask = ~reasonable_mask
+            timeout_dist_xy = torch.norm(
+                self.target_position[timeout_env_ids, 0:2]
+                - self.obs_dict["robot_position"][timeout_env_ids, 0:2],
+                dim=1,
+            )
+            far_mask = timeout_dist_xy > no_drop_eval_max_xy_dist
+            reasonable_mask = (pred_error_xy > reasonable_no_drop_threshold) & (~far_mask)
+            missed_mask = (~reasonable_mask)
             reasonable_env_ids = timeout_env_ids[reasonable_mask]
             missed_env_ids = timeout_env_ids[missed_mask]
 
@@ -3712,43 +3433,16 @@ class NavigationTaskGmmNoise(BaseTask):
         self.extras["no_drop_pred_landing_error_xy_mean"] = no_drop_pred_error_mean
         self.window_no_drop_done_count += step_no_drop_done_count
 
-        # Scheme B: Dynamic Stability & Terminal Reward
-        # 1. Update Best Potential in Goal
         position = self.obs_dict["robot_position"]
         dist_to_target = torch.norm(self.target_position - position, dim=1)
         in_goal_mask = dist_to_target <= self.success_config.success_radius
-        
-        # Update Arrival Tracker (Metric: "Have I ever been there?")
         self.has_arrived = self.has_arrived | in_goal_mask
-        
-        # J_t is stored in self.previous_potential (updated in _compute_reward_and_scores)
-        J_t = self.previous_potential
-        if not hasattr(self, "J_ema"):
-            self.J_ema = J_t.clone()
-        ema_alpha = getattr(self.success_config, "stability_potential_ema_alpha", 0.9)
-        self.J_ema = ema_alpha * self.J_ema + (1.0 - ema_alpha) * J_t
-        J_for_success = self.J_ema
-        
-        # Update J_best_in_goal where in_goal_mask is True
-        current_best = self.J_best_in_goal
-        new_best = torch.min(current_best, J_for_success)
-        self.J_best_in_goal = torch.where(in_goal_mask, new_best, current_best)
-        
-        # 2. Check Stability Conditions
-        # Cond 1: Position (d <= 2.0m) -> already in_goal_mask
-        
-        # Cond 2: Velocity (v <= v_hold)
+
         linvel = self.obs_dict["robot_linvel"]
         linvel_magnitude = torch.norm(linvel, dim=1)
         cond_vel = linvel_magnitude <= self.success_config.stability_velocity_threshold
-        
-        # Cond 3: Potential Quality (J_t <= J_best + delta)
-        cond_pot = J_for_success <= (self.J_best_in_goal + self.success_config.stability_potential_delta)
-        
-        # Stable?
-        is_stable = in_goal_mask & cond_vel & cond_pot
-        
-        # 3. Update Hold Counter
+        is_stable = in_goal_mask & cond_vel
+
         self.hold_counter = torch.where(
             is_stable,
             self.hold_counter + 1.0,
@@ -3792,43 +3486,21 @@ class NavigationTaskGmmNoise(BaseTask):
                 self.window_done_speed_sum += float(end_speeds[non_crash_mask].sum().item())
                 self.window_done_non_crash += int(non_crash_mask.sum().item())
 
-            # --- Capture Final J and Arrival Status ---
-            # Reuse already-computed J values (avoid dimension mismatch)
+            # --- Capture final arrival status only ---
             try:
-                final_J = self.current_J[done_indices]
-                final_J_vals = final_J.detach().cpu().numpy()
-                self.final_J_buffer.extend(final_J_vals)
-                
-                # Calculate distance for arrival check
                 d_pos = self.obs_dict["robot_position"][done_indices]
                 dist_to_tgt = torch.norm(self.target_position[done_indices] - d_pos, dim=1)
-                
-                # Check if distance <= 2.0 (3D Euclidean distance)
                 arrival_threshold = 2.0
                 final_arrived = (dist_to_tgt <= arrival_threshold)
                 final_arrived_vals = final_arrived.detach().cpu().numpy()
-                
-                # --- Apply Terminal Reward (NEW) ⭐ ---
-                # Retrieve terminal reward config (default to 0.0 if not set yet)
                 term_reward_val = self.reward_params.get("terminal_reward", 0.0)
-                
                 if term_reward_val > 0.0:
-                    # Create bonus tensor: +term_reward where arrived, 0 otherwise
-                    # CAUTION: 'rewards' tensor is (num_envs,), so we update specific indices
                     arrival_bonus = final_arrived.float() * term_reward_val
                     self.rewards[done_indices] += arrival_bonus
-                
-                # Legacy buffer for compatibility
                 self.final_arrival_buffer.extend(final_arrived_vals.astype(float))
-                
-                # New sliding window buffer for recent arrival rate
                 self.recent_arrival_buffer.extend(final_arrived_vals)
-                
-
-                
             except Exception as e:
-                # Log error for debugging
-                logger.error(f"Failed to compute final J and arrival stats: {e}")
+                logger.error(f"Failed to compute final arrival stats: {e}")
                 import traceback
                 traceback.print_exc()
 
@@ -3890,7 +3562,6 @@ class NavigationTaskGmmNoise(BaseTask):
         self.infos["drop_delta_theta_snapshot"] = self.step_drop_delta_theta.clone()
         self.infos["drop_delta_v_snapshot"] = self.step_drop_delta_v.clone()
         self.infos["drop_delta_omega_snapshot"] = self.step_drop_delta_omega.clone()
-        self.infos["drop_hit_obstacle_snapshot"] = self.step_drop_hit_obstacle.clone()
         self.infos["impulse_metric_snapshot"] = self.step_impulse_metric.clone()
         self.infos["landing_error_xy_snapshot"] = self.step_landing_error_xy.clone()
         self.infos["release_to_target_xy_snapshot"] = self.step_release_to_target_xy.clone()
@@ -3930,7 +3601,7 @@ class NavigationTaskGmmNoise(BaseTask):
             self._early_crash_retries[non_crash_envs] = 0
 
         # Simplified logging (no more total_score from old system)
-        self._populate_extras(improvement_reward, direction_reward, noise_reduction_reward, noise_intensity)
+        self._populate_extras(improvement_reward, direction_reward, noise_reduction_reward)
         if self.log_step_scores and not self._episode_log_written:
             env_id = min(self.log_step_env_id, self.truncations.shape[0] - 1)
             done = (self.terminations[env_id] > 0) | (self.truncations[env_id] > 0)

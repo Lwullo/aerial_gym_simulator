@@ -1,0 +1,152 @@
+{
+  "timestamp": "2026-04-02T16:10:35",
+  "experiment_name": "ppo_mlp_drop",
+  "reward_parameters": {
+    "potential_kj": 1.0,
+    "potential_sj": 0.10000000149011612,
+    "potential_w_d": 0.10000000149011612,
+    "potential_w_n": 1.0,
+    "potential_d0": 3.0,
+    "n_min_max_sample_size": 1000.0,
+    "direction_alignment_reward_magnitude": 0.10000000149011612,
+    "action_magnitude_penalty_weight": 0.05000000074505806,
+    "action_change_penalty_weight": 0.10000000149011612
+  },
+  "drop_reward_config_weights": {
+    "altitude_low_penalty_weight": 1.0,
+    "attitude_reward_weight": 0.5,
+    "attitude_total_ema_alpha": 0.9,
+    "direction_reward_weight": 0.65,
+    "drop_angle_reward_weight": 0.5,
+    "impulse_alpha": 1.0,
+    "impulse_beta": 0.8,
+    "impulse_penalty_weight": 0.5,
+    "landing_error_ema_alpha": 0.9,
+    "no_drop_penalty": 20.0,
+    "outside_region_penalty": 20.0,
+    "piecewise_thresholds": [
+      0.2,
+      0.4,
+      0.8,
+      1.2,
+      2.2,
+      4.0,
+      6.2,
+      12.2
+    ],
+    "score_d0": 3.6,
+    "score_max": 20.0,
+    "score_p": 1.0,
+    "score_reward_weight": 1.0,
+    "time_penalty": 0.0
+  },
+  "drop_reward_config_full": {
+    "altitude_low_penalty_weight": 1.0,
+    "altitude_target_z": 10.0,
+    "altitude_tolerance": 0.5,
+    "attitude_reward_weight": 0.5,
+    "attitude_theta0": 0.12,
+    "attitude_total_ema_alpha": 0.9,
+    "direction_min_speed": 0.05,
+    "direction_min_target_dist": 0.1,
+    "direction_reward_weight": 0.65,
+    "drop_angle_min_speed": 0.05,
+    "drop_angle_reward_weight": 0.5,
+    "drop_angle_theta0": 0.35,
+    "drop_obstacle_absent_obs_value": -1000.0,
+    "drop_obstacle_asset_file": "drop_box_0p2_0p2_0p4.urdf",
+    "drop_obstacle_center_radius_max": 2.0,
+    "drop_obstacle_center_radius_min": 1.0,
+    "drop_obstacle_enable": true,
+    "drop_obstacle_height": 0.4,
+    "drop_obstacle_radius_max": 0.1,
+    "drop_obstacle_radius_min": 0.1,
+    "drop_obstacle_spawn_prob": 0.5,
+    "impulse_alpha": 1.0,
+    "impulse_beta": 0.8,
+    "impulse_penalty_weight": 0.5,
+    "landing_error_ema_alpha": 0.9,
+    "no_drop_penalty": 20.0,
+    "outside_region_penalty": 20.0,
+    "piecewise_r": 2.0,
+    "piecewise_thresholds": [
+      0.2,
+      0.4,
+      0.8,
+      1.2,
+      2.2,
+      4.0,
+      6.2,
+      12.2
+    ],
+    "score_d0": 3.6,
+    "score_max": 20.0,
+    "score_p": 1.0,
+    "score_reward_weight": 1.0,
+    "time_penalty": 0.0
+  },
+  "drop_model_config": {
+    "allow_multiple_drops": false,
+    "child_drag_coefficient": 1.0,
+    "child_gravity": 9.81,
+    "child_mass": 1.0,
+    "child_wind_scale": 1.0,
+    "drop_threshold": 0.7,
+    "enable_drop_model": true,
+    "max_child_sim_steps": 5000
+  },
+  "drop_impact_config": {
+    "add_child_eject_velocity": true,
+    "angular_sigma_base": 0.1,
+    "angular_sigma_scale": 0.2,
+    "child_mass": 1.0,
+    "eject_direction_body": [
+      0.0,
+      0.0,
+      -1.0
+    ],
+    "eject_speed": 0.5,
+    "enable_impact": true,
+    "enable_random_angular_kick": false,
+    "fixed_payload_mount_index": 0,
+    "max_delta_omega": 0.5,
+    "mother_mass": 11.04,
+    "payload_mount_points_body": [
+      [
+        0.0919,
+        0.0919,
+        -0.13
+      ],
+      [
+        0.0919,
+        -0.0919,
+        -0.13
+      ],
+      [
+        -0.0919,
+        -0.0919,
+        -0.13
+      ],
+      [
+        -0.0919,
+        0.0919,
+        -0.13
+      ]
+    ],
+    "payload_offset_body": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "random_fixed_payload_mount": false,
+    "use_force_recoil": true
+  },
+  "success_config": {
+    "min_success_steps": 15,
+    "stability_potential_delta": 0.15,
+    "stability_potential_ema_alpha": 0.9,
+    "stability_velocity_threshold": 0.35,
+    "success_radius": 3.0,
+    "success_reward": 50.0
+  }
+}

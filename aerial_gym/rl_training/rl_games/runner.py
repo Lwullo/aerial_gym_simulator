@@ -231,9 +231,18 @@ class ExtractObsWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
 
+    @staticmethod
+    def _extract_obs_dict(observations):
+        actor_obs = observations["observations"]
+        critic_obs = observations.get("states", actor_obs)
+        return {
+            "obs": actor_obs,
+            "states": critic_obs,
+        }
+
     def reset(self, **kwargs):
         observations, *_ = super().reset(**kwargs)
-        return observations["observations"]
+        return self._extract_obs_dict(observations)
 
     def step(self, action):
         observations, rewards, terminated, truncated, infos = super().step(action)
@@ -245,7 +254,7 @@ class ExtractObsWrapper(gym.Wrapper):
         )
 
         return (
-            observations["observations"],
+            self._extract_obs_dict(observations),
             rewards,
             dones,
             infos,
@@ -260,6 +269,11 @@ class AERIALRLGPUEnv(vecenv.IVecEnv):
     def __init__(self, config_name, num_actors, **kwargs):
         self.env = env_configurations.configurations[config_name]["env_creator"](**kwargs)
         self.env = ExtractObsWrapper(self.env)
+        self.use_central_value = bool(getattr(self.env, "use_central_value", False))
+        self.state_space = spaces.Box(
+            np.ones(self.env.task_config.critic_observation_space_dim) * -np.Inf,
+            np.ones(self.env.task_config.critic_observation_space_dim) * np.Inf,
+        )
 
     def step(self, actions):
         return self.env.step(actions)
@@ -283,6 +297,8 @@ class AERIALRLGPUEnv(vecenv.IVecEnv):
             np.ones(self.env.task_config.observation_space_dim) * -np.Inf,
             np.ones(self.env.task_config.observation_space_dim) * np.Inf,
         )
+        info["state_space"] = self.state_space
+        info["use_global_observations"] = self.use_central_value
         print(info["action_space"], info["observation_space"])
         return info
 

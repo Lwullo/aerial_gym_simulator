@@ -7,8 +7,8 @@ from aerial_gym import AERIAL_GYM_DIRECTORY
 def apply_preset_overrides():
     preset_id_str = os.environ.get("AERIAL_GYM_PRESET_ID", "-1")
     try:
-        preset_id = -1
-    except:
+        preset_id = int(preset_id_str)
+    except (TypeError, ValueError):
         preset_id = -1
         
     if preset_id < 0:
@@ -20,7 +20,7 @@ def apply_preset_overrides():
     )
     
     # Preset 0: Panels
-    if preset_id == -1:
+    if preset_id == 0:
         panel_asset_params.num_assets = 6
         panel_asset_params.file = "panel.urdf"
         object_asset_params.num_assets = 0
@@ -37,12 +37,16 @@ def apply_preset_overrides():
         panel_asset_params.num_assets = 0
         object_asset_params.num_assets = 15
         object_asset_params.file = "small_cube.urdf"
+    else:
+        raise ValueError(
+            f"Unsupported AERIAL_GYM_PRESET_ID={preset_id}. Expected one of: 0, 1, 2."
+        )
 
 apply_preset_overrides()
 
 
 def disable_non_wall_assets():
-    """Disable non-wall assets except one instantiated drop-obstacle cylinder."""
+    """Disable non-wall assets for this navigation task."""
     from aerial_gym.config.asset_config.env_object_config import (
         panel_asset_params,
         thin_asset_params,
@@ -54,15 +58,13 @@ def disable_non_wall_assets():
     panel_asset_params.num_assets = 0
     thin_asset_params.num_assets = 0
     tree_asset_params.num_assets = 0
-    # Keep exactly one physical object actor so DROP obstacle can be instantiated in sim.
-    object_asset_params.num_assets = 1
-    object_asset_params.file = "drop_box_0p2_0p2_0p4.urdf"
+    object_asset_params.num_assets = 0
     tile_asset_params.num_assets = 0
 
     panel_asset_params.keep_in_env = False
     thin_asset_params.keep_in_env = False
     tree_asset_params.keep_in_env = False
-    object_asset_params.keep_in_env = True
+    object_asset_params.keep_in_env = False
     tile_asset_params.keep_in_env = False
 
 
@@ -80,7 +82,7 @@ def _read_env_int(name, default):
 
 
 class task_config:
-    seed = -1
+    seed = 42
     sim_name = "base_sim"
     env_name = "env_with_obstacles"
     # robot_name = "base_quadrotor"
@@ -92,15 +94,13 @@ class task_config:
     use_warp = True
     headless = True
     device = "cuda:0"
-    observation_space_dim = 12
-    privileged_observation_space_dim = 0
+    base_observation_dim = 13
+    frame_stack = 6
+    observation_space_dim = 78
+    privileged_observation_space_dim = 13
+    critic_observation_space_dim = 91
+    use_central_value = True
     action_space_dim = 5  # [vx_cmd, vy_cmd, vz_cmd, yawrate_cmd, drop_switch]
-    # Optional observation augmentation for wind-estimation without privileged wind inputs.
-    # When enabled, task builds:
-    # obs_dim = 12 base dims + 4 prev command + 3 delta_v + 3 * obs_linvel_history_frames.
-    # Default with 4-frame linear-velocity stack: 12 + 4 + 3 + 12 = 31 dims.
-    use_wind_estimation_features = False
-    obs_linvel_history_frames = 4
     episode_len_steps = 1000  # real physics time for simulation is this value multiplied by sim.dt
 
     return_state_before_reset = (
@@ -159,14 +159,6 @@ class task_config:
     target_max_ratio = [0.8, 0.8, 0.7]  # Z updated to 7.0m (0.7)
 
     reward_parameters = {
-        # Unified Cost Function Reward (J_prev - J_t) with Tanh Smoothing ⭐
-        "potential_kj": 1.0,
-        "potential_sj": 0.1,               # Sensitivity scale (s_J)
-        "potential_w_d": 0.1,              # Weight for distance cost (w_d)
-        "potential_w_n": 1.0,              # Weight for noise cost (w_n)
-        "potential_d0": 3.0,               # Reference distance (d0) for normalization
-        "n_min_max_sample_size": 1000,     # Number of samples to estimate noise range on reset
-        
         # Direction alignment reward ⭐
         "direction_alignment_reward_magnitude": 0.1,
         
@@ -187,28 +179,18 @@ class task_config:
         interpolation_mode = "nearest"
         return_sampled_latent = True
 
-    class noise_config:
-        enable_noise = False
-        num_sources = 0  # Disable spatial GMM sources (keep main wind + time-varying gust)
-        sigma_min = [5.0, 5.0, 2.5]
-        sigma_max = [15.0, 15.0, 7.5]
-        weight_min = 0.1
-        weight_max = 1.0
-        noise_scale = 1.0
-        resample_on_reset = True
-
     class gmm_force_config:
         """Two-layer wind field:
         w_total = w_main + w_local
         - w_main: per-env constant over an episode
-        - w_local: small GMM disturbance
+        - w_local: time-varying local gust
         """
         enable_physical_force = True
         # Layer 1: main wind (sampled per environment at reset, fixed within episode)
         main_wind_speed_min = 1.0  # m/s
         main_wind_speed_max = 3.0  # m/s
         main_wind_horizontal_only = False  # allow 3D wind direction (z component enabled)
-        # Layer 2: local GMM disturbance
+        # Layer 2: local gust disturbance
         force_update_steps = 5  # update local disturbance direction every N steps
         local_wind_max_speed_min = 0.2  # m/s, per-env sampled lower bound of |w_local|
         local_wind_max_speed_max = 0.3  # m/s, per-env sampled upper bound of |w_local|
@@ -217,7 +199,6 @@ class task_config:
         # Legacy alias kept for backward compatibility (fallback only).
         max_wind_speed = 4.0
         drag_coefficient = 4.0  # N/(m/s), c_drag in F_drag = c_drag * (v_w - v_uav)
-        normalize_intensity = True  # Normalize GMM intensity to [0, 1]
         # Legacy parameters kept for compatibility with older debug scripts.
         disturbance_coefficient = 0.05
         drone_mass = 12.04
@@ -243,6 +224,20 @@ class task_config:
         enable_drop_model = True
         drop_threshold = 0.7  # drop_switch > threshold triggers drop
         allow_multiple_drops = False
+        # Optional confidence-gated release:
+        # If enabled, a requested DROP is executed only when the heuristic
+        # release confidence is above confidence_threshold.
+        confidence_gate_enable = False
+        confidence_threshold = 0.45
+        confidence_error_scale = 2.0
+        confidence_stability_scale = 1.0
+        max_release_attitude_deg = 45.0
+        max_release_omega_xy = 0.3
+        preferred_release_attitude_deg = 7.5
+        preferred_release_attitude_band_deg = 2.5
+        confidence_history_len = 5
+        confidence_min_steps = 3
+        confidence_gate_penalty = 0.0
         child_gravity = 9.81
         # Child free-fall wind model:
         # a = g + (c_child / m_child) * (v_w - v_child)
@@ -282,8 +277,6 @@ class task_config:
         max_delta_omega = 0.5  # rad/s clamp for one drop event
 
     class drop_reward_config:
-        # WAIT step reward
-        time_penalty = 0.0
         # Mother altitude soft constraint:
         # Penalize only when z < (altitude_target_z - altitude_tolerance).
         # penalty = -altitude_low_penalty_weight * ((altitude_target_z - altitude_tolerance) - z)
@@ -294,42 +287,39 @@ class task_config:
         # R_dir = direction_reward_weight * (d_prev_xy - d_curr_xy)
         # Positive when moving closer to target, negative when moving away.
         # Active only when child has not dropped yet.
-        direction_reward_weight = 0.75
-        direction_min_speed = 0.05
-        direction_min_target_dist = 0.1
+        direction_reward_weight = 0.4
+        # Predicted-release-error shaping before DROP:
+        # reward the improvement of "if released now" landing error instead of
+        # penalizing the absolute error every step.
+        pred_error_shaping_weight = 0.5
+        pred_error_improvement_clip = 1.0
         # DROP accuracy reward (continuous):
         # R_score = score_reward_weight * score_max * exp(- (landing_error_xy / score_d0)^score_p)
         score_max = 20.0
-        score_d0 = 2.0
+        score_d0 = 4.0
         score_p = 2.0
+        # Performance-driven score_d0 curriculum:
+        # start wider for easier early learning, then tighten once the policy
+        # can reliably release and reduce the landing error.
+        score_d0_curriculum_enable = True
+        score_d0_curriculum_values = [4.0, 3.0, 2.5, 2.0, 1.5]
+        score_d0_curriculum_min_drop_rate = [0.15, 0.35, 0.55, 0.65]
+        score_d0_curriculum_max_error_ema = [8.0, 5.0, 3.0, 1.2]
         # Keep outer region threshold for hard override penalty (outside -> -outside_region_penalty).
         piecewise_r = 1.0
         piecewise_thresholds = [0.2, 0.4, 0.8, 1.2, 2.2, 4.0, 6.2, 8.0]
         # If landing_error_xy is outside the outermost scored region (d > max threshold),
-        # the DROP reward is overridden to -outside_region_penalty.
+        # use linear penalty beyond the threshold and clamp to this minimum.
         outside_region_penalty = 20.0
+        blocked_drop_penalty = 2.0
         # Risk-aware no-DROP terminal reward:
         # crash+no_drop is still bad; timeout+no_drop is acceptable when the predicted
         # landing error is already too large for a reasonable release.
-        no_drop_penalty = 0.0
         crash_no_drop_penalty = 20.0
         missed_drop_no_drop_penalty = 8.0
-        reasonable_no_drop_reward = 2.0
+        reasonable_no_drop_reward = 0.0
         reasonable_no_drop_pred_error_threshold = 5.0
-        # Optional single obstacle around target for drop-risk training:
-        # - each env samples whether obstacle exists with drop_obstacle_spawn_prob
-        # - if exists, center is sampled in annulus [center_radius_min, center_radius_max]
-        #   around target in XY
-        # - obstacle is represented by a ground disk for hit check
-        drop_obstacle_enable = True
-        drop_obstacle_spawn_prob = 0.5
-        drop_obstacle_center_radius_min = 1.0
-        drop_obstacle_center_radius_max = 2.0
-        drop_obstacle_radius_min = 0.1
-        drop_obstacle_radius_max = 0.1
-        drop_obstacle_height = 0.4
-        drop_obstacle_asset_file = "drop_box_0p2_0p2_0p4.urdf"
-        drop_obstacle_absent_obs_value = -1e3
+        no_drop_eval_max_xy_dist = 10.0
         # Unified score weight for continuous score:
         # R_score = score_reward_weight * score_max * exp(-(d_xy/score_d0)^score_p)
         score_reward_weight = 1.0
@@ -341,22 +331,9 @@ class task_config:
         landing_error_ema_alpha = 0.9
         # EMA for drop-only attitude-total diagnostics (deg)
         attitude_total_ema_alpha = 0.9
-        # Drop-attitude reward (only on DROP step):
-        # R_att now contains two terms evaluated at DROP pre-impact instant:
-        # 1) posture term: w_posture * exp(-(theta_drop / attitude_theta0)^2)
-        #    where theta_drop = sqrt(roll_drop^2 + pitch_drop^2)
-        # 2) angle term:   w_angle * exp(-(phi_drop / drop_angle_theta0)^2)
-        #    where phi_drop is the XY angle between mother velocity direction
-        #    and target direction at release.
-        attitude_theta0 = 0.12
-        attitude_reward_weight = 0.5
-        drop_angle_theta0 = 0.35
-        drop_angle_reward_weight = 0.8
-        drop_angle_min_speed = 0.05
         
     # Score config removed - formulas integrated into reward function
     # Distance reward uses s_dist formula: 1 - dist/d_max
-    # Noise reward uses gradient: max(0, noise_prev - noise_curr)
     # Obstacle safety (s_obs) removed per user request
 
     class adaptive_grid_config:
@@ -392,9 +369,8 @@ class task_config:
         safe_spawn_margin = 1.0      # 与障碍物的安全边距（米）
         fallback_to_center = True    # 超过重试次数后移到中心
 
-    # Fixed presets removed - target and noise now randomly generated
+    # Fixed presets removed - target is randomized at reset
     # Target position: random within target_min/max_ratio
-    # Noise sources: random GMM parameters within configured ranges
 
     class curriculum:
         min_level = 15

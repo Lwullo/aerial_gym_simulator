@@ -1,8 +1,8 @@
 """
 Paper-style comparative evaluation for DROP task:
-1) PPO(baseline) policy (loaded from checkpoint)
-2) PPO-GRU policy (loaded from checkpoint)
-3) PPO-RNN policy (optional checkpoint)
+1) PPO policy (loaded from checkpoint)
+2) Proposed policy: MLP+GRU (loaded from checkpoint)
+3) PPO-GRU baseline: GRU-only (optional checkpoint)
 4) MPC controller
 
 Outputs:
@@ -72,6 +72,10 @@ DEFAULT_RNN_CHECKPOINT = ""
 DEFAULT_OUTPUT_ROOT = (
     "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/result"
 )
+BASE_TASK_OBS_DIM = 15
+BASE_TASK_OBS_WITH_DROP_DECISION_DIM = 18
+AUG_TASK_OBS_DIM = 34
+AUG_TASK_OBS_WITH_DROP_DECISION_DIM = 37
 CASE_SEED_STRIDE = 10007
 
 
@@ -145,18 +149,19 @@ class PPOActorGRU(nn.Module):
         obs_dim: int,
         act_dim: int,
         rnn_hidden_size: int = 64,
+        mlp_units: Optional[List[int]] = None,
         use_layer_norm: bool = True,
     ):
         super().__init__()
-        self.actor_mlp = nn.Sequential(
-            nn.Linear(obs_dim, 256),
-            nn.ELU(),
-            nn.Linear(256, 128),
-            nn.ELU(),
-            nn.Linear(128, 64),
-            nn.ELU(),
-        )
-        self.rnn = RNNBlock(input_size=64, hidden_size=rnn_hidden_size)
+        mlp_units = mlp_units or [256, 128, 64]
+        layers: List[nn.Module] = []
+        in_dim = obs_dim
+        for out_dim in mlp_units:
+            layers.append(nn.Linear(in_dim, out_dim))
+            layers.append(nn.ELU())
+            in_dim = out_dim
+        self.actor_mlp = nn.Sequential(*layers)
+        self.rnn = RNNBlock(input_size=in_dim, hidden_size=rnn_hidden_size)
         self.layer_norm = nn.LayerNorm(rnn_hidden_size) if use_layer_norm else nn.Identity()
         self.mu = nn.Linear(rnn_hidden_size, act_dim)
 
@@ -193,17 +198,17 @@ class PPOActorRNNOnly(nn.Module):
 
 
 class PPOActorMLP(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int):
+    def __init__(self, obs_dim: int, act_dim: int, mlp_units: Optional[List[int]] = None):
         super().__init__()
-        self.actor_mlp = nn.Sequential(
-            nn.Linear(obs_dim, 256),
-            nn.ELU(),
-            nn.Linear(256, 128),
-            nn.ELU(),
-            nn.Linear(128, 64),
-            nn.ELU(),
-        )
-        self.mu = nn.Linear(64, act_dim)
+        mlp_units = mlp_units or [256, 128, 64]
+        layers: List[nn.Module] = []
+        in_dim = obs_dim
+        for out_dim in mlp_units:
+            layers.append(nn.Linear(in_dim, out_dim))
+            layers.append(nn.ELU())
+            in_dim = out_dim
+        self.actor_mlp = nn.Sequential(*layers)
+        self.mu = nn.Linear(in_dim, act_dim)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return self.mu(self.actor_mlp(obs))
@@ -330,7 +335,25 @@ def _ppo_checkpoint_has_layer_norm(model_state: Dict[str, torch.Tensor]) -> bool
     return "a2c_network.layer_norm.weight" in model_state
 
 
-def _infer_ppo_dims(model_state: Dict[str, torch.Tensor]) -> Tuple[int, int, int, bool]:
+def _infer_actor_mlp_units(model_state: Dict[str, torch.Tensor]) -> List[int]:
+    units: List[int] = []
+    linear_indices: List[int] = []
+    prefix = "a2c_network.actor_mlp."
+    suffix = ".weight"
+    for key, value in model_state.items():
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        idx_text = key[len(prefix) : -len(suffix)]
+        if not idx_text.isdigit() or len(value.shape) != 2:
+            continue
+        linear_indices.append(int(idx_text))
+
+    for idx in sorted(linear_indices):
+        units.append(int(model_state[f"{prefix}{idx}{suffix}"].shape[0]))
+    return units
+
+
+def _infer_ppo_dims(model_state: Dict[str, torch.Tensor]) -> Tuple[int, int, int, bool, List[int]]:
     actor_mlp_obs_key = "a2c_network.actor_mlp.0.weight"
     rnn_input_key = "a2c_network.rnn.rnn.weight_ih_l0"
     rnn_hidden_key = "a2c_network.rnn.rnn.weight_hh_l0"
@@ -342,6 +365,7 @@ def _infer_ppo_dims(model_state: Dict[str, torch.Tensor]) -> Tuple[int, int, int
     act_dim = int(model_state[act_key].shape[0])
     has_actor_mlp = _ppo_checkpoint_has_actor_mlp(model_state)
     has_rnn = _ppo_checkpoint_has_rnn(model_state)
+    actor_mlp_units = _infer_actor_mlp_units(model_state) if has_actor_mlp else []
 
     if has_actor_mlp:
         obs_dim = int(model_state[actor_mlp_obs_key].shape[1])
@@ -360,7 +384,38 @@ def _infer_ppo_dims(model_state: Dict[str, torch.Tensor]) -> Tuple[int, int, int
     else:
         rnn_hidden_size = 0
 
-    return obs_dim, act_dim, rnn_hidden_size, has_actor_mlp
+    return obs_dim, act_dim, rnn_hidden_size, has_actor_mlp, actor_mlp_units
+
+
+def _infer_eval_obs_layout(obs_dims: List[int]) -> Tuple[int, bool, bool]:
+    dims = [int(v) for v in obs_dims if int(v) > 0]
+    if BASE_TASK_OBS_WITH_DROP_DECISION_DIM in dims and any(
+        v in (AUG_TASK_OBS_DIM, AUG_TASK_OBS_WITH_DROP_DECISION_DIM) for v in dims
+    ):
+        raise RuntimeError(
+            "Incompatible observation layouts: base+drop-decision (18D) cannot be mixed with augmented "
+            "wind-estimation checkpoints (34D/37D) in the same evaluation run."
+        )
+    has_augmented_obs = any(
+        v in (AUG_TASK_OBS_DIM, AUG_TASK_OBS_WITH_DROP_DECISION_DIM) for v in dims
+    )
+    has_drop_decision_features = any(
+        v in (BASE_TASK_OBS_WITH_DROP_DECISION_DIM, AUG_TASK_OBS_WITH_DROP_DECISION_DIM)
+        for v in dims
+    )
+    if has_augmented_obs:
+        eval_obs_dim = (
+            AUG_TASK_OBS_WITH_DROP_DECISION_DIM
+            if has_drop_decision_features
+            else AUG_TASK_OBS_DIM
+        )
+    else:
+        eval_obs_dim = (
+            BASE_TASK_OBS_WITH_DROP_DECISION_DIM
+            if has_drop_decision_features
+            else BASE_TASK_OBS_DIM
+        )
+    return eval_obs_dim, has_augmented_obs, has_drop_decision_features
 
 
 def load_ppo_policy(checkpoint_path: str, device: str):
@@ -371,7 +426,9 @@ def load_ppo_policy(checkpoint_path: str, device: str):
     model_state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     if not isinstance(model_state, dict):
         raise RuntimeError("Unsupported checkpoint format: model state dict not found.")
-    ppo_obs_dim, ppo_act_dim, rnn_hidden_size, has_actor_mlp = _infer_ppo_dims(model_state)
+    ppo_obs_dim, ppo_act_dim, rnn_hidden_size, has_actor_mlp, actor_mlp_units = _infer_ppo_dims(
+        model_state
+    )
     use_rnn = _ppo_checkpoint_has_rnn(model_state)
     if use_rnn:
         use_layer_norm = _ppo_checkpoint_has_layer_norm(model_state)
@@ -380,6 +437,7 @@ def load_ppo_policy(checkpoint_path: str, device: str):
                 obs_dim=ppo_obs_dim,
                 act_dim=ppo_act_dim,
                 rnn_hidden_size=rnn_hidden_size,
+                mlp_units=actor_mlp_units,
                 use_layer_norm=use_layer_norm,
             ).to(device)
         else:
@@ -390,7 +448,11 @@ def load_ppo_policy(checkpoint_path: str, device: str):
                 use_layer_norm=use_layer_norm,
             ).to(device)
     else:
-        actor = PPOActorMLP(obs_dim=ppo_obs_dim, act_dim=ppo_act_dim).to(device)
+        actor = PPOActorMLP(
+            obs_dim=ppo_obs_dim,
+            act_dim=ppo_act_dim,
+            mlp_units=actor_mlp_units,
+        ).to(device)
 
     actor_state = {}
     for key, value in model_state.items():
@@ -544,6 +606,7 @@ def build_env(
     episode_len_steps: int,
     observation_space_dim: int = None,
     use_wind_estimation_features: bool = None,
+    use_drop_decision_features: bool = None,
     overrides: Optional[Dict[str, Any]] = None,
 ):
     _ensure_eval_env_modules_loaded()
@@ -556,6 +619,8 @@ def build_env(
         _apply_task_overrides(overrides)
     if use_wind_estimation_features is not None:
         task_config.use_wind_estimation_features = bool(use_wind_estimation_features)
+    if use_drop_decision_features is not None:
+        task_config.use_drop_decision_features = bool(use_drop_decision_features)
     if observation_space_dim is not None:
         task_config.observation_space_dim = int(observation_space_dim)
     env = NavigationTaskGmmNoise(task_config)
@@ -1245,8 +1310,8 @@ def evaluate_paired_single_seed(
 
         logger.info(
             f"[paired][seed={seed}] batch={batch_idx}, cases={case_offset}->{case_offset + valid_env_count - 1}, "
-            f"PPO(baseline)(drop/no_drop)={baseline_summary_batch.drop_done}/{baseline_summary_batch.no_drop_done}, "
-            f"PPO-GRU(drop/no_drop)={gru_summary_batch.drop_done}/{gru_summary_batch.no_drop_done}"
+            f"PPO(drop/no_drop)={baseline_summary_batch.drop_done}/{baseline_summary_batch.no_drop_done}, "
+            f"Proposed(drop/no_drop)={gru_summary_batch.drop_done}/{gru_summary_batch.no_drop_done}"
         )
 
         case_offset += valid_env_count
@@ -1632,20 +1697,76 @@ def _row_metric_value(row: Dict[str, float], metric_key: str) -> float:
     return float(row.get(metric_key, float("nan")))
 
 
+def _canonical_method_key(method: str) -> str:
+    text = str(method).strip()
+    normalized = text.lower().replace("-", "_").replace("(", "").replace(")", "")
+    normalized = normalized.replace(" ", "_")
+    if normalized in {"ppo", "ppo_baseline", "ppobaseline"}:
+        return "ppo"
+    if normalized in {"ppo_gru", "ppo_gru_plus", "proposed"}:
+        return "ppo_gru"
+    if normalized in {"ppo_rnn", "rnn", "rnn_only", "ppo_rnn_only"}:
+        return "ppo_rnn"
+    if normalized == "mpc":
+        return "mpc"
+    return normalized
+
+
 def method_display_name(method: str) -> str:
-    if method == "ppo":
+    """Paper-facing method names; raw CSV method keys are intentionally unchanged."""
+    key = _canonical_method_key(method)
+    if key == "ppo":
         return "PPO"
-    if method == "ppo_baseline":
-        return "PPO(baseline)"
-    if method == "ppo_gru_plus":
+    if key == "ppo_gru":
+        return "Proposed"
+    if key == "ppo_rnn":
         return "PPO-GRU"
-    if method == "ppo_gru":
-        return "PPO-GRU"
-    if method == "ppo_rnn":
-        return "PPO-RNN"
-    if method == "mpc":
+    if key == "mpc":
         return "MPC"
-    return method.upper()
+    return str(method).strip() or "Unknown"
+
+
+def method_color(method: str) -> Optional[str]:
+    key = _canonical_method_key(method)
+    return {
+        "ppo": "#1f77b4",
+        "ppo_gru": "#d62728",
+        "ppo_rnn": "#ff7f0e",
+        "mpc": "#2ca02c",
+    }.get(key)
+
+
+def _short_experiment_label(experiment_display_name: str) -> str:
+    text = str(experiment_display_name).strip()
+    if ":" in text and text.lower().startswith("experiment"):
+        sim_label = text.split(":", 1)[0].strip()
+        # Paper order differs from simulation order:
+        # simulation exp4 -> paper Experiment 3, simulation exp5 -> paper Experiment 4.
+        if sim_label == "Experiment 4":
+            return "Experiment 3"
+        if sim_label == "Experiment 5":
+            return "Experiment 4"
+        return sim_label
+    return text or "Experiment"
+
+
+def _short_condition_label(condition_display_name: str) -> str:
+    key = str(condition_display_name).strip().lower()
+    return {
+        "no_obstacle": "No Obstacle",
+        "random_obstacle": "Random Obstacle",
+        "weak_wind": "Low Wind",
+        "medium_wind": "Medium Wind",
+        "strong_wind": "High Wind",
+    }.get(key, "")
+
+
+def _short_figure_title_prefix(experiment_display_name: str, condition_display_name: str) -> str:
+    exp_label = _short_experiment_label(experiment_display_name)
+    condition_label = _short_condition_label(condition_display_name)
+    if condition_label:
+        return f"{exp_label}-{condition_label}"
+    return exp_label
 
 
 def paired_metric_arrays(rows: List[Dict[str, float]], metric_key: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -1681,7 +1802,7 @@ def paired_metric_delta_array(rows: List[Dict[str, float]], metric_key: str) -> 
     n = min(y_baseline.size, y_gru.size)
     if n <= 0:
         return np.asarray([], dtype=np.float64)
-    # Delta is defined as: PPO-GRU minus PPO(baseline).
+    # Delta is defined as: Proposed minus PPO.
     return y_gru[:n] - y_baseline[:n]
 
 
@@ -1710,8 +1831,8 @@ def plot_trend_figure(
     if len(metrics) == 1:
         axes = [axes]
 
-    c_baseline = "#1f77b4"
-    c_gru = "#d62728"
+    c_baseline = method_color("ppo") or "#1f77b4"
+    c_gru = method_color("ppo_gru") or "#d62728"
 
     for ax, (key, title, ylab) in zip(axes, metrics):
         y_baseline, y_gru = paired_metric_arrays(rows, key)
@@ -1729,8 +1850,8 @@ def plot_trend_figure(
         y_baseline_ema = ema(y_baseline, alpha=0.97)
         y_gru_ema = ema(y_gru, alpha=0.97)
 
-        ax.plot(x, y_baseline_ema, color=c_baseline, linewidth=2.8, label="PPO(baseline)")
-        ax.plot(x, y_gru_ema, color=c_gru, linewidth=2.8, label="PPO-GRU")
+        ax.plot(x, y_baseline_ema, color=c_baseline, linewidth=2.8, label=method_display_name("ppo"))
+        ax.plot(x, y_gru_ema, color=c_gru, linewidth=2.8, label=method_display_name("ppo_gru"))
         _set_tight_ylim_from_smoothed(ax, [y_baseline_ema, y_gru_ema])
 
         ax.set_title(title, fontweight="bold", pad=10)
@@ -1925,8 +2046,8 @@ def _plot_two_method_cdf(ax, vals_baseline: np.ndarray, vals_gru: np.ndarray, ti
     cb = np.arange(1, vb.size + 1, dtype=np.float64) / float(vb.size)
     cg = np.arange(1, vg.size + 1, dtype=np.float64) / float(vg.size)
 
-    ax.plot(vb, cb, color="#1f77b4", linewidth=2.8, label="PPO(baseline)")
-    ax.plot(vg, cg, color="#d62728", linewidth=2.8, label="PPO-GRU")
+    ax.plot(vb, cb, color=method_color("ppo") or "#1f77b4", linewidth=2.8, label=method_display_name("ppo"))
+    ax.plot(vg, cg, color=method_color("ppo_gru") or "#d62728", linewidth=2.8, label=method_display_name("ppo_gru"))
 
     x_max = float(max(np.percentile(vb, 99.5), np.percentile(vg, 99.5)))
     if np.isfinite(x_max) and x_max > 0:
@@ -2010,8 +2131,8 @@ def plot_landing_cdf_summary_table_figure(
         return row
 
     cell_text = [
-        _row("PPO(baseline)", sb),
-        _row("PPO-GRU", sg),
+        _row(method_display_name("ppo"), sb),
+        _row(method_display_name("ppo_gru"), sg),
     ]
 
     fig, ax = plt.subplots(1, 1, figsize=(12.8, 3.8), constrained_layout=True)
@@ -2069,8 +2190,8 @@ def plot_paired_attitude_shadow_figure(
     if len(metrics) == 1:
         axes = [axes]
 
-    c_baseline = "#1f77b4"
-    c_gru = "#d62728"
+    c_baseline = method_color("ppo") or "#1f77b4"
+    c_gru = method_color("ppo_gru") or "#d62728"
 
     for ax, (key, title, ylab) in zip(axes, metrics):
         y_baseline, y_gru = paired_metric_arrays(rows, key)
@@ -2092,8 +2213,8 @@ def plot_paired_attitude_shadow_figure(
         # first-version style: raw traces as light background + smoothed foreground
         ax.plot(x, y_baseline, color=c_baseline, linewidth=1.0, alpha=0.18)
         ax.plot(x, y_gru, color=c_gru, linewidth=1.0, alpha=0.18)
-        ax.plot(x, y_baseline_ema, color=c_baseline, linewidth=2.8, label="PPO(baseline)")
-        ax.plot(x, y_gru_ema, color=c_gru, linewidth=2.8, label="PPO-GRU")
+        ax.plot(x, y_baseline_ema, color=c_baseline, linewidth=2.8, label=method_display_name("ppo"))
+        ax.plot(x, y_gru_ema, color=c_gru, linewidth=2.8, label=method_display_name("ppo_gru"))
 
         _set_coarse_ylim_from_raw(ax, [y_baseline, y_gru])
 
@@ -2190,8 +2311,8 @@ def plot_paired_scatter_figure(
         if vb.size < 5 or vg.size < 5:
             logger.warning(f"Skip paired scatter due to insufficient samples: {key}")
             ax.set_title(f"{title} (insufficient samples)", fontweight="bold", pad=10)
-            ax.set_xlabel("PPO(baseline)")
-            ax.set_ylabel("PPO-GRU")
+            ax.set_xlabel(method_display_name("ppo"))
+            ax.set_ylabel(method_display_name("ppo_gru"))
             ax.grid(True, linestyle="--", linewidth=1.0, alpha=0.5, color="#b0b0b0")
             continue
 
@@ -2213,8 +2334,8 @@ def plot_paired_scatter_figure(
         ax.set_ylim(xmin, xmax)
 
         ax.set_title(title, fontweight="bold", pad=10)
-        ax.set_xlabel("PPO(baseline)")
-        ax.set_ylabel("PPO-GRU")
+        ax.set_xlabel(method_display_name("ppo"))
+        ax.set_ylabel(method_display_name("ppo_gru"))
         ax.grid(True, linestyle="--", linewidth=1.0, alpha=0.5, color="#b0b0b0")
 
         summary_text = (
@@ -2314,11 +2435,20 @@ def plot_attitude_impulse_summary_tables_figure(
 
 
 def _methods_in_rows(rows: List[Dict[str, float]], preferred_order: Optional[List[str]] = None) -> List[str]:
-    present = sorted(set(r["method"] for r in rows))
+    present = sorted(set(str(r["method"]) for r in rows))
     if preferred_order is None:
         return present
-    ordered = [m for m in preferred_order if m in present]
-    tail = [m for m in present if m not in ordered]
+    ordered: List[str] = []
+    seen = set()
+    for preferred in preferred_order:
+        preferred_key = _canonical_method_key(preferred)
+        for method in present:
+            if method in seen:
+                continue
+            if _canonical_method_key(method) == preferred_key:
+                ordered.append(method)
+                seen.add(method)
+    tail = [m for m in present if m not in seen]
     return ordered + tail
 
 
@@ -2333,15 +2463,6 @@ def plot_multi_method_cdf_single_metric(
 ):
     set_paper_style()
     fig, ax = plt.subplots(1, 1, figsize=(8.6, 6.2), constrained_layout=True)
-    colors = {
-        "ppo": "#1f77b4",
-        "ppo_baseline": "#1f77b4",
-        "ppo_gru": "#d62728",
-        "ppo_gru_plus": "#d62728",
-        "ppo_rnn": "#ff7f0e",
-        "mpc": "#2ca02c",
-    }
-
     plotted = 0
     for method in methods:
         vals = single_method_metric_array(rows=rows, method=method, metric_key=metric_key)
@@ -2357,7 +2478,7 @@ def plot_multi_method_cdf_single_metric(
             cdf,
             linewidth=2.6,
             label=method_display_name(method),
-            color=colors.get(method, None),
+            color=method_color(method),
         )
         plotted += 1
 
@@ -2402,14 +2523,6 @@ def plot_multi_method_roll_pitch_case_series(
 ):
     set_paper_style()
     fig, axes = plt.subplots(1, 2, figsize=(17.8, 6.4), constrained_layout=True, sharex=False)
-    colors = {
-        "ppo": "#1f77b4",
-        "ppo_baseline": "#1f77b4",
-        "ppo_gru": "#d62728",
-        "ppo_gru_plus": "#d62728",
-        "ppo_rnn": "#ff7f0e",
-        "mpc": "#2ca02c",
-    }
     metric_specs = [
         ("roll_deg", "Roll"),
         ("pitch_deg", "Pitch"),
@@ -2428,7 +2541,7 @@ def plot_multi_method_roll_pitch_case_series(
             win = max(11, min(101, int(max(11, y.size // 18))))
             y_mean, y_std = _moving_mean_std(y, window=win)
 
-            c = colors.get(method, None)
+            c = method_color(method)
             ax.plot(x, y, color=c, linewidth=0.8, alpha=0.14)
             ax.fill_between(
                 x,
@@ -2458,7 +2571,7 @@ def plot_multi_method_roll_pitch_case_series(
         ax.set_xlabel("DROP Sample Index")
         ax.grid(True, linestyle="--", linewidth=1.0, alpha=0.5, color="#b0b0b0")
         if plotted > 0:
-            leg = ax.legend(loc="best", frameon=True, fancybox=False, framealpha=0.95)
+            leg = ax.legend(loc="upper right", frameon=True, fancybox=False, framealpha=0.95)
             leg.get_frame().set_linewidth(1.1)
             leg.get_frame().set_edgecolor("#222222")
 
@@ -2755,12 +2868,16 @@ def render_condition_outputs(
     fig_dir: str,
     large_error_threshold_m: float,
 ):
+    title_prefix = _short_figure_title_prefix(
+        experiment_display_name=experiment_display_name,
+        condition_display_name=condition_display_name,
+    )
     # 1) Precision CDF
     plot_multi_method_cdf_single_metric(
         rows=rows,
         methods=methods,
         metric_key="landing_error_xy_m",
-        title=f"{experiment_display_name} | {condition_display_name} | Landing Precision CDF",
+        title=f"{title_prefix}: Landing Precision CDF",
         x_label="Landing Error XY (m)",
         out_pdf=os.path.join(fig_dir, "precision_cdf.pdf"),
         use_abs=False,
@@ -2770,7 +2887,7 @@ def render_condition_outputs(
     plot_multi_method_roll_pitch_case_series(
         rows=rows,
         methods=methods,
-        title=f"{experiment_display_name} | {condition_display_name} | Roll/Pitch",
+        title=f"{title_prefix}: Roll/Pitch",
         out_pdf=os.path.join(fig_dir, "roll_pitch_case.pdf"),
     )
 
@@ -2779,7 +2896,7 @@ def render_condition_outputs(
         rows=rows,
         methods=methods,
         metric_key="impulse_metric",
-        title=f"{experiment_display_name} | {condition_display_name} | Impact CDF",
+        title=f"{title_prefix}: Impact CDF",
         x_label="Impact Metric",
         out_pdf=os.path.join(fig_dir, "impact_cdf.pdf"),
         use_abs=False,
@@ -2789,7 +2906,7 @@ def render_condition_outputs(
     plot_four_pdf_comparison_table(
         rows=rows,
         methods=methods,
-        title=f"{experiment_display_name} | {condition_display_name} | Comparison Table",
+        title=f"{title_prefix}: Summary Table",
         out_pdf=os.path.join(fig_dir, "summary_table.pdf"),
         large_error_threshold_m=float(large_error_threshold_m),
     )
@@ -2797,11 +2914,11 @@ def render_condition_outputs(
 
 def _wind_condition_style(condition_name: str) -> Tuple[str, str]:
     if condition_name == "weak_wind":
-        return "Weak Wind", "#2ca02c"
+        return "Low Wind", "#2ca02c"
     if condition_name == "medium_wind":
         return "Medium Wind", "#ff7f0e"
     if condition_name == "strong_wind":
-        return "Strong Wind", "#d62728"
+        return "High Wind", "#d62728"
     return condition_name, "#1f77b4"
 
 
@@ -2919,7 +3036,7 @@ def plot_post_drop_wind_error_evolution(
 
 
 def render_experiment_level_outputs(exp_root: str, exp: ExperimentSpec):
-    if exp.name != "exp4_fixedH_multiW_obs":
+    if exp.name not in {"exp4_fixedH_multiW_obs", "exp4_multiH_multiW_noObs"}:
         return
     _, exp_stats_dir, exp_fig_dir = ensure_dirs(exp_root)
     condition_trace_bundles: Dict[str, Dict[str, np.ndarray]] = {}
@@ -2950,7 +3067,7 @@ def render_experiment_level_outputs(exp_root: str, exp: ExperimentSpec):
     plot_post_drop_wind_error_evolution(
         condition_trace_bundles=condition_trace_bundles,
         methods=methods,
-        title=f"{exp.display_name} | Post-DROP Error Evolution Across Wind Strengths",
+        title=f"{_short_experiment_label(exp.display_name)}: Post-DROP Error Evolution",
         out_pdf=os.path.join(exp_fig_dir, "post_drop_error_evolution_wind.pdf"),
     )
 
@@ -3222,20 +3339,21 @@ def _experiment_specs() -> List[ExperimentSpec]:
     )
 
     exp4 = ExperimentSpec(
-        name="exp4_fixedH_multiW_obs",
-        display_name="Experiment 4: Fixed Height + Obstacle + Multi Wind Strength",
+        name="exp4_multiH_multiW_noObs",
+        display_name="Experiment 4: Multi Height + No Obstacle + Multi Wind Strength",
         conditions=[
             EvalCondition(
                 name="weak_wind",
                 display_name="weak_wind",
                 overrides={
                     **common_base,
-                    "spawn_use_random_z": False,
-                    "spawn_fixed_z": fixed_height,
+                    "spawn_use_random_z": True,
+                    "spawn_random_z_min": random_height_min,
+                    "spawn_random_z_max": random_height_max,
                     "gmm_force_config.main_wind_speed_min": weak_wind,
                     "gmm_force_config.main_wind_speed_max": weak_wind,
-                    "drop_reward_config.drop_obstacle_enable": True,
-                    "drop_reward_config.drop_obstacle_spawn_prob": 1.0,
+                    "drop_reward_config.drop_obstacle_enable": False,
+                    "drop_reward_config.drop_obstacle_spawn_prob": 0.0,
                 },
             ),
             EvalCondition(
@@ -3243,12 +3361,13 @@ def _experiment_specs() -> List[ExperimentSpec]:
                 display_name="medium_wind",
                 overrides={
                     **common_base,
-                    "spawn_use_random_z": False,
-                    "spawn_fixed_z": fixed_height,
+                    "spawn_use_random_z": True,
+                    "spawn_random_z_min": random_height_min,
+                    "spawn_random_z_max": random_height_max,
                     "gmm_force_config.main_wind_speed_min": med_wind,
                     "gmm_force_config.main_wind_speed_max": med_wind,
-                    "drop_reward_config.drop_obstacle_enable": True,
-                    "drop_reward_config.drop_obstacle_spawn_prob": 1.0,
+                    "drop_reward_config.drop_obstacle_enable": False,
+                    "drop_reward_config.drop_obstacle_spawn_prob": 0.0,
                 },
             ),
             EvalCondition(
@@ -3256,12 +3375,13 @@ def _experiment_specs() -> List[ExperimentSpec]:
                 display_name="strong_wind",
                 overrides={
                     **common_base,
-                    "spawn_use_random_z": False,
-                    "spawn_fixed_z": fixed_height,
+                    "spawn_use_random_z": True,
+                    "spawn_random_z_min": random_height_min,
+                    "spawn_random_z_max": random_height_max,
                     "gmm_force_config.main_wind_speed_min": strong_wind,
                     "gmm_force_config.main_wind_speed_max": strong_wind,
-                    "drop_reward_config.drop_obstacle_enable": True,
-                    "drop_reward_config.drop_obstacle_spawn_prob": 1.0,
+                    "drop_reward_config.drop_obstacle_enable": False,
+                    "drop_reward_config.drop_obstacle_spawn_prob": 0.0,
                 },
             ),
         ],
@@ -3298,6 +3418,33 @@ def _experiment_specs() -> List[ExperimentSpec]:
     return [exp1, exp2, exp3, exp4, exp5]
 
 
+def _resolve_render_only_experiment(
+    output_root: str, exp: ExperimentSpec
+) -> Tuple[ExperimentSpec, str]:
+    exp_root = os.path.join(output_root, exp.name)
+    if os.path.exists(exp_root):
+        return exp, exp_root
+
+    # Older saved results used the previous experiment-4 directory name.
+    # Keep this as render-only compatibility so figures can be regenerated
+    # without rerunning simulation.
+    if exp.name == "exp4_multiH_multiW_noObs":
+        legacy_name = "exp4_fixedH_multiW_obs"
+        legacy_root = os.path.join(output_root, legacy_name)
+        if os.path.exists(legacy_root):
+            legacy_exp = ExperimentSpec(
+                name=legacy_name,
+                display_name="Experiment 4: Fixed Height + Obstacle + Multi Wind Strength",
+                conditions=exp.conditions,
+            )
+            logger.info(
+                f"[render-only] Using legacy experiment-4 saved directory: {legacy_root}"
+            )
+            return legacy_exp, legacy_root
+
+    return exp, exp_root
+
+
 def _parse_experiment_ids(text: str) -> List[int]:
     out = []
     for token in text.split(","):
@@ -3310,7 +3457,7 @@ def _parse_experiment_ids(text: str) -> List[int]:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Paper comparison: PPO vs PPO-GRU vs optional PPO-RNN vs MPC across five DROP experiments."
+        description="Paper comparison: PPO vs Proposed vs optional PPO-GRU baseline vs MPC across five DROP experiments."
     )
     parser.add_argument(
         "--baseline_checkpoint",
@@ -3322,13 +3469,13 @@ def parse_args():
         "--gru_checkpoint",
         type=str,
         default=DEFAULT_GRU_CHECKPOINT,
-        help="PPO-GRU checkpoint path.",
+        help="Proposed MLP+GRU checkpoint path.",
     )
     parser.add_argument(
         "--rnn_checkpoint",
         type=str,
         default=DEFAULT_RNN_CHECKPOINT,
-        help="Optional pure PPO-RNN checkpoint path. If empty, PPO-RNN is skipped.",
+        help="Optional pure PPO-GRU baseline checkpoint path. If empty, PPO-GRU baseline is skipped.",
     )
     parser.add_argument("--output_root", type=str, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument(
@@ -3414,7 +3561,7 @@ def main():
     seeds = parse_seed_list(args.seeds)
     os.makedirs(args.output_root, exist_ok=True)
 
-    logger.info("Paper comparison: PPO vs PPO-GRU vs optional PPO-RNN vs MPC (five experiments)")
+    logger.info("Paper comparison: PPO vs Proposed vs optional PPO-GRU baseline vs MPC (five experiments)")
     logger.info(f"baseline_checkpoint={args.baseline_checkpoint}")
     logger.info(f"gru_checkpoint={args.gru_checkpoint}")
     logger.info(f"rnn_checkpoint={args.rnn_checkpoint or '<disabled>'}")
@@ -3431,11 +3578,11 @@ def main():
     if bool(args.render_only_from_saved):
         logger.info("Render-only mode: regenerate PDFs directly from saved raw CSV files.")
         for exp in selected_experiments:
-            exp_root = os.path.join(args.output_root, exp.name)
+            render_exp, exp_root = _resolve_render_only_experiment(args.output_root, exp)
             os.makedirs(exp_root, exist_ok=True)
-            logger.info(f"[render-only] {exp.display_name}")
+            logger.info(f"[render-only] {render_exp.display_name}")
 
-            for cond in exp.conditions:
+            for cond in render_exp.conditions:
                 cond_root = os.path.join(exp_root, cond.name)
                 raw_dir, stats_dir, fig_dir = ensure_dirs(cond_root)
                 raw_csv_path = os.path.join(raw_dir, "combined_drop_metrics.csv")
@@ -3452,7 +3599,7 @@ def main():
                 render_condition_outputs(
                     rows=rows,
                     methods=methods,
-                    experiment_display_name=exp.display_name,
+                    experiment_display_name=render_exp.display_name,
                     condition_display_name=cond.display_name,
                     fig_dir=fig_dir,
                     large_error_threshold_m=float(args.large_error_threshold_m),
@@ -3460,7 +3607,7 @@ def main():
                 logger.info(
                     f"[render-only] Regenerated PDFs from {raw_csv_path} into {fig_dir}"
                 )
-            render_experiment_level_outputs(exp_root=exp_root, exp=exp)
+            render_experiment_level_outputs(exp_root=exp_root, exp=render_exp)
         return
 
     if len(seeds) > 1:
@@ -3520,12 +3667,12 @@ def main():
     if not gru_use_rnn:
         raise RuntimeError(
             "gru_checkpoint appears to be pure MLP. "
-            "Please provide PPO-GRU checkpoint."
+            "Please provide the Proposed MLP+GRU checkpoint."
         )
     if not gru_has_actor_mlp:
         raise RuntimeError(
             "gru_checkpoint appears to be RNN-only. "
-            "Please provide a PPO-GRU checkpoint with actor_mlp + GRU."
+            "Please provide a Proposed checkpoint with actor_mlp + GRU."
         )
     if rnn_checkpoint and (not rnn_use_rnn or rnn_has_actor_mlp):
         raise RuntimeError(
@@ -3533,25 +3680,26 @@ def main():
         )
     if int(ppo_act_dim) != int(gru_act_dim):
         raise RuntimeError(
-            f"Action dim mismatch between PPO and PPO-GRU checkpoints: {ppo_act_dim} vs {gru_act_dim}"
+            f"Action dim mismatch between PPO and Proposed checkpoints: {ppo_act_dim} vs {gru_act_dim}"
         )
     if rnn_checkpoint and int(ppo_act_dim) != int(rnn_act_dim):
         raise RuntimeError(
-            f"Action dim mismatch between PPO and PPO-RNN checkpoints: {ppo_act_dim} vs {rnn_act_dim}"
+            f"Action dim mismatch between PPO and PPO-GRU baseline checkpoints: {ppo_act_dim} vs {rnn_act_dim}"
         )
 
     obs_dims = [int(ppo_obs_dim), int(gru_obs_dim)]
     if rnn_checkpoint:
         obs_dims.append(int(rnn_obs_dim))
-    eval_obs_dim = max(obs_dims)
-    use_augmented_obs = bool(eval_obs_dim > 12)
+    eval_obs_dim, use_augmented_obs, use_drop_decision_features = _infer_eval_obs_layout(obs_dims)
     logger.info(
         f"Policy dims: ppo(obs={ppo_obs_dim}, act={ppo_act_dim}, rnn={ppo_use_rnn}), "
         f"gru(obs={gru_obs_dim}, act={gru_act_dim}, rnn={gru_use_rnn}, hidden={gru_rnn_hidden_size}), "
         f"rnn(obs={rnn_obs_dim if rnn_checkpoint else 'disabled'}, "
         f"act={rnn_act_dim if rnn_checkpoint else 'disabled'}, "
         f"hidden={rnn_hidden_size if rnn_checkpoint else 'disabled'}), "
-        f"eval_obs_dim={eval_obs_dim}"
+        f"eval_obs_dim={eval_obs_dim}, "
+        f"use_augmented_obs={use_augmented_obs}, "
+        f"use_drop_decision_features={use_drop_decision_features}"
     )
 
     first_overrides = (
@@ -3565,6 +3713,7 @@ def main():
         episode_len_steps=args.episode_len_steps,
         observation_space_dim=eval_obs_dim,
         use_wind_estimation_features=use_augmented_obs,
+        use_drop_decision_features=use_drop_decision_features,
         overrides=first_overrides,
     )
     env_act_dim = int(env.task_config.action_space_dim)
