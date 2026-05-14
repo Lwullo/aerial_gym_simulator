@@ -131,6 +131,11 @@ class NavigationTaskGmmNoise(BaseTask):
             logger.warning("frame_stack must be >= 1. Falling back to 1.")
             self.obs_frame_stack = 1
 
+        self.use_central_value = bool(getattr(self.task_config, "use_central_value", True))
+        self.critic_use_privileged_obs = bool(
+            getattr(self.task_config, "critic_use_privileged_obs", self.use_central_value)
+        )
+
         self.privileged_observation_dim = int(
             getattr(self.task_config, "privileged_observation_space_dim", 13)
         )
@@ -144,9 +149,12 @@ class NavigationTaskGmmNoise(BaseTask):
         self.actor_observation_space_dim = (
             self.base_observation_space_dim * self.obs_frame_stack
         )
-        self.critic_observation_space_dim = (
-            self.actor_observation_space_dim + self.privileged_observation_dim
-        )
+        if self.critic_use_privileged_obs:
+            self.critic_observation_space_dim = (
+                self.actor_observation_space_dim + self.privileged_observation_dim
+            )
+        else:
+            self.critic_observation_space_dim = self.actor_observation_space_dim
         if int(
             getattr(self.task_config, "observation_space_dim", self.actor_observation_space_dim)
         ) != self.actor_observation_space_dim:
@@ -161,16 +169,21 @@ class NavigationTaskGmmNoise(BaseTask):
                 self.critic_observation_space_dim,
             )
         ) != self.critic_observation_space_dim:
+            critic_obs_desc = (
+                "asymmetric critic observations"
+                if self.critic_use_privileged_obs
+                else "symmetric critic observations"
+            )
             logger.warning(
                 f"Overriding critic_observation_space_dim to {self.critic_observation_space_dim} "
-                "for asymmetric critic observations."
+                f"for {critic_obs_desc}."
             )
-        self.use_central_value = bool(getattr(self.task_config, "use_central_value", True))
         self.task_config.base_observation_dim = self.base_observation_space_dim
         self.task_config.frame_stack = self.obs_frame_stack
         self.task_config.observation_space_dim = self.actor_observation_space_dim
         self.task_config.critic_observation_space_dim = self.critic_observation_space_dim
         self.task_config.use_central_value = self.use_central_value
+        self.task_config.critic_use_privileged_obs = self.critic_use_privileged_obs
 
         self.observation_space = Dict(
             {
@@ -3102,9 +3115,12 @@ class NavigationTaskGmmNoise(BaseTask):
         self.obs_frame_buffer[:, -1, :] = self.base_task_observations
         actor_obs = self.obs_frame_buffer.reshape(self.sim_env.num_envs, -1)
         self.task_obs["observations"][:] = actor_obs
-        privileged_obs = self._compute_privileged_observation()
-        self.task_obs["states"][:, 0:self.actor_observation_space_dim] = actor_obs
-        self.task_obs["states"][:, self.actor_observation_space_dim :] = privileged_obs
+        if self.critic_use_privileged_obs:
+            privileged_obs = self._compute_privileged_observation()
+            self.task_obs["states"][:, 0:self.actor_observation_space_dim] = actor_obs
+            self.task_obs["states"][:, self.actor_observation_space_dim :] = privileged_obs
+        else:
+            self.task_obs["states"][:] = actor_obs
 
     def process_obs_for_task(self):
         self._compute_base_observation()

@@ -227,6 +227,113 @@ def _patch_rl_games_sac_epoch_scalar_logging():
     sac_agent_mod.SACAgent._aerial_sac_epoch_scalar_patch_applied = True
 
 
+def _patch_rl_games_fixed_epoch_schedule():
+    """
+    Apply a reproducible epoch-based piecewise schedule for PPO.
+
+    Config format:
+      params:
+        config:
+          fixed_schedule:
+            enabled: True
+            stages:
+              - start_epoch: 1
+                learning_rate: 3e-5
+                entropy_coef: 0.001
+              - start_epoch: 9001
+                learning_rate: 1e-5
+                entropy_coef: 0.0003
+    """
+    from rl_games.algos_torch import a2c_continuous
+
+    if getattr(a2c_continuous.A2CAgent, "_aerial_fixed_schedule_patch_applied", False):
+        return
+
+    original_update_epoch = a2c_continuous.A2CAgent.update_epoch
+
+    def _get_schedule_stages(agent):
+        schedule_cfg = agent.config.get("fixed_schedule", {})
+        if not isinstance(schedule_cfg, dict) or not bool(schedule_cfg.get("enabled", False)):
+            return []
+        stages = schedule_cfg.get("stages", [])
+        if not isinstance(stages, list):
+            return []
+
+        normalized = []
+        for idx, stage in enumerate(stages):
+            if not isinstance(stage, dict):
+                continue
+            start_epoch = int(stage.get("start_epoch", idx + 1))
+            normalized.append(
+                {
+                    "start_epoch": max(start_epoch, 1),
+                    "learning_rate": stage.get("learning_rate", None),
+                    "entropy_coef": stage.get("entropy_coef", None),
+                    "central_value_learning_rate": stage.get(
+                        "central_value_learning_rate", stage.get("learning_rate", None)
+                    ),
+                }
+            )
+        normalized.sort(key=lambda item: item["start_epoch"])
+        return normalized
+
+    def _select_stage(agent, epoch_num):
+        stages = _get_schedule_stages(agent)
+        if not stages:
+            return None, -1
+
+        selected_idx = 0
+        selected_stage = stages[0]
+        for idx, stage in enumerate(stages):
+            if epoch_num >= stage["start_epoch"]:
+                selected_idx = idx
+                selected_stage = stage
+            else:
+                break
+        return selected_stage, selected_idx
+
+    def _apply_stage(agent, epoch_num, stage, stage_idx):
+        target_lr = stage.get("learning_rate", None)
+        target_entropy = stage.get("entropy_coef", None)
+        target_cv_lr = stage.get("central_value_learning_rate", target_lr)
+
+        if target_lr is not None:
+            target_lr = float(target_lr)
+            agent.last_lr = target_lr
+            agent.update_lr(target_lr)
+
+        if target_entropy is not None:
+            agent.entropy_coef = float(target_entropy)
+
+        if getattr(agent, "has_central_value", False) and target_cv_lr is not None:
+            target_cv_lr = float(target_cv_lr)
+            agent.central_value_net.lr = target_cv_lr
+            agent.central_value_net.update_lr(target_cv_lr)
+
+        previous_stage = getattr(agent, "_fixed_schedule_stage_idx", None)
+        agent._fixed_schedule_stage_idx = stage_idx
+
+        if agent.global_rank == 0 and previous_stage != stage_idx:
+            lr_str = f"{float(target_lr):.6g}" if target_lr is not None else "unchanged"
+            ent_str = (
+                f"{float(target_entropy):.6g}" if target_entropy is not None else "unchanged"
+            )
+            print(
+                f"[fixed_schedule] epoch {epoch_num}: stage {stage_idx} "
+                f"(start_epoch={stage['start_epoch']}), lr={lr_str}, entropy={ent_str}"
+            )
+
+    def patched_update_epoch(self):
+        epoch_num = original_update_epoch(self)
+        stage, stage_idx = _select_stage(self, epoch_num)
+        if stage is not None:
+            _apply_stage(self, epoch_num, stage, stage_idx)
+        return epoch_num
+
+    a2c_continuous.A2CAgent.update_epoch = patched_update_epoch
+    a2c_continuous.A2CAgent._aerial_fixed_schedule_patch_applied = True
+
+
 class ExtractObsWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -569,8 +676,15 @@ if __name__ == "__main__":
             for key, value in task_overrides.items():
                 setattr(task_cfg, key, value)
 
-        experiment_name = config.get("params", {}).get("config", {}).get("name", "gen_ppo")
-        runs_dir = os.path.join(runner_dir, "runs")
+        config_params = config.get("params", {}).get("config", {})
+        experiment_name = config_params.get(
+            "full_experiment_name",
+            config_params.get("name", "gen_ppo"),
+        )
+        runs_dir = config_params.get("train_dir", os.path.join(runner_dir, "runs"))
+        if not os.path.isabs(runs_dir):
+            runs_dir = os.path.abspath(os.path.join(original_cwd, runs_dir))
+        config["params"]["config"]["train_dir"] = runs_dir
         os.environ["AERIAL_GYM_RUNS_DIR"] = runs_dir
         os.environ["AERIAL_GYM_EXPERIMENT_NAME"] = experiment_name
         os.environ["AERIAL_GYM_PPO_CONFIG_PATH"] = config_name
@@ -594,6 +708,7 @@ if __name__ == "__main__":
         _patch_rl_games_scalar_logging()
         _patch_rl_games_sac_obs_handling()
         _patch_rl_games_sac_epoch_scalar_logging()
+        _patch_rl_games_fixed_epoch_schedule()
         runner = Runner()
         try:
             runner.load(config)

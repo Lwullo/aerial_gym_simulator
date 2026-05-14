@@ -1,0 +1,119 @@
+params:
+  seed: 42
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  load_checkpoint: False
+
+  network:
+    name: actor_critic
+    separate: False
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+    mlp:
+      units: [256,128,64]
+      d2rl: False
+      activation: elu
+      initializer:
+        name: default
+        scale: 2
+
+  config:
+    env_name: navigation_task_gmm_noise
+    env_config:
+      num_envs: 1024
+      use_central_value: True
+      seed: 42
+
+    name: gmm_noise_run
+    full_experiment_name: acomparsion1-singleframe
+    train_dir: /home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs
+
+    task_overrides:
+      frame_stack: 1
+      observation_space_dim: 13
+      critic_observation_space_dim: 26
+      privileged_observation_space_dim: 13
+
+    reward_shaper:
+      scale_value: 0.1
+
+    normalize_advantage: True
+    gamma: 0.99
+    tau: 0.95
+    ppo: True
+
+    learning_rate: 3e-5
+    lr_schedule: null
+    kl_threshold: 0.007
+    save_frequency: 10
+    save_best_after: 10
+    score_to_win: 100000
+    grad_norm: 0.5
+    entropy_coef: 0.001
+    truncate_grads: True
+    e_clip: 0.2
+    clip_value: False
+    num_actors: 1024
+    horizon_length: 32
+    minibatch_size: 4096
+    mini_epochs: 4
+    critic_coef: 1.0
+
+    normalize_input: True
+    bounds_loss_coef: 0.0005
+    max_epochs: 10000
+    normalize_value: True
+    use_diagnostics: True
+    value_bootstrap: True
+    use_experimental_cv: False
+    use_smooth_clamp: False
+
+    fixed_schedule:
+      enabled: True
+      stages:
+        - start_epoch: 1
+          learning_rate: 3e-5
+          entropy_coef: 0.001
+          central_value_learning_rate: 3e-5
+        - start_epoch: 7200
+          learning_rate: 1e-5
+          entropy_coef: 0.0003
+          central_value_learning_rate: 1e-5
+
+    central_value_config:
+      minibatch_size: 4096
+      mini_epochs: 4
+      learning_rate: 3e-5
+      lr_schedule: null
+      clip_value: False
+      normalize_input: True
+      truncate_grads: True
+      grad_norm: 0.5
+      network:
+        name: actor_critic
+        central_value: True
+        mlp:
+          units: [256,128,64]
+          activation: elu
+          initializer:
+            name: default
+            scale: 2
+          regularizer:
+            name: None
+
+    player:
+      render: True
+      deterministic: True
+      games_num: 100000

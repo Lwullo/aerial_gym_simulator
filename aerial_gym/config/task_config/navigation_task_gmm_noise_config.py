@@ -100,6 +100,7 @@ class task_config:
     privileged_observation_space_dim = 13
     critic_observation_space_dim = 91
     use_central_value = True
+    critic_use_privileged_obs = True
     action_space_dim = 5  # [vx_cmd, vy_cmd, vz_cmd, yawrate_cmd, drop_switch]
     episode_len_steps = 1000  # real physics time for simulation is this value multiplied by sim.dt
 
