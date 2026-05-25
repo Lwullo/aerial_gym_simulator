@@ -37,11 +37,17 @@ params:
       seed: 42
 
     name: gmm_noise_run
-    full_experiment_name: seed-42
-    train_dir: /home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/random
+    full_experiment_name: acomparsion4-proposed-wo-physics
+    train_dir: /home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/no-rando
 
     task_overrides:
-      critic_privileged_mode: full
+      frame_stack: 6
+      observation_space_dim: 78
+      critic_observation_space_dim: 91
+      privileged_observation_space_dim: 13
+      use_central_value: True
+      critic_use_privileged_obs: True
+      critic_privileged_mode: wind_only
       privileged_randomization_enable: True
       privileged_wind_scale_min: 0.5
       privileged_wind_scale_max: 1.5
@@ -53,6 +59,9 @@ params:
       privileged_recoil_force_scale_max: 1.2
       privileged_recoil_tau_scale_min: 0.8
       privileged_recoil_tau_scale_max: 1.2
+      spawn_use_random_x: True
+      spawn_use_random_z: True
+      spawn_z_curriculum_enable: True
 
     reward_shaper:
       scale_value: 0.1
@@ -62,8 +71,6 @@ params:
     tau: 0.95
     ppo: True
 
-    # Stage 1 values are frozen here and later switched automatically
-    # by fixed_schedule below. No manual mid-training intervention needed.
     learning_rate: 3e-5
     lr_schedule: null
     kl_threshold: 0.007
@@ -83,7 +90,7 @@ params:
 
     normalize_input: True
     bounds_loss_coef: 0.0005
-    max_epochs: 15000
+    max_epochs: 10000
     normalize_value: True
     use_diagnostics: True
     value_bootstrap: True

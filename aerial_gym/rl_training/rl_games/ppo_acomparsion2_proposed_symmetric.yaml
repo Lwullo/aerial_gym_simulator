@@ -38,7 +38,7 @@ params:
 
     name: gmm_noise_run
     full_experiment_name: acomparsion2-proposed-symmetric
-    train_dir: /home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs
+    train_dir: /home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/random
 
     task_overrides:
       frame_stack: 6
@@ -47,6 +47,21 @@ params:
       privileged_observation_space_dim: 13
       use_central_value: False
       critic_use_privileged_obs: False
+      critic_privileged_mode: full
+      privileged_randomization_enable: False
+      privileged_wind_scale_min: 0.5
+      privileged_wind_scale_max: 1.5
+      privileged_mass_scale_min: 0.95
+      privileged_mass_scale_max: 1.05
+      privileged_inertia_scale_min: 0.95
+      privileged_inertia_scale_max: 1.05
+      privileged_recoil_force_scale_min: 0.8
+      privileged_recoil_force_scale_max: 1.2
+      privileged_recoil_tau_scale_min: 0.8
+      privileged_recoil_tau_scale_max: 1.2
+      spawn_use_random_x: True
+      spawn_use_random_z: True
+      spawn_z_curriculum_enable: True
 
     reward_shaper:
       scale_value: 0.1

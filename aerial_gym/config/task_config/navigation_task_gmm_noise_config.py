@@ -101,6 +101,18 @@ class task_config:
     critic_observation_space_dim = 91
     use_central_value = True
     critic_use_privileged_obs = True
+    critic_privileged_mode = "full"  # "full" or "wind_only"
+    privileged_randomization_enable = True
+    privileged_wind_scale_min = 0.5
+    privileged_wind_scale_max = 1.5
+    privileged_mass_scale_min = 0.95
+    privileged_mass_scale_max = 1.05
+    privileged_inertia_scale_min = 0.95
+    privileged_inertia_scale_max = 1.05
+    privileged_recoil_force_scale_min = 0.8
+    privileged_recoil_force_scale_max = 1.2
+    privileged_recoil_tau_scale_min = 0.8
+    privileged_recoil_tau_scale_max = 1.2
     action_space_dim = 5  # [vx_cmd, vy_cmd, vz_cmd, yawrate_cmd, drop_switch]
     episode_len_steps = 1000  # real physics time for simulation is this value multiplied by sim.dt
 

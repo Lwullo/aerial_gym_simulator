@@ -135,6 +135,18 @@ class NavigationTaskGmmNoise(BaseTask):
         self.critic_use_privileged_obs = bool(
             getattr(self.task_config, "critic_use_privileged_obs", self.use_central_value)
         )
+        self.critic_privileged_mode = str(
+            getattr(self.task_config, "critic_privileged_mode", "full")
+        ).strip().lower()
+        if self.critic_privileged_mode not in ("full", "wind_only"):
+            logger.warning(
+                "Unsupported critic_privileged_mode=%s. Falling back to 'full'.",
+                self.critic_privileged_mode,
+            )
+            self.critic_privileged_mode = "full"
+        self.privileged_randomization_enable = bool(
+            getattr(self.task_config, "privileged_randomization_enable", False)
+        )
 
         self.privileged_observation_dim = int(
             getattr(self.task_config, "privileged_observation_space_dim", 13)
@@ -184,6 +196,8 @@ class NavigationTaskGmmNoise(BaseTask):
         self.task_config.critic_observation_space_dim = self.critic_observation_space_dim
         self.task_config.use_central_value = self.use_central_value
         self.task_config.critic_use_privileged_obs = self.critic_use_privileged_obs
+        self.task_config.critic_privileged_mode = self.critic_privileged_mode
+        self.task_config.privileged_randomization_enable = self.privileged_randomization_enable
 
         self.observation_space = Dict(
             {
@@ -3108,7 +3122,61 @@ class NavigationTaskGmmNoise(BaseTask):
         self.privileged_observations[:, 4:7] = inertia_diag
         self.privileged_observations[:, 7:10] = recoil_force_world
         self.privileged_observations[:, 10:13] = recoil_tau_world
+        if self.critic_privileged_mode == "wind_only":
+            self.privileged_observations[:, 3:13] = 0.0
+        if self.privileged_randomization_enable:
+            self._apply_privileged_randomization(self.privileged_observations)
         return self.privileged_observations
+
+    def _sample_privileged_scale(self, start: int, end: int, min_val: float, max_val: float):
+        if end <= start:
+            return
+        lo = float(min(min_val, max_val))
+        hi = float(max(min_val, max_val))
+        if hi - lo < 1e-9:
+            self.privileged_observations[:, start:end] *= lo
+            return
+        scale = torch.empty(
+            (self.sim_env.num_envs, end - start),
+            device=self.device,
+            dtype=self.privileged_observations.dtype,
+        ).uniform_(lo, hi)
+        self.privileged_observations[:, start:end] *= scale
+
+    def _apply_privileged_randomization(self, privileged_obs: torch.Tensor):
+        del privileged_obs
+        self._sample_privileged_scale(
+            start=0,
+            end=3,
+            min_val=getattr(self.task_config, "privileged_wind_scale_min", 0.5),
+            max_val=getattr(self.task_config, "privileged_wind_scale_max", 1.5),
+        )
+        if self.critic_privileged_mode != "full":
+            return
+        self._sample_privileged_scale(
+            start=3,
+            end=4,
+            min_val=getattr(self.task_config, "privileged_mass_scale_min", 0.95),
+            max_val=getattr(self.task_config, "privileged_mass_scale_max", 1.05),
+        )
+        self._sample_privileged_scale(
+            start=4,
+            end=7,
+            min_val=getattr(self.task_config, "privileged_inertia_scale_min", 0.95),
+            max_val=getattr(self.task_config, "privileged_inertia_scale_max", 1.05),
+        )
+        self._sample_privileged_scale(
+            start=7,
+            end=10,
+            min_val=getattr(self.task_config, "privileged_recoil_force_scale_min", 0.8),
+            max_val=getattr(self.task_config, "privileged_recoil_force_scale_max", 1.2),
+        )
+        self._sample_privileged_scale(
+            start=10,
+            end=13,
+            min_val=getattr(self.task_config, "privileged_recoil_tau_scale_min", 0.8),
+            max_val=getattr(self.task_config, "privileged_recoil_tau_scale_max", 1.2),
+        )
 
     def _refresh_stacked_observations(self):
         self.obs_frame_buffer[:] = torch.roll(self.obs_frame_buffer, shifts=-1, dims=1)

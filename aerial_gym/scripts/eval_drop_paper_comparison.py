@@ -14,6 +14,7 @@ import math
 import os
 import sys
 import distutils
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -49,6 +50,25 @@ DEFAULT_OUTPUT_ROOT = (
     "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/result"
 )
 CASE_SEED_STRIDE = 10007
+BASE_OBS_DIM = 13
+DEFAULT_METHOD_CHECKPOINTS = [
+    ("proposed", "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/no-random/seed-42/nn/last_gmm_noise_run_ep_10000_rew_25.736092.pth"),
+    ("singleframe", "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/no-random/acomparsion1-singleframe/nn/last_gmm_noise_run_ep_10000_rew_22.893427.pth"),
+    ("symmetric", "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/no-random/acomparsion2-proposed-symmetric/nn/last_gmm_noise_run_ep_10000_rew_21.429558.pth"),
+    ("gru_singleframe", "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/no-random/acomparsion3-gru-singleframe/nn/last_gmm_noise_run_ep_10000_rew_22.317175.pth"),
+    ("wo_physics", "/home/lwulo/workspaces/aerial_gym_ws/src/aerial_gym_simulator/aerial_gym/rl_training/rl_games/runs/no-random/acomparsion4-proposed-wo-physics/nn/last_gmm_noise_run_ep_10000_rew_26.023333.pth"),
+]
+
+
+@dataclass
+class EvalMethod:
+    name: str
+    checkpoint: str
+    actor: nn.Module
+    rms: "RunningMeanStd"
+    obs_dim: int
+    act_dim: int
+    use_rnn: bool
 
 
 @dataclass
@@ -70,6 +90,23 @@ class RunningMeanStd:
     def normalize(self, obs: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
         std = torch.sqrt(torch.clamp(self.var, min=epsilon))
         return (obs - self.mean) / (std + epsilon)
+
+
+def slice_actor_obs(full_obs: torch.Tensor, actor_obs_dim: int) -> torch.Tensor:
+    full_obs_dim = int(full_obs.shape[1])
+    actor_obs_dim = int(actor_obs_dim)
+    if full_obs_dim == actor_obs_dim:
+        return full_obs
+    if full_obs_dim < actor_obs_dim:
+        raise ValueError(
+            f"Full observation dim {full_obs_dim} is smaller than actor obs dim {actor_obs_dim}."
+        )
+    if full_obs_dim % BASE_OBS_DIM != 0 or actor_obs_dim % BASE_OBS_DIM != 0:
+        raise ValueError(
+            f"Expected stacked observations divisible by {BASE_OBS_DIM}, got "
+            f"full={full_obs_dim}, actor={actor_obs_dim}."
+        )
+    return full_obs[:, -actor_obs_dim:]
 
 
 class RNNBlock(nn.Module):
@@ -317,6 +354,29 @@ def parse_seed_list(seed_text: str) -> List[int]:
     return seeds
 
 
+def parse_method_checkpoints(method_texts: List[str]) -> List[Tuple[str, str]]:
+    methods: List[Tuple[str, str]] = []
+    for text in method_texts:
+        item = text.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                f"Invalid --method_checkpoint entry '{item}'. Expected format: method_name=/abs/path/to/checkpoint.pth"
+            )
+        name, checkpoint = item.split("=", 1)
+        name = name.strip()
+        checkpoint = checkpoint.strip()
+        if not name or not checkpoint:
+            raise ValueError(
+                f"Invalid --method_checkpoint entry '{item}'. Method name and checkpoint path must both be non-empty."
+            )
+        methods.append((name, checkpoint))
+    if not methods:
+        raise ValueError("No valid method checkpoints parsed.")
+    return methods
+
+
 def _to_numpy_bool(x: torch.Tensor) -> np.ndarray:
     return x.detach().cpu().numpy().astype(bool)
 
@@ -469,7 +529,7 @@ def _run_method_on_case_batch(
     max_steps = max(int(episode_len_steps * 2), 2000)
 
     while (not np.all(done_seen)) and sim_step < max_steps:
-        obs = env.task_obs["observations"][:, :obs_dim]
+        obs = slice_actor_obs(env.task_obs["observations"], obs_dim)
         if rms is not None:
             obs = rms.normalize(obs)
         with torch.no_grad():
@@ -558,6 +618,67 @@ def _run_method_on_case_batch(
         no_drop_done=no_drop_done,
     )
     return rows, summary
+
+
+def evaluate_multi_method_single_seed(
+    env,
+    seed: int,
+    episodes_target: int,
+    device: str,
+    methods: List[EvalMethod],
+) -> Tuple[List[Dict[str, float]], List[MethodSummary]]:
+    num_envs = env.sim_env.num_envs
+    all_rows: List[Dict[str, float]] = []
+    summary_accumulator: Dict[str, MethodSummary] = {
+        method.name: MethodSummary(method=method.name, seed=seed, done_total=0, drop_done=0, no_drop_done=0)
+        for method in methods
+    }
+
+    case_offset = 0
+    batch_idx = 0
+    while case_offset < episodes_target:
+        valid_env_count = min(num_envs, episodes_target - case_offset)
+        case_seed = int(seed + batch_idx * CASE_SEED_STRIDE)
+        batch_summaries: List[MethodSummary] = []
+
+        for method in methods:
+            rows_batch, summary_batch = _run_method_on_case_batch(
+                env=env,
+                method=method.name,
+                seed=seed,
+                case_seed=case_seed,
+                batch_idx=batch_idx,
+                case_id_offset=case_offset,
+                valid_env_count=valid_env_count,
+                device=device,
+                actor=method.actor,
+                rms=method.rms,
+                obs_dim=method.obs_dim,
+                use_rnn=method.use_rnn,
+            )
+            all_rows.extend(rows_batch)
+            accum = summary_accumulator[method.name]
+            accum.done_total += summary_batch.done_total
+            accum.drop_done += summary_batch.drop_done
+            accum.no_drop_done += summary_batch.no_drop_done
+            batch_summaries.append(summary_batch)
+
+        summary_text = ", ".join(
+            [
+                f"{s.method}(drop/no_drop)={s.drop_done}/{s.no_drop_done}"
+                for s in batch_summaries
+            ]
+        )
+        logger.info(
+            f"[paired][seed={seed}] batch={batch_idx}, cases={case_offset}->{case_offset + valid_env_count - 1}, "
+            f"{summary_text}"
+        )
+
+        case_offset += valid_env_count
+        batch_idx += 1
+
+    summaries = [summary_accumulator[method.name] for method in methods]
+    return all_rows, summaries
 
 
 def evaluate_paired_single_seed(
@@ -1504,6 +1625,12 @@ def parse_args():
         default=DEFAULT_GRU_CHECKPOINT,
         help="PPO-GRU checkpoint path.",
     )
+    parser.add_argument(
+        "--method_checkpoint",
+        action="append",
+        default=[],
+        help="Multi-method evaluation entry in the form method_name=/abs/path/to/checkpoint.pth. Can be provided multiple times.",
+    )
     parser.add_argument("--output_root", type=str, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--num_envs", type=int, default=256)
     parser.add_argument("--episodes_per_seed", type=int, default=2000)
@@ -1524,10 +1651,17 @@ def main():
     os.environ["AERIAL_GYM_EVAL_MODE"] = "1"
     seeds = parse_seed_list(args.seeds)
     raw_dir, stats_dir, fig_dir = ensure_dirs(args.output_root)
+    multi_method_mode = len(args.method_checkpoint) > 0
 
-    logger.info("DROP paper comparison: PPO(baseline) vs PPO-GRU")
-    logger.info(f"baseline_checkpoint={args.baseline_checkpoint}")
-    logger.info(f"gru_checkpoint={args.gru_checkpoint}")
+    if multi_method_mode:
+        method_entries = parse_method_checkpoints(args.method_checkpoint)
+        logger.info("DROP paper comparison: multi-method paired evaluation")
+        for method_name, checkpoint in method_entries:
+            logger.info(f"method_checkpoint[{method_name}]={checkpoint}")
+    else:
+        logger.info("DROP paper comparison: PPO(baseline) vs PPO-GRU")
+        logger.info(f"baseline_checkpoint={args.baseline_checkpoint}")
+        logger.info(f"gru_checkpoint={args.gru_checkpoint}")
     logger.info(f"output_root={args.output_root}")
     logger.info(
         f"num_envs={args.num_envs}, episodes_per_seed={args.episodes_per_seed}, "
@@ -1545,160 +1679,230 @@ def main():
         )
     seed = seeds[0]
 
-    baseline_actor, baseline_rms, baseline_obs_dim, baseline_act_dim, baseline_use_rnn = load_ppo_policy(
-        checkpoint_path=args.baseline_checkpoint, device=args.device
-    )
-    gru_actor, gru_rms, gru_obs_dim, gru_act_dim, gru_use_rnn = load_ppo_policy(
-        checkpoint_path=args.gru_checkpoint, device=args.device
-    )
+    if multi_method_mode:
+        methods: List[EvalMethod] = []
+        for method_name, checkpoint in method_entries:
+            actor, rms, obs_dim, act_dim, use_rnn = load_ppo_policy(
+                checkpoint_path=checkpoint, device=args.device
+            )
+            methods.append(
+                EvalMethod(
+                    name=method_name,
+                    checkpoint=checkpoint,
+                    actor=actor,
+                    rms=rms,
+                    obs_dim=int(obs_dim),
+                    act_dim=int(act_dim),
+                    use_rnn=bool(use_rnn),
+                )
+            )
+            logger.info(
+                f"Policy dims [{method_name}]: obs={obs_dim}, act={act_dim}, rnn={use_rnn}"
+            )
 
-    if baseline_use_rnn:
-        logger.warning(
-            "baseline_checkpoint appears to contain RNN weights. "
-            "For PPO(baseline), use a pure-MLP checkpoint."
-        )
-    if not gru_use_rnn:
-        logger.warning(
-            "gru_checkpoint appears to be pure MLP. "
-            "For PPO-GRU, use a checkpoint trained with RNN enabled."
-        )
-
-    eval_obs_dim = max(int(baseline_obs_dim), int(gru_obs_dim))
-    use_augmented_obs = bool(eval_obs_dim > 12)
-    logger.info(
-        f"Policy dims: baseline(obs={baseline_obs_dim}, act={baseline_act_dim}, rnn={baseline_use_rnn}), "
-        f"gru(obs={gru_obs_dim}, act={gru_act_dim}, rnn={gru_use_rnn}), eval_obs_dim={eval_obs_dim}"
-    )
-    env = build_env(
-        num_envs=args.num_envs,
-        seed=seed,
-        device=args.device,
-        headless=args.headless,
-        episode_len_steps=args.episode_len_steps,
-        observation_space_dim=eval_obs_dim,
-        use_wind_estimation_features=use_augmented_obs,
-    )
-    env_act_dim = int(env.task_config.action_space_dim)
-    if env_act_dim != int(baseline_act_dim) or env_act_dim != int(gru_act_dim):
-        env.close()
-        raise RuntimeError(
-            f"Action dim mismatch: env={env_act_dim}, baseline={baseline_act_dim}, gru={gru_act_dim}"
-        )
-    if int(env.task_config.observation_space_dim) < eval_obs_dim:
-        env.close()
-        raise RuntimeError(
-            f"Env observation dim {env.task_config.observation_space_dim} < required {eval_obs_dim}"
-        )
-
-    try:
-        baseline_rows, gru_rows, baseline_summary, gru_summary = evaluate_paired_single_seed(
-            env=env,
+        eval_obs_dim = max(method.obs_dim for method in methods)
+        use_augmented_obs = bool(eval_obs_dim > 12)
+        env = build_env(
+            num_envs=args.num_envs,
             seed=seed,
-            episodes_target=args.episodes_per_seed,
             device=args.device,
-            baseline_actor=baseline_actor,
-            baseline_rms=baseline_rms,
-            baseline_obs_dim=int(baseline_obs_dim),
-            baseline_use_rnn=baseline_use_rnn,
-            gru_actor=gru_actor,
-            gru_rms=gru_rms,
-            gru_obs_dim=int(gru_obs_dim),
-            gru_use_rnn=gru_use_rnn,
+            headless=args.headless,
+            episode_len_steps=args.episode_len_steps,
+            observation_space_dim=eval_obs_dim,
+            use_wind_estimation_features=use_augmented_obs,
+        )
+        env_act_dim = int(env.task_config.action_space_dim)
+        for method in methods:
+            if env_act_dim != int(method.act_dim):
+                env.close()
+                raise RuntimeError(
+                    f"Action dim mismatch for {method.name}: env={env_act_dim}, method={method.act_dim}"
+                )
+        if int(env.task_config.observation_space_dim) < eval_obs_dim:
+            env.close()
+            raise RuntimeError(
+                f"Env observation dim {env.task_config.observation_space_dim} < required {eval_obs_dim}"
+            )
+
+        try:
+            all_rows, summaries = evaluate_multi_method_single_seed(
+                env=env,
+                seed=seed,
+                episodes_target=args.episodes_per_seed,
+                device=args.device,
+                methods=methods,
+            )
+            for summary in summaries:
+                logger.info(
+                    f"[seed={seed}] {summary.method} done/drop/no_drop="
+                    f"{summary.done_total}/{summary.drop_done}/{summary.no_drop_done}"
+                )
+        finally:
+            env.close()
+
+        for method in methods:
+            method_rows = [r for r in all_rows if r["method"] == method.name]
+            write_rows_csv(os.path.join(raw_dir, f"{method.name}_drop_metrics.csv"), method_rows)
+        write_rows_csv(os.path.join(raw_dir, "combined_drop_metrics.csv"), all_rows)
+
+        mean_std_path, median_iqr_path, no_drop_path = save_summary_tables(
+            stats_dir=stats_dir, rows=all_rows, summaries=summaries
+        )
+    else:
+        baseline_actor, baseline_rms, baseline_obs_dim, baseline_act_dim, baseline_use_rnn = load_ppo_policy(
+            checkpoint_path=args.baseline_checkpoint, device=args.device
+        )
+        gru_actor, gru_rms, gru_obs_dim, gru_act_dim, gru_use_rnn = load_ppo_policy(
+            checkpoint_path=args.gru_checkpoint, device=args.device
         )
 
-        all_rows.extend(baseline_rows)
-        all_rows.extend(gru_rows)
-        summaries.extend([baseline_summary, gru_summary])
+        if baseline_use_rnn:
+            logger.warning(
+                "baseline_checkpoint appears to contain RNN weights. "
+                "For PPO(baseline), use a pure-MLP checkpoint."
+            )
+        if not gru_use_rnn:
+            logger.warning(
+                "gru_checkpoint appears to be pure MLP. "
+                "For PPO-GRU, use a checkpoint trained with RNN enabled."
+            )
+
+        eval_obs_dim = max(int(baseline_obs_dim), int(gru_obs_dim))
+        use_augmented_obs = bool(eval_obs_dim > 12)
         logger.info(
-            f"[seed={seed}] paired cases={args.episodes_per_seed}, "
-            f"PPO(baseline) done/drop/no_drop={baseline_summary.done_total}/{baseline_summary.drop_done}/{baseline_summary.no_drop_done}, "
-            f"PPO-GRU done/drop/no_drop={gru_summary.done_total}/{gru_summary.drop_done}/{gru_summary.no_drop_done}"
+            f"Policy dims: baseline(obs={baseline_obs_dim}, act={baseline_act_dim}, rnn={baseline_use_rnn}), "
+            f"gru(obs={gru_obs_dim}, act={gru_act_dim}, rnn={gru_use_rnn}), eval_obs_dim={eval_obs_dim}"
         )
-    finally:
-        env.close()
+        env = build_env(
+            num_envs=args.num_envs,
+            seed=seed,
+            device=args.device,
+            headless=args.headless,
+            episode_len_steps=args.episode_len_steps,
+            observation_space_dim=eval_obs_dim,
+            use_wind_estimation_features=use_augmented_obs,
+        )
+        env_act_dim = int(env.task_config.action_space_dim)
+        if env_act_dim != int(baseline_act_dim) or env_act_dim != int(gru_act_dim):
+            env.close()
+            raise RuntimeError(
+                f"Action dim mismatch: env={env_act_dim}, baseline={baseline_act_dim}, gru={gru_act_dim}"
+            )
+        if int(env.task_config.observation_space_dim) < eval_obs_dim:
+            env.close()
+            raise RuntimeError(
+                f"Env observation dim {env.task_config.observation_space_dim} < required {eval_obs_dim}"
+            )
 
-    baseline_rows_all = [r for r in all_rows if r["method"] == "ppo_baseline"]
-    gru_rows_all = [r for r in all_rows if r["method"] == "ppo_gru"]
-    write_rows_csv(os.path.join(raw_dir, "ppo_baseline_drop_metrics.csv"), baseline_rows_all)
-    write_rows_csv(os.path.join(raw_dir, "ppo_gru_drop_metrics.csv"), gru_rows_all)
-    write_rows_csv(os.path.join(raw_dir, "combined_drop_metrics.csv"), all_rows)
+        try:
+            baseline_rows, gru_rows, baseline_summary, gru_summary = evaluate_paired_single_seed(
+                env=env,
+                seed=seed,
+                episodes_target=args.episodes_per_seed,
+                device=args.device,
+                baseline_actor=baseline_actor,
+                baseline_rms=baseline_rms,
+                baseline_obs_dim=int(baseline_obs_dim),
+                baseline_use_rnn=baseline_use_rnn,
+                gru_actor=gru_actor,
+                gru_rms=gru_rms,
+                gru_obs_dim=int(gru_obs_dim),
+                gru_use_rnn=gru_use_rnn,
+            )
 
-    mean_std_path, median_iqr_path, no_drop_path = save_summary_tables(
-        stats_dir=stats_dir, rows=all_rows, summaries=summaries
-    )
+            all_rows.extend(baseline_rows)
+            all_rows.extend(gru_rows)
+            summaries.extend([baseline_summary, gru_summary])
+            logger.info(
+                f"[seed={seed}] paired cases={args.episodes_per_seed}, "
+                f"PPO(baseline) done/drop/no_drop={baseline_summary.done_total}/{baseline_summary.drop_done}/{baseline_summary.no_drop_done}, "
+                f"PPO-GRU done/drop/no_drop={gru_summary.done_total}/{gru_summary.drop_done}/{gru_summary.no_drop_done}"
+            )
+        finally:
+            env.close()
 
-    # Figure 1: landing_error_xy CDF comparison (PPO vs PPO-GRU)
-    plot_paired_cdf_figure(
-        rows=all_rows,
-        metrics=[
-            ("landing_error_xy_m", "Landing Error XY CDF", "Landing Error XY (m)", False),
-        ],
-        suptitle="DROP Precision CDF: PPO(baseline) vs PPO-GRU",
-        out_png=os.path.join(fig_dir, "fig_landing_error_xy_cdf_compare.png"),
-        out_pdf=os.path.join(fig_dir, "fig_landing_error_xy_cdf_compare.pdf"),
-    )
+        baseline_rows_all = [r for r in all_rows if r["method"] == "ppo_baseline"]
+        gru_rows_all = [r for r in all_rows if r["method"] == "ppo_gru"]
+        write_rows_csv(os.path.join(raw_dir, "ppo_baseline_drop_metrics.csv"), baseline_rows_all)
+        write_rows_csv(os.path.join(raw_dir, "ppo_gru_drop_metrics.csv"), gru_rows_all)
+        write_rows_csv(os.path.join(raw_dir, "combined_drop_metrics.csv"), all_rows)
 
-    # Figure 2: summary table for Figure 1
-    plot_landing_cdf_summary_table_figure(
-        rows=all_rows,
-        out_png=os.path.join(fig_dir, "fig_landing_error_xy_cdf_summary_table.png"),
-        out_pdf=os.path.join(fig_dir, "fig_landing_error_xy_cdf_summary_table.pdf"),
-        thresholds=(0.5, 1.0, 2.0),
-    )
+        mean_std_path, median_iqr_path, no_drop_path = save_summary_tables(
+            stats_dir=stats_dir, rows=all_rows, summaries=summaries
+        )
 
-    # Figure 3: pre-DROP attitude trend comparison (first-style: shadow + smoothed)
-    plot_paired_attitude_shadow_figure(
-        rows=all_rows,
-        metrics=[
-            ("roll_deg", "Roll", "Pre-DROP Angle (deg)"),
-            ("pitch_deg", "Pitch", "Pre-DROP Angle (deg)"),
-            ("yaw_deg", "Yaw", "Pre-DROP Angle (deg)"),
-        ],
-        suptitle="Pre-DROP Attitude Comparison: PPO(baseline) vs PPO-GRU",
-        out_png=os.path.join(fig_dir, "fig_pre_drop_attitude_compare.png"),
-        out_pdf=os.path.join(fig_dir, "fig_pre_drop_attitude_compare.pdf"),
-    )
+        # Figure 1: landing_error_xy CDF comparison (PPO vs PPO-GRU)
+        plot_paired_cdf_figure(
+            rows=all_rows,
+            metrics=[
+                ("landing_error_xy_m", "Landing Error XY CDF", "Landing Error XY (m)", False),
+            ],
+            suptitle="DROP Precision CDF: PPO(baseline) vs PPO-GRU",
+            out_png=os.path.join(fig_dir, "fig_landing_error_xy_cdf_compare.png"),
+            out_pdf=os.path.join(fig_dir, "fig_landing_error_xy_cdf_compare.pdf"),
+        )
 
-    # Added scatter windows: attitude (3 subplots) + impact (1 subplot)
-    plot_paired_scatter_figure(
-        rows=all_rows,
-        metrics=[
-            ("roll_deg", "|Roll| Paired Scatter", True),
-            ("pitch_deg", "|Pitch| Paired Scatter", True),
-            ("yaw_deg", "|Yaw| Paired Scatter", True),
-        ],
-        suptitle="Paired Attitude Scatter: PPO(baseline) vs PPO-GRU",
-        out_png=os.path.join(fig_dir, "fig_pre_drop_attitude_scatter_compare.png"),
-        out_pdf=os.path.join(fig_dir, "fig_pre_drop_attitude_scatter_compare.pdf"),
-    )
+        # Figure 2: summary table for Figure 1
+        plot_landing_cdf_summary_table_figure(
+            rows=all_rows,
+            out_png=os.path.join(fig_dir, "fig_landing_error_xy_cdf_summary_table.png"),
+            out_pdf=os.path.join(fig_dir, "fig_landing_error_xy_cdf_summary_table.pdf"),
+            thresholds=(0.5, 1.0, 2.0),
+        )
 
-    plot_paired_scatter_figure(
-        rows=all_rows,
-        metrics=[
-            ("impulse_metric", "Impulse Metric Paired Scatter", False),
-        ],
-        suptitle="Paired Impact Scatter: PPO(baseline) vs PPO-GRU",
-        out_png=os.path.join(fig_dir, "fig_impulse_metric_scatter_compare.png"),
-        out_pdf=os.path.join(fig_dir, "fig_impulse_metric_scatter_compare.pdf"),
-    )
+        # Figure 3: pre-DROP attitude trend comparison (first-style: shadow + smoothed)
+        plot_paired_attitude_shadow_figure(
+            rows=all_rows,
+            metrics=[
+                ("roll_deg", "Roll", "Pre-DROP Angle (deg)"),
+                ("pitch_deg", "Pitch", "Pre-DROP Angle (deg)"),
+                ("yaw_deg", "Yaw", "Pre-DROP Angle (deg)"),
+            ],
+            suptitle="Pre-DROP Attitude Comparison: PPO(baseline) vs PPO-GRU",
+            out_png=os.path.join(fig_dir, "fig_pre_drop_attitude_compare.png"),
+            out_pdf=os.path.join(fig_dir, "fig_pre_drop_attitude_compare.pdf"),
+        )
 
-    # Combined table window (2 subplots): attitude table + impact table
-    plot_attitude_impulse_summary_tables_figure(
-        rows=all_rows,
-        out_png=os.path.join(fig_dir, "fig_attitude_impact_summary_tables.png"),
-        out_pdf=os.path.join(fig_dir, "fig_attitude_impact_summary_tables.pdf"),
-    )
+        # Added scatter windows: attitude (3 subplots) + impact (1 subplot)
+        plot_paired_scatter_figure(
+            rows=all_rows,
+            metrics=[
+                ("roll_deg", "|Roll| Paired Scatter", True),
+                ("pitch_deg", "|Pitch| Paired Scatter", True),
+                ("yaw_deg", "|Yaw| Paired Scatter", True),
+            ],
+            suptitle="Paired Attitude Scatter: PPO(baseline) vs PPO-GRU",
+            out_png=os.path.join(fig_dir, "fig_pre_drop_attitude_scatter_compare.png"),
+            out_pdf=os.path.join(fig_dir, "fig_pre_drop_attitude_scatter_compare.pdf"),
+        )
 
-    # Figure 4: impulse metric CDF comparison
-    plot_paired_cdf_figure(
-        rows=all_rows,
-        metrics=[
-            ("impulse_metric", "Impulse Metric CDF", "Impulse Metric", False),
-        ],
-        suptitle="DROP Impact CDF: PPO(baseline) vs PPO-GRU",
-        out_png=os.path.join(fig_dir, "fig_impulse_metric_cdf_compare.png"),
-        out_pdf=os.path.join(fig_dir, "fig_impulse_metric_cdf_compare.pdf"),
-    )
+        plot_paired_scatter_figure(
+            rows=all_rows,
+            metrics=[
+                ("impulse_metric", "Impulse Metric Paired Scatter", False),
+            ],
+            suptitle="Paired Impact Scatter: PPO(baseline) vs PPO-GRU",
+            out_png=os.path.join(fig_dir, "fig_impulse_metric_scatter_compare.png"),
+            out_pdf=os.path.join(fig_dir, "fig_impulse_metric_scatter_compare.pdf"),
+        )
+
+        # Combined table window (2 subplots): attitude table + impact table
+        plot_attitude_impulse_summary_tables_figure(
+            rows=all_rows,
+            out_png=os.path.join(fig_dir, "fig_attitude_impact_summary_tables.png"),
+            out_pdf=os.path.join(fig_dir, "fig_attitude_impact_summary_tables.pdf"),
+        )
+
+        # Figure 4: impulse metric CDF comparison
+        plot_paired_cdf_figure(
+            rows=all_rows,
+            metrics=[
+                ("impulse_metric", "Impulse Metric CDF", "Impulse Metric", False),
+            ],
+            suptitle="DROP Impact CDF: PPO(baseline) vs PPO-GRU",
+            out_png=os.path.join(fig_dir, "fig_impulse_metric_cdf_compare.png"),
+            out_pdf=os.path.join(fig_dir, "fig_impulse_metric_cdf_compare.pdf"),
+        )
 
     logger.info(f"Saved raw metrics to: {raw_dir}")
     logger.info(f"Saved summaries to: {stats_dir}")

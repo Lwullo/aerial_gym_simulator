@@ -130,7 +130,7 @@ def restore_state_snapshot(env, snapshot):
 
 
 # ============================================================================
-# APF Baseline Agent (from test_baseline_pid.py)
+# APF Baseline Agent (legacy PID + greedy baseline)
 # ============================================================================
 
 class APFAgent:
