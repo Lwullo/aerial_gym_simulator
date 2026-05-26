@@ -415,76 +415,10 @@ class AERIALRLGPUEnv(vecenv.IVecEnv):
 
 
 env_configurations.register(
-    "position_setpoint_task",
-    {
-        "env_creator": lambda **kwargs: task_registry.make_task("position_setpoint_task", **kwargs),
-        "vecenv_type": "AERIAL-RLGPU",
-    },
-)
-
-env_configurations.register(
-    "position_setpoint_task_sim2real",
-    {
-        "env_creator": lambda **kwargs: task_registry.make_task(
-            "position_setpoint_task_sim2real", **kwargs
-        ),
-        "vecenv_type": "AERIAL-RLGPU",
-    },
-)
-
-env_configurations.register(
-    "position_setpoint_task_acceleration_sim2real",
-    {
-        "env_creator": lambda **kwargs: task_registry.make_task(
-            "position_setpoint_task_acceleration_sim2real", **kwargs
-        ),
-        "vecenv_type": "AERIAL-RLGPU",
-    },
-)
-
-env_configurations.register(
-    "navigation_task",
-    {
-        "env_creator": lambda **kwargs: task_registry.make_task("navigation_task", **kwargs),
-        "vecenv_type": "AERIAL-RLGPU",
-    },
-)
-
-env_configurations.register(
     "navigation_task_gmm_noise",
     {
         "env_creator": lambda **kwargs: task_registry.make_task(
             "navigation_task_gmm_noise", **kwargs
-        ),
-        "vecenv_type": "AERIAL-RLGPU",
-    },
-)
-
-env_configurations.register(
-    "position_setpoint_task_reconfigurable",
-    {
-        "env_creator": lambda **kwargs: task_registry.make_task(
-            "position_setpoint_task_reconfigurable", **kwargs
-        ),
-        "vecenv_type": "AERIAL-RLGPU",
-    },
-)
-
-env_configurations.register(
-    "position_setpoint_task_morphy",
-    {
-        "env_creator": lambda **kwargs: task_registry.make_task(
-            "position_setpoint_task_morphy", **kwargs
-        ),
-        "vecenv_type": "AERIAL-RLGPU",
-    },
-)
-
-env_configurations.register(
-    "position_setpoint_task_sim2real_end_to_end",
-    {
-        "env_creator": lambda **kwargs: task_registry.make_task(
-            "position_setpoint_task_sim2real_end_to_end", **kwargs
         ),
         "vecenv_type": "AERIAL-RLGPU",
     },
@@ -534,7 +468,7 @@ def get_args():
         {
             "name": "--file",
             "type": str,
-            "default": "ppo_aerial_quad.yaml",
+            "default": "ppo_aerial_quad_navigation_seed42.yaml",
             "required": False,
             "help": "path to config",
         },
@@ -570,7 +504,7 @@ def get_args():
         {
             "name": "--task",
             "type": str,
-            "default": "navigation_task",
+            "default": "navigation_task_gmm_noise",
             "help": "Override task from config file if provided.",
         },
         {

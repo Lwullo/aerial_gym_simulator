@@ -1,7 +1,0 @@
-preset_id=0
-best_score=1.945259
-best_position=[9.5, 4.700000286102295, 3.9000000953674316]
-total_points_searched=38088
-adaptive_search=False
-r_obs=1.62
-w1=0.6 w2=0.7 w3=1.0 c=1.5

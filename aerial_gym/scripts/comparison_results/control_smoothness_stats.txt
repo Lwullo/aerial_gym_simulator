@@ -1,4 +1,0 @@
-Mean Action Variation (lower is smoother):
-RL: 0.9306
-PID+Greedy: 0.1153
-Pure PID: 0.1089

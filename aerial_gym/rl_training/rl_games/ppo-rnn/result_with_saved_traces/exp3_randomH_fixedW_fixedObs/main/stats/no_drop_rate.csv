@@ -1,5 +1,0 @@
-method,seed,done_total,drop_done,no_drop_done,no_drop_rate
-ppo,10,2000,1993,7,0.0035
-ppo_gru,10,2000,1962,38,0.019
-ppo_rnn,10,2000,1982,18,0.009
-mpc,10,2000,1049,951,0.4755
